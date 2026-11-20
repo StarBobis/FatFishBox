@@ -100,10 +100,10 @@ try {
     assert.equal(initial.accounts,2);
     assert.equal(initial.models,3);
     let settings = await two.tool('cluster_configure',{revision:initial.settings.revision,permission:'prompt-on-risk'});
-    await one.tool('cluster_configure',{revision:initial.settings.revision,balance:'priority'},true);
+    await one.tool('cluster_configure',{revision:initial.settings.revision,preset:'ptc'},true);
     settings = await two.tool('cluster_update_account',{revision:settings.revision,id:'account-a',concurrency:2});
     const pool = Object.values(settings.pools).find(row => row.provider==='account-a' && row.model==='fast');
-    settings = await two.tool('cluster_update_pool',{revision:settings.revision,id:pool.id,enabled:true,concurrency:2,roles:{developer:1}});
+    settings = await two.tool('cluster_update_pool',{revision:settings.revision,id:pool.id,enabled:true,concurrency:1});
     const replay = await one.tool('cluster_import_models',{authPath:auth,configPath:''});
     assert.equal(replay.settings.pools[pool.id].enabled,true);
     const args = {title:'Smoke dispatch',batch:'smoke',role:'developer',task:'Return one report',workspace:a};
@@ -152,6 +152,30 @@ try {
     assert.equal(updated.outcome,ack.outcome);
     assert.equal((await two.tool('cluster_next_handoff',{claimToken:next.claimToken,outcome:'Verified report.'})).empty,true);
     assert.equal((await one.tool('cluster_overview')).unprocessed,0);
+    const balanced=await connect(join(root,'balanced'));
+    const balancedImport=await balanced.tool('cluster_import_models',{authPath:auth,configPath:''});
+    let balancedSettings=await balanced.tool('cluster_configure',{revision:balancedImport.settings.revision,permission:'prompt-on-risk'});
+    for (const id of ['account-a','account-b'])
+        balancedSettings=await balanced.tool('cluster_update_account',{revision:balancedSettings.revision,id,concurrency:4});
+    let firstPool;
+    for (const row of Object.values(balancedSettings.pools)) {
+        if (row.provider==='account-a' && row.model==='fast') firstPool=row.id;
+        balancedSettings=await balanced.tool('cluster_update_pool',{revision:balancedSettings.revision,id:row.id,enabled:true,concurrency:4});
+    }
+    const c=join(root,'workspace-c'),d=join(root,'workspace-d');
+    await Promise.all([mkdir(c),mkdir(d)]);
+    terminal=false;
+    running=false;
+    const spread=[];
+    for (const [index,workspace] of [a,b,c,d].entries()) {
+        const row=await balanced.tool('cluster_start_session',{
+            ...args,role:index===0?'reviewer':'repair',workspace,...(index===0?{poolId:firstPool}:{}),
+        });
+        spread.push(row.provider);
+    }
+    assert.equal(spread[0],'account-a');
+    assert.equal(spread[1],'account-b');
+    assert.deepEqual(spread.sort(),['account-a','account-a','account-b','account-b']);
     console.log('stdio MCP passed: DSH presets, scheduling, FIFO claims, shared receipts and denied bypasses.');
     if (process.env.FATFISH_TEST_LIVE_DSH === '1') {
         const directory = join(root,'real');

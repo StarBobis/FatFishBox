@@ -11,6 +11,7 @@
 #include <native_ui/text_box.h>
 #include <native_ui/theme_resources.h>
 #include <native_ui/title_bar.h>
+#include <native_ui/toggle_switch.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <objbase.h>
@@ -37,18 +38,20 @@ using fatfish::narrow;
 using fatfish::widen;
 constexpr UINT finished = WM_APP + 1;
 constexpr UINT usage_finished = WM_APP + 2;
+constexpr UINT sessions_finished = WM_APP + 3;
 constexpr UINT_PTR usage_timer = 1;
+constexpr UINT_PTR sessions_timer = 2;
+constexpr UINT sessions_interval_ms = 5000;
+constexpr ULONGLONG live_interval_ms = 30000;
 constexpr int minimum_width=740, minimum_height=520;
 constexpr float row_height=34;
+constexpr float pool_row_height=52;
 enum class List { running, pending, pools };
 struct ListViewport {
     std::string key;
     Rect bounds{};
     double offset=0, maximum=0;
 };
-constexpr std::array roles{"developer","reviewer","repair","support"};
-constexpr std::array role_names{L"开发",L"评审",L"返修",L"协助"};
-const std::vector<Choice> balance_options{{"least_loaded",L"最少负载"},{"priority",L"优先级优先"},{"weighted",L"按权重"}};
 std::shared_ptr<ImageSource> embedded_logo() {
     const auto module=GetModuleHandleW(nullptr);
     const auto resource=FindResourceW(module,MAKEINTRESOURCEW(IDR_FATFISHBOX_LOGO),RT_RCDATA);
@@ -134,7 +137,9 @@ public:
     HWND window{};
     ~App() {
         usage_worker_.request_stop();
+        sessions_worker_.request_stop();
         if (usage_worker_.joinable()) usage_worker_.join();
+        if (sessions_worker_.joinable()) sessions_worker_.join();
         if (worker_.joinable()) worker_.join();
     }
     void init() {
@@ -149,6 +154,7 @@ public:
         sync_usage();
         reload();
         SetTimer(window,usage_timer,60000,nullptr);
+        SetTimer(window,sessions_timer,sessions_interval_ms,nullptr);
     }
     void size(int width, int height) {
         if (!width || !height) return;
@@ -303,6 +309,8 @@ public:
         }
         auto* box = widget(model_,model_.focused);
         if (!box || !box->enabled) return false;
+        if (box->visual==WidgetVisual::toggle_switch && pressed==VK_SPACE)
+            return ToggleSwitch::key_down(model_,"Space");
         if (ScrollBar::matches(*box)) {
             const std::map<WPARAM,std::string_view> keys{{VK_UP,"Up"},{VK_DOWN,"Down"},
                 {VK_HOME,"Home"},{VK_END,"End"},{VK_PRIOR,"PageUp"},{VK_NEXT,"PageDown"}};
@@ -316,6 +324,14 @@ public:
             return true;
         }
         if (box->kind != WidgetKind::textbox) return false;
+        if (pressed==VK_RETURN && box->binding.starts_with("schedule.")) {
+            try { save_schedule(box->binding,number(box->binding)); }
+            catch (const std::exception&) {
+                notice_=L"请输入有效整数后按回车保存";
+                redraw();
+            }
+            return true;
+        }
         const bool control=GetKeyState(VK_CONTROL)<0, extend=GetKeyState(VK_SHIFT)<0;
         if (control && pressed=='V') {
             if (box->read_only) return true;
@@ -378,6 +394,12 @@ public:
             insert(std::wstring_view(&c,1));
         }
     }
+    void key_up(WPARAM key) {
+        if (key!=VK_SPACE) return;
+        const auto* field=widget(model_,model_.focused);
+        if (field && field->visual==WidgetVisual::toggle_switch && ToggleSwitch::key_up(model_,"Space"))
+            save_schedule(field->action,field->selected);
+    }
     void receive() {
         if (worker_.joinable()) worker_.join();
         busy_ = false;
@@ -390,6 +412,10 @@ public:
             }
         } else {
             notice_ = error_;
+            if (page_=="pools") {
+                try { settings_=cluster_.invoke("cluster_get_settings");update_pools(); }
+                catch (const std::exception&) {}
+            }
         }
         redraw();
     }
@@ -410,6 +436,29 @@ public:
         catch (const std::exception&) {}
         if (page_=="sessions" && GetCapture()!=window) redraw();
     }
+    void refresh_sessions_automatically() {
+        if (page_!="sessions" || IsIconic(window) || busy_ || sessions_worker_.joinable() ||
+            GetCapture()==window || !model_.ui.choice.empty()) return;
+        const auto tick=GetTickCount64();
+        const bool poll_live=tick>=next_live_poll_;
+        if (poll_live) next_live_poll_=tick+live_interval_ms;
+        sessions_generation_=snapshot_generation_;
+        sessions_worker_=std::jthread([this,poll_live](std::stop_token stop) {
+            try {
+                if (poll_live) cluster_.poll_desktop_session();
+                if (!stop.stop_requested()) sessions_snapshot_=cluster_.desktop_snapshot();
+            } catch (const std::exception&) {}
+            if (!stop.stop_requested()) PostMessageW(window,sessions_finished,0,0);
+        });
+    }
+    void receive_sessions() {
+        if (sessions_worker_.joinable()) sessions_worker_.join();
+        auto snapshot=std::exchange(sessions_snapshot_,std::nullopt);
+        if (!snapshot || page_!="sessions" || IsIconic(window) || busy_ ||
+            sessions_generation_!=snapshot_generation_ || GetCapture()==window || !model_.ui.choice.empty()) return;
+        apply_sessions(*snapshot);
+        redraw();
+    }
 private:
     Cluster cluster_;
     std::unique_ptr<fatfish::McpHttpServer> http_;
@@ -421,11 +470,15 @@ private:
     NavigationView navigation_;
     std::shared_ptr<ImageSource> logo_;
     std::map<std::string,std::wstring> fields_;
-    Json running_=Json::array(), pending_=Json::array(), settings_=Json::object(), overview_=Json::object(), editing_, selected_;
+    Json running_=Json::array(), pending_=Json::array(), settings_=Json::object(), overview_=Json::object(), selected_;
     std::vector<std::pair<bool,Json>> pools_;
     std::vector<Json> visible_sessions_;
     std::jthread worker_;
     std::jthread usage_worker_;
+    std::jthread sessions_worker_;
+    std::optional<Json> sessions_snapshot_;
+    std::uint64_t snapshot_generation_=0,sessions_generation_=0;
+    ULONGLONG next_live_poll_=0;
     bool usage_busy_=false;
     std::optional<Json> result_;
     std::function<void(Json)> callback_;
@@ -436,13 +489,13 @@ private:
     std::array<ListViewport,3> viewports_{{{"scroll.running"},{"scroll.pending"},{"scroll.pools"}}};
     ScrollBar scroll_bar_;
     std::optional<List> drag_list_;
-    bool busy_ = false, enabled_ = false, is_pool_ = false;
+    bool busy_ = false;
     bool navigation_open_ = true;
     Json presets_ = Json::object();
 
     static bool interactive(const Widget* w) {
         return w && w->enabled && (w->kind==WidgetKind::textbox || w->kind==WidgetKind::button ||
-            w->kind==WidgetKind::select || ScrollBar::matches(*w));
+            w->kind==WidgetKind::select || w->visual==WidgetVisual::toggle_switch || ScrollBar::matches(*w));
     }
     ListViewport& viewport(List list) { return viewports_.at(static_cast<std::size_t>(list)); }
     const ListViewport& viewport(List list) const { return viewports_.at(static_cast<std::size_t>(list)); }
@@ -479,16 +532,19 @@ private:
         InvalidateRect(window,nullptr,FALSE);
     }
     void combo_changed(const ComboBoxChange& change) {
-        if (change.selection_changed) fields_[change.key]=widen(change.new_value);
         refresh_combo_layout();
         ComboBox::reveal_candidate(model_,layout_);
         refresh_combo_layout();
+        if (!change.selection_changed) return;
+        if (change.key.starts_with("schedule.")) save_schedule(change.key,change.new_value);
+        else fields_[change.key]=widen(change.new_value);
     }
 
     void insert(std::wstring_view text) {
         auto* box = widget(model_,model_.focused);
         if (!box || box->kind!=WidgetKind::textbox || !box->enabled || box->read_only) return;
-        if (TextEditor::insert(model_.ui,box->value,model_.focused,text))
+        if (TextEditor::insert(model_.ui,box->value,model_.focused,text,false,
+            box->text_box?box->text_box->max_length:0))
             text_changed(*box);
     }
     void text_changed(const Widget& box) {
@@ -522,7 +578,7 @@ private:
             std::move(after));
     }
     void load_connection() {
-        for (auto key : {"configPath","authPath","permission","preset","balance"})
+        for (auto key : {"configPath","authPath","permission","preset"})
             fields_[key] = title(settings_,key);
         refresh_presets();
     }
@@ -584,14 +640,29 @@ private:
         redraw();
     }
     void local_snapshot() {
+        ++snapshot_generation_;
         try {
             auto snapshot=cluster_.desktop_snapshot();
-            overview_=std::move(snapshot.at("overview"));
+            apply_sessions(snapshot);
             settings_=std::move(snapshot.at("settings"));
-            running_=std::move(snapshot.at("running"));
-            pending_=std::move(snapshot.at("pending"));
             update_pools();
         } catch (const std::exception& e) { notice_ = widen(e.what()); }
+    }
+    void apply_sessions(Json& snapshot) {
+        const auto replace=[&](List list,Json& rows,const char* key) {
+            auto& next=snapshot.at(key);
+            auto& offset=viewport(list).offset;
+            const auto first=static_cast<std::size_t>(std::lround(offset));
+            if (first>0 && first<rows.size()) {
+                const auto& id=rows.at(first).at("id");
+                const auto same=std::ranges::find_if(next,[&](const Json& row){return row.at("id")==id;});
+                if (same!=next.end()) offset=static_cast<double>(same-next.begin());
+            }
+            rows=std::move(next);
+        };
+        replace(List::running,running_,"running");
+        replace(List::pending,pending_,"pending");
+        overview_=std::move(snapshot.at("overview"));
     }
     void update_pools() {
         pools_.clear();
@@ -734,6 +805,7 @@ private:
         }
     }
     void session_page(float x,float right,float h) {
+        label(L"每 5 秒自动刷新",right-224,27,108,12,"root",ColorToken::text_secondary);
         button("sync",L"同步会话",right-104,20,104);
         const auto usage=overview_.value("usage",Json::object());
         const auto total=usage.value("total",Json::object());
@@ -787,9 +859,8 @@ private:
         field("authPath",L"本机授权文件（可从配置自动识别）",left,164,form,"dsh");
         combo("permission",L"权限预设",left,224,half,preset_options("permissions",L"请选择权限预设"),"dsh");
         combo("preset",L"Agent 预设",left+half+14,224,half,preset_options("agents",L"DSH 默认"),"dsh");
-        combo("balance",L"分配策略",left,282,half,balance_options,"dsh");
-        button("refresh_presets",L"刷新预设",config_right-248,306,96,false,true,"dsh");
-        button("save_connection",L"保存连接设置",config_right-142,306,126,true,true,"dsh");
+        button("refresh_presets",L"刷新预设",config_right-248,296,96,false,true,"dsh");
+        button("save_connection",L"保存连接设置",config_right-142,296,126,true,true,"dsh");
         button("import",L"从 DSH 导入模型",right-154,20,154,true);
 
         const float mcp_x=side?config_right+12:x;
@@ -808,35 +879,50 @@ private:
     void pools_page(float x,float right,float h) {
         button("import",L"从 DSH 导入模型",right-154,20,154,true);
         const float left=x+16, width=right-x;
-        const auto strategy=std::ranges::find(balance_options,settings_.value("balance","least_loaded"),&Choice::key);
         const int accounts=int(settings_.value("accounts",Json::object()).size());
         const int models=int(settings_.value("pools",Json::object()).size());
         auto description=std::to_wstring(accounts)+L" 个账号  ·  "+std::to_wstring(models)+L" 个模型池";
-        if (strategy!=balance_options.end()) description+=L"  ·  "+strategy->label;
+        description+=L"  ·  并发可用 + / − 调整，也可输入后按回车保存";
         label(std::move(description),x,56,width,13,"root",ColorToken::text_secondary);
         const float top=85, bottom=h-30;
         panel("poolrows",{x,top,right,bottom});
-        const int total=int(pools_.size()), capacity=std::max(1,int((bottom-top-50)/row_height));
+        const int total=int(pools_.size()), capacity=std::max(1,int((bottom-top-50)/pool_row_height));
         const int start=list_start(List::pools,"poolrows",{x+8,top+41,right-7,bottom-8},total,capacity,L"滚动账号与模型池");
-        const float model=x+width*.14f, state=x+width*.63f, limit=x+width*.77f;
-        label(L"类型",left,top+12,model-left-8,12,"poolrows",ColorToken::text_tertiary);
-        label(L"账号或模型",model,top+12,state-model-10,12,"poolrows",ColorToken::text_tertiary);
-        label(L"状态",state,top+12,limit-state-6,12,"poolrows",ColorToken::text_tertiary);
-        label(L"并发 · 思考强度",limit,top+12,right-limit-32,12,"poolrows",ColorToken::text_tertiary);
+        const float effort_width=std::clamp(width*.20f,100.f,175.f), effort=right-32-effort_width;
+        const float limit=effort-128, state=limit-72;
+        label(L"账号或模型",left,top+12,state-left-12,12,"poolrows",ColorToken::text_tertiary);
+        label(L"启用",state,top+12,64,12,"poolrows",ColorToken::text_tertiary);
+        label(L"并发",limit,top+12,112,12,"poolrows",ColorToken::text_tertiary);
+        label(L"思考强度",effort,top+12,effort_width,12,"poolrows",ColorToken::text_tertiary);
         for (int i=start;i<std::min(start+capacity,total);++i) {
             const auto& [pool,row]=pools_[i];
-            const float y=top+41+float(i-start)*row_height;
-            table_row("pool."+row.at("id").get<std::string>(),"pool."+std::to_string(i),x+8,y,width-40,"poolrows");
-            label(pool?L"模型池":L"账号",left,y+7,model-left-8,12,"poolrows",ColorToken::text_secondary);
+            const float row_top=top+37+float(i-start)*pool_row_height;
+            const float y=row_top+12;
             auto name=title(row,"name");
             if (pool) name+=L"  ·  "+title(row,"provider");
-            label(std::move(name),model,y+7,state-model-10,14,"poolrows");
+            else name=L"账号  ·  "+name;
+            label(std::move(name),left,y+7,state-left-12,14,"poolrows",ColorToken::text_primary,!pool);
+            const auto suffix="."+std::to_string(i);
             const bool enabled=row.value("enabled",false);
-            label(enabled?L"● 启用":L"○ 关闭",state,y+7,limit-state-6,12,"poolrows",
-                enabled?ColorToken::status_success:ColorToken::text_secondary);
-            auto concurrency=std::to_wstring(row.value("concurrency",1));
-            if (pool) concurrency+=row.value("effort","").empty()?L"  ·  DSH 默认":L"  ·  "+title(row,"effort");
-            label(std::move(concurrency),limit,y+7,right-limit-32,12,"poolrows",ColorToken::text_secondary);
+            auto& toggle=ToggleSwitch({.on=enabled,.enabled=!busy_}).append(model_,"poolrows","schedule.enabled"+suffix);
+            toggle.action=toggle.key;
+            toggle.area=WidgetArea::absolute;
+            const float toggle_top=row_top-12+title_bar_.height();
+            toggle.bounds={state,toggle_top,state+52,toggle_top+pool_row_height};
+            const auto concurrency=row.value("concurrency",1);
+            const auto binding="schedule.concurrency"+suffix;
+            const auto& value=fields_.try_emplace(binding,std::to_wstring(concurrency)).first->second;
+            button("lower"+suffix,L"−",limit,y,26,false,concurrency>1,"poolrows");
+            auto& number_box=add(binding,WidgetKind::textbox,L"",limit+30,y,52,32,"poolrows");
+            TextBox({.text=value,.enabled=!busy_,.max_length=4}).apply(number_box);
+            number_box.binding=binding;
+            button("raise"+suffix,L"+",limit+86,y,26,false,concurrency<1000,"poolrows");
+            if (pool) {
+                std::vector<Choice> options{{"",L"DSH 默认"}};
+                for (const auto& option:row.at("efforts")) options.push_back({option.get<std::string>(),widen(option.get<std::string>())});
+                auto& choice=add("schedule.effort"+suffix,WidgetKind::select,L"",effort,y,effort_width,32,"poolrows");
+                ComboBox({L"思考强度",std::move(options),title(row,"effort"),!busy_,effort_width}).apply(choice);
+            } else label(L"—",effort,y+7,effort_width,12,"poolrows",ColorToken::text_tertiary);
         }
         if (!total) label(L"从 DSH 导入模型后可在这里编辑调度配置。",left,top+55,width-32,14,"poolrows",ColorToken::text_secondary);
     }
@@ -873,13 +959,13 @@ private:
                 Image({.source=logo_,.width=20,.height=20,.description=L"肥鱼重工"}).apply(*icon);
             }
         }
-        const auto selected_page=page_=="pools" || page_=="edit" ? "pools" :
+        const auto selected_page=page_=="pools" ? "pools" :
             page_=="connection" ? "connection" : "sessions";
         NavigationViewOptions navigation;
         navigation.id="sidebar";
         navigation.pane_expanded=navigation_open_ && w>=minimum_width;
         navigation.selected_id=selected_page;
-        navigation.items={{"sessions",L"会话与交接",L"\uE8BD",!busy_,{}},
+        navigation.items={{"sessions",L"会话",L"\uE8BD",!busy_,{}},
                           {"pools",L"账号与模型池",L"\uE716",!busy_,{}}};
         navigation.settings={"connection",L"连接与 MCP",L"\uE713",!busy_,{}};
         navigation.expanded_width=w<900?166.f:196.f;
@@ -890,8 +976,8 @@ private:
         const float inset=w<900?18.f:26.f;
         const float content=w-navigation_.width()-2*inset;
         const float width=std::min(content,1440.f), x=navigation_.width()+inset+(content-width)/2, right=x+width;
-        const std::map<std::string,std::wstring> names{{"sessions",L"会话与交接"},{"pools",L"账号与模型池"},
-            {"connection",L"连接与 MCP"},{"detail",L"会话详情"},{"edit",L"调度配置"}};
+        const std::map<std::string,std::wstring> names{{"sessions",L"会话"},{"pools",L"账号与模型池"},
+            {"connection",L"连接与 MCP"},{"detail",L"会话详情"}};
         label(names.at(page_),x,19,width-246,25);
         if (!notice_.empty()) label(notice_,x,h-24,width,12,"root",ColorToken::text_secondary);
         if (page_=="sessions") {
@@ -900,27 +986,6 @@ private:
             connection_page(x,right);
         } else if (page_=="pools") {
             pools_page(x,right,h);
-        } else if (page_=="edit" && editing_.is_object()) {
-            button("nav.pools",L"返回模型池",right-112,20,112);
-            const float left=x+16, form=width-32, third=(form-24)/3;
-            panel("limits",{x,64,right,258});
-            label(title(editing_,"name"),left,77,form-120,18,"limits",ColorToken::text_primary,true);
-            label(title(editing_,is_pool_?"provider":"id"),left,102,form-120,13,"limits",ColorToken::text_secondary);
-            button("enabled",enabled_?L"已启用":L"已关闭",right-112,79,96,enabled_,true,"limits");
-            field("concurrency",L"总并发",left,132,third,"limits");
-            if (is_pool_) {
-                field("priority",L"优先级（越小越优先）",left+third+12,132,third,"limits");
-                field("weight",L"权重",left+2*(third+12),132,third,"limits");
-                std::vector<Choice> efforts{{"",L"DSH 默认"}};
-                for (const auto& effort:editing_.at("efforts")) efforts.push_back({effort.get<std::string>(),widen(effort.get<std::string>())});
-                combo("effort",L"思考强度",left,194,third,std::move(efforts),"limits");
-            }
-            panel("roles",{x,270,right,387});
-            label(L"角色并发",left,280,form,17,"roles",ColorToken::text_primary,true);
-            const float part=(form-36)/4;
-            for (std::size_t i=0;i<roles.size();++i)
-                field(roles[i],role_names[i],left+float(i)*(part+12),312,part,"roles");
-            button("save_pool",L"保存调度配置",right-132,400,132,true);
         } else if (page_=="detail" && selected_.is_object()) {
             button("nav.sessions",L"返回会话",right-110,20,110);
             const float left=x+16, inner=width-32;
@@ -967,6 +1032,36 @@ private:
         if (length!=text.size()) throw std::runtime_error("请输入整数");
         return value;
     }
+    void save_schedule(const std::string& action,Json value) {
+        if (busy_) return;
+        try {
+            const auto split=action.rfind('.');
+            const auto index=std::stoul(action.substr(split+1));
+            const auto field=action.substr(std::string_view("schedule.").size(),split-std::string_view("schedule.").size());
+            const auto& [pool,row]=pools_.at(index);
+            if (field=="concurrency" && (value.get<int>()<1 || value.get<int>()>1000)) {
+                notice_=L"并发必须在 1 至 1000 之间";
+                redraw();
+                return;
+            }
+            if (row.at(field)==value) return;
+            const auto id=row.at("id").get<std::string>();
+            const auto expected=row.at(field);
+            job([this,pool,id,field,expected,value=std::move(value)] {
+                    const auto settings=cluster_.invoke("cluster_get_settings");
+                    if (settings.at(pool?"pools":"accounts").at(id).at(field)!=expected)
+                        throw std::runtime_error("这一项已在别处修改，请核对后重试");
+                    return cluster_.invoke(pool?"cluster_update_pool":"cluster_update_account",
+                        {{"revision",settings.at("revision")},{"id",id},{field,value}});
+                },
+                [this, action](Json result) {
+                    fields_.erase(action);
+                    settings_=std::move(result);
+                    update_pools();
+                    notice_=L"调度配置已保存";
+                });
+        } catch (const std::exception& error) {notice_=widen(error.what());redraw();}
+    }
     void click(int control) {
         if (control>=choice_base) {
             ComboBoxChange change;
@@ -976,6 +1071,10 @@ private:
         }
         auto* w=widget(model_,control);
         if (!interactive(w)) return;
+        if (w->visual==WidgetVisual::toggle_switch) {
+            save_schedule(w->action,!w->selected);
+            return;
+        }
         if (w->kind==WidgetKind::select) {
             if (ComboBox::open(model_,control)) combo_changed({});
             return;
@@ -997,19 +1096,13 @@ private:
                 notice_=copy_text(result_loaded_?output_:title(selected_,"error"))?L"已复制结果":L"剪贴板暂不可用";
                 redraw();return;
             }
-            if (name=="enabled") {enabled_=!enabled_;redraw();return;}
-            if (name.starts_with("row.")) {selected_=visible_sessions_.at(std::stoul(name.substr(4)));clear_result();nav("detail");return;}
-            if (name.starts_with("pool.")) {
-                auto [is_pool,row]=pools_.at(std::stoul(name.substr(5)));
-                editing_=row;is_pool_=is_pool;enabled_=row.value("enabled",false);
-                fields_["concurrency"]=std::to_wstring(row.value("concurrency",1));
-                for (auto role:roles) fields_[role]=row.at("roles").contains(role)?std::to_wstring(row.at("roles").at(role).get<int>()):L"";
-                if (is_pool) {
-                    for (auto key:{"priority","weight"}) fields_[key]=std::to_wstring(row.value(key,0));
-                    fields_["effort"]=title(row,"effort");
-                }
-                nav("edit");return;
+            if (name.starts_with("raise.") || name.starts_with("lower.")) {
+                const auto index=std::stoul(name.substr(6));
+                save_schedule("schedule.concurrency."+std::to_string(index),
+                    pools_.at(index).second.value("concurrency",1)+(name.starts_with("raise.")?1:-1));
+                return;
             }
+            if (name.starts_with("row.")) {selected_=visible_sessions_.at(std::stoul(name.substr(4)));clear_result();nav("detail");return;}
             if (name=="sync") {
                 sync_usage();
                 call("cluster_refresh_sessions",Json::object(),[this](Json value) {
@@ -1019,25 +1112,14 @@ private:
                 });
             } else if (name=="import") {
                 call("cluster_import_models",page_=="connection"?paths():Json::object(),[this](Json value) {
+                    std::erase_if(fields_,[](const auto& entry){return entry.first.starts_with("schedule.");});
                     local_snapshot();nav("pools");notice_=L"已导入 "+std::to_wstring(value.value("accounts",0))+L" 个账号、"+std::to_wstring(value.value("models",0))+L" 个模型";
                 });
             } else if (name=="save_connection") {
                 Json input=paths();
                 input.update(Json{{"revision",settings_.at("revision")},{"permission",narrow(fields_.at("permission"))},
-                    {"preset",narrow(fields_.at("preset"))},{"balance",narrow(fields_.at("balance"))}});
+                    {"preset",narrow(fields_.at("preset"))}});
                 call("cluster_configure",input,[this](Json value){settings_=std::move(value);local_snapshot();notice_=L"连接设置已保存";});
-            } else if (name=="save_pool") {
-                Json caps=Json::object();
-                for (auto role:roles) if (!fields_.at(role).empty()) caps[role]=number(role);
-                Json input{{"revision",settings_.at("revision")},{"id",editing_.at("id")},{"enabled",enabled_},
-                    {"concurrency",number("concurrency")},{"roles",caps}};
-                if (is_pool_) {
-                    input["priority"]=number("priority");input["weight"]=number("weight");
-                    input["effort"]=narrow(fields_.at("effort"));
-                }
-                call(is_pool_?"cluster_update_pool":"cluster_update_account",input,[this](Json value) {
-                    settings_=std::move(value);update_pools();nav("pools");notice_=L"调度配置已保存";
-                });
             } else if (name.ends_with("_row") || name.starts_with("mark_")) {
                 const std::map<std::string,std::string> operations{{"refresh_row","cluster_refresh_session"},{"cancel_row","cluster_cancel_session"},
                     {"read_row","cluster_read_result"},{"mark_done","cluster_mark_receipt"}};
@@ -1142,11 +1224,16 @@ LRESULT CALLBACK dispatch_window(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP: app->up(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));return 0;
     case WM_CAPTURECHANGED: app->lost_capture();return 0;
     case WM_KEYDOWN: if (app->key(wp)) return 0;break;
+    case WM_KEYUP: app->key_up(wp);break;
     case WM_SYSKEYDOWN: if ((wp==VK_UP || wp==VK_DOWN) && app->key(wp)) return 0;break;
     case WM_CHAR: app->type(static_cast<wchar_t>(wp));return 0;
     case finished: app->receive();return 0;
     case usage_finished: app->receive_usage();return 0;
-    case WM_TIMER: if (wp==usage_timer) { app->sync_usage();return 0; } break;
+    case sessions_finished: app->receive_sessions();return 0;
+    case WM_TIMER:
+        if (wp==usage_timer) { app->sync_usage();return 0; }
+        if (wp==sessions_timer) { app->refresh_sessions_automatically();return 0; }
+        break;
     case WM_DESTROY: PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);

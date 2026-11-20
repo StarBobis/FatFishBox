@@ -64,7 +64,7 @@ bool active(const Json& row) {
 }
 Json settings_template() {
     return {{"revision",0},{"configPath",""},{"authPath",""},{"permission",""},{"preset",""},
-        {"balance","least_loaded"},{"accounts",Json::object()},{"pools",Json::object()}};
+        {"accounts",Json::object()},{"pools",Json::object()}};
 }
 class Database {
 public:
@@ -80,6 +80,14 @@ public:
             const auto file = folder / L"state.json";
             state = fs::exists(file) ? read_json(file, 64 * 1024 * 1024)
                 : Json{{"settings",settings_template()},{"sessions",Json::object()}};
+            auto& settings=state.at("settings");
+            settings.erase("balance");
+            for (auto& row:settings.at("accounts")) row.erase("roles");
+            for (auto& row:settings.at("pools")) {
+                row.erase("roles");
+                row.erase("priority");
+                row.erase("weight");
+            }
         } catch (...) {
             UnlockFileEx(lock_, 0, 1, 0, &range_);
             CloseHandle(lock_);
@@ -121,8 +129,6 @@ std::string field(const Json& source, std::string_view key, std::size_t max) {
     return value;
 }
 void validate_configuration(const Json& settings) {
-    const auto balance = settings.at("balance").get<std::string>();
-    require(balance == "least_loaded" || balance == "priority" || balance == "weighted", "调度策略无效");
     for (const auto name : {"configPath","authPath"}) {
         auto path = settings.at(name).get<std::string>();
         require(path.empty() || path_from_utf8(path).is_absolute(), "配置文件必须使用绝对路径");
@@ -136,17 +142,11 @@ void validate_configuration(const Json& settings) {
         require(row.at("concurrency").is_number_integer(), "并发必须为整数");
         const auto cap = row.at("concurrency").get<int>();
         require(cap >= 1 && cap <= 1000, "总并发必须在 1 至 1000 之间");
-        require(row.at("roles").is_object(), "角色设置必须为对象");
-        for (const auto& [role, value] : row.at("roles").items())
-            require(roles.contains(role) && value.is_number_integer() && value.get<int>() >= 0 &&
-                value.get<int>() <= cap, "角色并发必须在 0 和总并发之间");
     };
     for (const auto& account : settings.at("accounts")) limits(account);
     for (const auto& pool : settings.at("pools")) {
         limits(pool);
         require(settings.at("accounts").contains(pool.at("provider").get<std::string>()), "模型池的账号无效");
-        require(pool.at("weight").is_number_integer() && pool.at("priority").is_number_integer() &&
-            pool.at("weight").get<int>() >= 1 && pool.at("weight").get<int>() <= 10000, "优先级或权重无效");
         const auto effort = pool.at("effort").get<std::string>();
         const auto& efforts = pool.at("efforts");
         require(effort.empty() || std::find(efforts.begin(), efforts.end(), effort) != efforts.end(), "DSH 不提供该思考强度");
@@ -157,39 +157,28 @@ Json public_row(Json row) {
     row.erase("dispatchOperation");
     return row;
 }
-std::string choose_pool(const Json& settings, const Json& sessions, const std::string& role, const std::string& pinned) {
+std::string choose_pool(const Json& settings, const Json& sessions,const std::string& pinned) {
     std::vector<std::tuple<int,int,std::string>> scores;
     for (const auto& [key, pool] : settings.at("pools").items()) {
         if (!pool.at("enabled").get<bool>() || (!pinned.empty() && key != pinned)) continue;
         const auto provider = pool.at("provider").get<std::string>();
         const auto& account = settings.at("accounts").at(provider);
         if (!account.at("enabled").get<bool>()) continue;
-        int account_count = 0, account_role = 0, pool_count = 0, pool_role = 0;
+        int account_count=0,pool_count=0;
         for (const auto& row : sessions) {
             if (!active(row)) continue;
-            if (row.at("provider") == provider) {
-                ++account_count;
-                if (row.at("role") == role) ++account_role;
-            }
+            if (row.at("provider")==provider) ++account_count;
             const auto legacy_model = row.value("source","") == "codex" && row.at("provider") == provider &&
                 row.value("model","") == pool.at("model").get<std::string>();
-            if (row.value("poolId","") == key || legacy_model) {
-                ++pool_count;
-                if (row.at("role") == role) ++pool_role;
-            }
+            if (row.value("poolId","")==key || legacy_model) ++pool_count;
         }
         const auto cap = pool.at("concurrency").get<int>();
         const auto account_cap = account.at("concurrency").get<int>();
-        if (account_count >= account_cap || account_role >= account.at("roles").value(role, account_cap) ||
-            pool_count >= cap || pool_role >= pool.at("roles").value(role, 0)) continue;
+        if (account_count>=account_cap || pool_count>=cap) continue;
         const auto load = 100000 * pool_count / cap;
-        const auto priority = pool.at("priority").get<int>();
-        const auto policy = settings.at("balance").get<std::string>();
-        if (policy == "priority") scores.emplace_back(priority, load, key);
-        else if (policy == "weighted") scores.emplace_back(100000 * (pool_count + 1) / pool.at("weight").get<int>(), priority, key);
-        else scores.emplace_back(load, priority, key);
+        scores.emplace_back(account_count,load,key);
     }
-    require(!scores.empty(), "没有符合角色及并发限制的启用模型池");
+    require(!scores.empty(), "没有具备可用并发额度的启用模型池");
     return std::get<2>(*std::min_element(scores.begin(), scores.end()));
 }
 Json catalog_import(Json& settings, const Json& catalog) {
@@ -199,7 +188,7 @@ Json catalog_import(Json& settings, const Json& catalog) {
     for (const auto& group : groups) {
         auto provider = field(group, "id", 512);
         auto& account = settings["accounts"][provider];
-        if (account.is_null()) account = {{"id",provider},{"enabled",true},{"concurrency",1},{"roles",Json::object()}};
+        if (account.is_null()) account = {{"id",provider},{"enabled",true},{"concurrency",1}};
         account["name"] = group.value("name", provider);
         ++group_count;
         for (const auto& model : group.at("models")) {
@@ -216,7 +205,7 @@ Json catalog_import(Json& settings, const Json& catalog) {
             if (it == pools.end()) {
                 auto key = id();
                 pools[key] = {{"id",key},{"provider",provider},{"model",model_id},{"enabled",false},
-                    {"concurrency",1},{"priority",0},{"weight",1},{"effort",""},{"roles",{{"developer",1}}}};
+                    {"concurrency",1},{"effort",""}};
                 it = pools.find(key);
             }
             auto& pool = *it;
@@ -350,7 +339,7 @@ Json telemetry_overview(const Json& sessions,const Json& legacy_cache) {
     return {{"total",usage},{"todayTokens",total},{"hourlyTokens",hours>0 && (today_sampled || !missing)?
         Json(double(total)/hours):Json(nullptr)},{"missing",missing},{"sampled",sampled}};
 }
-Json refresh(const fs::path& data, const std::string& key) {
+Json refresh(const fs::path& data, const std::string& key,int timeout_ms=15000) {
     Json settings, prior;
     {
         Database db(data, false);
@@ -358,7 +347,7 @@ Json refresh(const fs::path& data, const std::string& key) {
         prior = db.state.at("sessions").at(key);
     }
     if (!prior.contains("startCursor")) return public_row(prior);
-    Dsh dsh(path_from_utf8(settings.at("authPath").get<std::string>()));
+    Dsh dsh(path_from_utf8(settings.at("authPath").get<std::string>()),timeout_ms);
     auto live = rpc_state(dsh, prior);
     auto cursor = live.at("cursor").get<std::int64_t>();
     const auto start = prior.at("startCursor").get<std::int64_t>();
@@ -461,6 +450,22 @@ Json Cluster::desktop_snapshot() const {
     std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return order(a,"completed")<order(b,"completed");});
     return {{"overview",session_overview(settings,sessions,legacy,data_)},{"settings",settings},
         {"running",std::move(running)},{"pending",std::move(pending)}};
+}
+
+void Cluster::poll_desktop_session() const {
+    std::optional<std::pair<std::int64_t,std::string>> oldest;
+    {
+        Database db(data_,false);
+        for (const auto& row:db.state.at("sessions")) {
+            if (!active(row) || !row.contains("startCursor")) continue;
+            const auto candidate=std::pair(row.at("updated").get<std::int64_t>(),row.at("id").get<std::string>());
+            if (!oldest || candidate<*oldest) oldest=candidate;
+        }
+    }
+    if (oldest) {
+        try { refresh(data_,oldest->second,2500); }
+        catch (const std::exception&) {}
+    }
 }
 
 void Cluster::refresh_legacy_usage(std::stop_token stop) const {
@@ -701,15 +706,14 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         auto& settings = db.state["settings"];
         require(settings.at("revision") == input.at("revision"), "配置已变化，请刷新后重试");
         if (tool == "cluster_configure") {
-            for (const auto member : {"configPath","authPath","permission","preset","balance"})
+            for (const auto member : {"configPath","authPath","permission","preset"})
                 if (input.contains(member)) settings[member] = input.at(member);
         } else {
             const bool pool = tool == "cluster_update_pool";
             auto& entry = settings.at(pool ? "pools" : "accounts").at(field(input, "id", 512));
-            for (const auto member : {"enabled","concurrency","roles"})
+            for (const auto member : {"enabled","concurrency"})
                 if (input.contains(member)) entry[member] = input.at(member);
-            if (pool) for (const auto member : {"priority","weight","effort"})
-                if (input.contains(member)) entry[member] = input.at(member);
+            if (pool && input.contains("effort")) entry["effort"]=input.at("effort");
         }
         validate_configuration(settings);
         settings["revision"] = settings["revision"].get<int>() + 1;
@@ -718,7 +722,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
     }
     if (tool == "cluster_start_session") {
         const auto title = field(input,"title",400), batch = field(input,"batch",400);
-        const auto role = field(input,"role",32), task = field(input,"task",64000);
+        const auto role=input.contains("role")?field(input,"role",32):"developer", task=field(input,"task",64000);
         require(roles.contains(role), "未知角色");
         const auto work = path_from_utf8(field(input,"workspace",4000));
         require(work.is_absolute() && fs::is_directory(work) && work.has_relative_path(), "工作区必须是现有的绝对子目录");
@@ -737,7 +741,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
                 if (active(value)) require(_wcsicmp(widen(value.at("workspace").get<std::string>()).c_str(),
                     workspace.c_str()) != 0, "该工作区已有活动会话");
             }
-            auto pool_id = choose_pool(settings, occupied, role, input.value("poolId", ""));
+            auto pool_id = choose_pool(settings,occupied,input.value("poolId",""));
             pool = settings.at("pools").at(pool_id);
             row = {{"id",key},{"title",title},{"role",role},{"batch",batch},{"workspace",utf8(workspace)},
                 {"poolId",pool_id},{"provider",pool.at("provider")},{"model",pool.at("model")},{"status","starting"},
@@ -917,8 +921,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
 
 Json Cluster::tools() {
     Json tools = Json::array();
-    const Json text{{"type","string"}}, integer{{"type","integer"}}, boolean{{"type","boolean"}},
-        object{{"type","object"}};
+    const Json text{{"type","string"}}, integer{{"type","integer"}}, boolean{{"type","boolean"}};
     auto add = [&](const char* name, const char* description, Json fields = Json::object(), Json required = Json::array()) {
         tools.push_back({{"name",name},{"description",description},
             {"inputSchema",{{"type","object"},{"properties",fields},{"required",required},{"additionalProperties",false}}}});
@@ -929,19 +932,18 @@ Json Cluster::tools() {
         {{"authPath",text},{"configPath",text}});
     add("cluster_import_models","从 DSH 实时目录导入所有已配置账号和模型。",
         {{"authPath",text},{"configPath",text}});
-    add("cluster_configure","更新 DSH 连接设置和全局负载均衡策略。",
-        {{"revision",integer},{"configPath",text},{"authPath",text},{"permission",text},{"preset",text},{"balance",text}}, {"revision"});
-    add("cluster_update_account","设置一个账号的启用状态、总并发和各角色并发。",
-        {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer},{"roles",object}}, {"revision","id"});
-    add("cluster_update_pool","设置模型、角色并发、思考强度、调度优先级和权重。",
-        {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer},{"roles",object},
-         {"effort",text},{"priority",integer},{"weight",integer}}, {"revision","id"});
+    add("cluster_configure","更新 DSH 连接与预设。",
+        {{"revision",integer},{"configPath",text},{"authPath",text},{"permission",text},{"preset",text}}, {"revision"});
+    add("cluster_update_account","设置一个账号的启用状态和总并发。",
+        {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer}}, {"revision","id"});
+    add("cluster_update_pool","设置模型启用状态、总并发和思考强度。",
+        {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer},{"effort",text}}, {"revision","id"});
     add("cluster_next_handoff","获取下一个需处理对话。完成实际处置后，传回 claimToken 和 outcome 自动确认并领取下一条。省略 outcome 可用领取凭据重读本条。",
         {{"claimToken",text},{"outcome",text}});
     tools.back()["title"]="获取下一个需处理对话";
-    add("cluster_start_session","在授权工作区和角色并发范围内派发一个会话。",
+    add("cluster_start_session","在授权工作区派发会话。自动选池会优先分配至占用较少的账号。Agent 可指定任务角色。",
         {{"title",text},{"batch",text},{"role",text},{"workspace",text},{"task",text},{"poolId",text}},
-        {"title","batch","role","workspace","task"});
+        {"title","batch","workspace","task"});
     add("cluster_refresh_sessions","同步本地登记的最早活动会话，每次最多 20 个。",{{"limit",integer}});
     add("cluster_cancel_session","取消已知的活动会话。",{{"sessionId",text}},{"sessionId"});
     return tools;
