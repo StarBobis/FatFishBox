@@ -26,6 +26,7 @@
 #include <memory>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -46,7 +47,6 @@ struct ListViewport {
 constexpr std::array roles{"developer","reviewer","repair","support"};
 constexpr std::array role_names{L"开发",L"评审",L"返修",L"协助"};
 const std::vector<Choice> balance_options{{"least_loaded",L"最少负载"},{"priority",L"优先级优先"},{"weighted",L"按权重"}};
-const std::vector<Choice> role_options{{"developer",L"开发"},{"reviewer",L"评审"},{"repair",L"返修"},{"support",L"协助"}};
 std::shared_ptr<ImageSource> embedded_logo() {
     const auto module=GetModuleHandleW(nullptr);
     const auto resource=FindResourceW(module,MAKEINTRESOURCEW(IDR_FATFISHBOX_LOGO),RT_RCDATA);
@@ -151,6 +151,12 @@ public:
     void paint() { renderer_.paint(window, model_, layout_, Theme::dark); }
     void activate(bool active) {
         model_.active = active;
+        if (!active) {
+            ComboBox::dismiss(model_);
+            refresh_combo_layout();
+            TextBox::cancel_editing(model_,model_.focused);
+            if (GetCapture()==window) ReleaseCapture();
+        }
         InvalidateRect(window,nullptr,FALSE);
     }
     bool caption_control(POINT point) const {
@@ -168,6 +174,13 @@ public:
             }
             return;
         }
+        if (const auto* field=widget(model_,model_.pressed); field && field->kind==WidgetKind::textbox &&
+            GetCapture()==window) {
+            const auto point=dip_point(x,y);
+            if (TextBox::pointer(model_,layout_,model_.pressed,point.x,point.y,true))
+                InvalidateRect(window,nullptr,FALSE);
+            return;
+        }
         if (model_.hovered != hit(x,y)) {
             model_.hovered = hit(x,y);
             InvalidateRect(window, nullptr, FALSE);
@@ -176,7 +189,7 @@ public:
         TrackMouseEvent(&track);
     }
     void leave() { model_.hovered = none; InvalidateRect(window, nullptr, FALSE); }
-    void down(int x, int y) {
+    void down(int x, int y,bool double_click=false) {
         auto which = hit(x,y);
         if (!model_.ui.choice.empty() && which < choice_base) {
             ComboBox::dismiss(model_);
@@ -189,7 +202,6 @@ public:
         model_.focused = which;
         model_.pressed = which;
         model_.focus_visible = true;
-        const DpiScale scale(GetDpiForWindow(window));
         if (w && ScrollBar::matches(*w)) {
             if (const auto list=list_for(w->key); list &&
                 scroll_bar_.pointer_down(*w,control_bounds(which),dip_point(x,y))) {
@@ -201,7 +213,9 @@ public:
         }
         if (w && w->kind == WidgetKind::textbox) {
             TextEditor::focus(model_.ui,w->value,which);
-            TextBox::pointer(model_,layout_,which,float(scale.dips(x)),float(scale.dips(y)));
+            const auto point=dip_point(x,y);
+            if (double_click) TextBox::select_word(model_,layout_,which,point.x,point.y);
+            else TextBox::pointer(model_,layout_,which,point.x,point.y,GetKeyState(VK_SHIFT)<0);
         }
         SetCapture(window);
         InvalidateRect(window,nullptr,FALSE);
@@ -294,33 +308,63 @@ public:
             return true;
         }
         if (box->kind != WidgetKind::textbox) return false;
-        if (GetKeyState(VK_CONTROL) < 0 && pressed == 'V') {
+        const bool control=GetKeyState(VK_CONTROL)<0, extend=GetKeyState(VK_SHIFT)<0;
+        if (control && pressed=='V') {
+            if (box->read_only) return true;
             if (OpenClipboard(window)) {
-                if (HANDLE item = GetClipboardData(CF_UNICODETEXT))
-                    if (const auto* text = static_cast<const wchar_t*>(GlobalLock(item))) {
-                        insert(text);
+                if (HANDLE item=GetClipboardData(CF_UNICODETEXT)) {
+                    const auto count=GlobalSize(item)/sizeof(wchar_t);
+                    if (const auto* text=static_cast<const wchar_t*>(GlobalLock(item))) {
+                        const auto end=std::find(text,text+count,L'\0');
+                        if (end!=text+count) insert({text,static_cast<std::size_t>(end-text)});
                         GlobalUnlock(item);
                     }
+                }
                 CloseClipboard();
             }
             return true;
         }
-        if (GetKeyState(VK_CONTROL) < 0 && pressed == 'A') {
+        if (control && (pressed=='C' || pressed=='X')) {
+            const auto text=TextBox::selected_text(model_,model_.focused);
+            if (!text.empty() && copy_text(text) && pressed=='X' && !box->read_only) {
+                TextEditor::key(model_.ui,box->value,model_.focused,"delete");
+                text_changed(*box);
+            }
+            return true;
+        }
+        if (control && pressed=='A') {
             TextBox::select_all(model_,model_.focused);
             InvalidateRect(window,nullptr,FALSE);
             return true;
         }
-        const std::map<WPARAM,std::string> keys{{VK_LEFT,"Left"},{VK_RIGHT,"Right"},{VK_HOME,"Home"},{VK_END,"End"},
-            {VK_DELETE,"Delete"},{VK_BACK,"Backspace"}};
-        auto found = keys.find(pressed);
-        if (found == keys.end()) return false;
-        if (TextBox::key(model_,layout_,found->second,GetKeyState(VK_SHIFT) < 0)) {
-            fields_[box->binding] = box->value;
+        const std::map<WPARAM,std::string_view> navigation{{VK_HOME,control?"Ctrl+Home":"Home"},
+            {VK_END,control?"Ctrl+End":"End"},{VK_UP,"Up"},{VK_DOWN,"Down"},{VK_PRIOR,"PageUp"},{VK_NEXT,"PageDown"}};
+        if (const auto found=navigation.find(pressed); found!=navigation.end() &&
+            TextBox::key(model_,layout_,found->second,extend)) {
             InvalidateRect(window,nullptr,FALSE);
+            return true;
+        }
+        const std::map<WPARAM,std::string_view> editing{{VK_LEFT,control?"word-left":"left"},
+            {VK_RIGHT,control?"word-right":"right"},{VK_DELETE,control?"word-delete":"delete"},
+            {VK_BACK,control?"word-backspace":"backspace"}};
+        const auto found=editing.find(pressed);
+        if (found==editing.end()) return false;
+        if (!box->read_only || pressed==VK_LEFT || pressed==VK_RIGHT) {
+            TextEditor::key(model_.ui,box->value,model_.focused,found->second,extend);
+            text_changed(*box);
         }
         return true;
     }
     void type(wchar_t c) {
+        if (c>=0xd800 && c<=0xdbff) { surrogate_=c;return; }
+        const auto high=std::exchange(surrogate_,wchar_t{});
+        if (c>=0xdc00 && c<=0xdfff) {
+            if (high) {
+                const wchar_t pair[]{high,c};
+                insert({pair,std::size(pair)});
+            }
+            return;
+        }
         if (c >= 32 || c == L'\r') {
             if (c == L'\r') c = L'\n';
             insert(std::wstring_view(&c,1));
@@ -331,7 +375,11 @@ public:
         busy_ = false;
         if (error_.empty()) {
             notice_.clear();
-            if (result_ && callback_) callback_(std::move(*result_));
+            try {
+                if (result_ && callback_) callback_(std::move(*result_));
+            } catch (const std::exception& error) {
+                notice_=widen(error.what());
+            }
         } else {
             notice_ = error_;
         }
@@ -355,6 +403,8 @@ private:
     std::optional<Json> result_;
     std::function<void(Json)> callback_;
     std::wstring notice_, error_, output_;
+    wchar_t surrogate_{};
+    bool result_loaded_=false;
     std::string page_ = "sessions";
     std::array<ListViewport,3> viewports_{{{"scroll.running"},{"scroll.pending"},{"scroll.pools"}}};
     ScrollBar scroll_bar_;
@@ -410,9 +460,13 @@ private:
 
     void insert(std::wstring_view text) {
         auto* box = widget(model_,model_.focused);
-        if (!box || box->kind != WidgetKind::textbox || !box->enabled) return;
-        if (TextEditor::insert(model_.ui,box->value,model_.focused,text,box->binding == "task",64000))
-            fields_[box->binding] = box->value;
+        if (!box || box->kind!=WidgetKind::textbox || !box->enabled || box->read_only) return;
+        if (TextEditor::insert(model_.ui,box->value,model_.focused,text))
+            text_changed(*box);
+    }
+    void text_changed(const Widget& box) {
+        if (!box.read_only && !box.binding.empty()) fields_[box.binding]=box.value;
+        TextBox::reveal(model_,layout_);
         InvalidateRect(window,nullptr,FALSE);
     }
     int hit(int x, int y) const {
@@ -452,30 +506,29 @@ private:
             presets_=std::move(data);
         });
     }
-    void copy_http_token() {
-        if (!http_) return;
-        const auto value=widen(http_->token());
+    bool copy_text(const std::wstring& value) {
         const auto bytes=(value.size()+1)*sizeof(wchar_t);
         const auto buffer=GlobalAlloc(GMEM_MOVEABLE,bytes);
-        if (!buffer) throw std::runtime_error("无法分配剪贴板内存");
+        if (!buffer) return false;
         if (auto* text=GlobalLock(buffer)) {
             memcpy(text,value.c_str(),bytes);
             GlobalUnlock(buffer);
         } else {
             GlobalFree(buffer);
-            throw std::runtime_error("无法写入剪贴板");
+            return false;
         }
         if (!OpenClipboard(window)) {
             GlobalFree(buffer);
-            throw std::runtime_error("剪贴板暂不可用");
+            return false;
         }
         const bool copied=EmptyClipboard() && SetClipboardData(CF_UNICODETEXT,buffer);
         CloseClipboard();
-        if (!copied) {
-            GlobalFree(buffer);
-            throw std::runtime_error("MCP 令牌复制失败");
-        }
-        notice_=L"已复制 MCP 令牌";
+        if (!copied) GlobalFree(buffer);
+        return copied;
+    }
+    void copy_http_token() {
+        if (!http_) return;
+        notice_=copy_text(widen(http_->token()))?L"已复制 MCP 令牌":L"剪贴板暂不可用";
         redraw();
     }
     void local_snapshot() {
@@ -496,6 +549,9 @@ private:
     void reload() { local_snapshot(); redraw(); }
     void nav(std::string to) {
         ComboBox::dismiss(model_);
+        TextBox::cancel_editing(model_,model_.focused);
+        model_.ui.editor_focus=none;
+        surrogate_=0;
         page_ = std::move(to);
         model_.focused = none;
         model_.hovered = none;
@@ -503,6 +559,10 @@ private:
         notice_.clear();
         if (page_ == "connection") load_connection();
         redraw();
+    }
+    void clear_result() {
+        output_.clear();
+        result_loaded_=false;
     }
     void panel(std::string key, Rect box, SurfaceVisual visual = SurfaceVisual::card) {
         Surface surface;
@@ -542,12 +602,11 @@ private:
         auto& item = add(std::move(key),WidgetKind::button,name,x,y,w,32,std::move(surface));
         Button(ButtonOptions{.text=std::move(name),.primary=primary,.enabled=allowed && !busy_,.width=w}).apply(item);
     }
-    void field(std::string key,std::wstring name,float x,float y,float w,const std::string& surface="root",float height=32) {
+    void field(std::string key,std::wstring name,float x,float y,float w,const std::string& surface="root") {
         label(std::move(name),x,y,w,13,surface,ColorToken::text_secondary);
-        auto& item = add("input."+key,WidgetKind::textbox,L"",x,y+24,w,height,surface);
+        auto& item = add("input."+key,WidgetKind::textbox,L"",x,y+24,w,32,surface);
         item.binding = key;
-        const bool multiline=height>32;
-        TextBox(TextBoxOptions{.text=fields_[key],.enabled=!busy_,.multiline=multiline,.accepts_return=multiline,.height=height}).apply(item);
+        TextBox(TextBoxOptions{.text=fields_[key],.enabled=!busy_}).apply(item);
     }
     void combo(std::string key,std::wstring name,float x,float y,float w,std::vector<Choice> options,const std::string& surface="root") {
         label(name,x,y,w,13,surface,ColorToken::text_secondary);
@@ -623,8 +682,7 @@ private:
         }
     }
     void session_page(float x,float right,float h) {
-        button("sync",L"同步会话",right-228,20,104);
-        button("new",L"派发会话",right-112,20,112,true);
+        button("sync",L"同步会话",right-104,20,104);
         const auto usage=overview_.value("usage",Json::object());
         const auto total=usage.value("total",Json::object());
         const auto input=total.value("uncachedInputTokens",0.0), read=total.value("cacheReadTokens",0.0);
@@ -774,7 +832,7 @@ private:
         const float content=w-navigation_.width()-2*inset;
         const float width=std::min(content,1440.f), x=navigation_.width()+inset+(content-width)/2, right=x+width;
         const std::map<std::string,std::wstring> names{{"sessions",L"会话与交接"},{"pools",L"账号与模型池"},
-            {"connection",L"连接与 MCP"},{"dispatch",L"派发会话"},{"detail",L"会话详情"},{"edit",L"调度配置"}};
+            {"connection",L"连接与 MCP"},{"detail",L"会话详情"},{"edit",L"调度配置"}};
         label(names.at(page_),x,19,width-246,25);
         if (!notice_.empty()) label(notice_,x,h-24,width,12,"root",ColorToken::text_secondary);
         if (page_=="sessions") {
@@ -804,16 +862,6 @@ private:
             for (std::size_t i=0;i<roles.size();++i)
                 field(roles[i],role_names[i],left+float(i)*(part+12),312,part,"roles");
             button("save_pool",L"保存调度配置",right-132,400,132,true);
-        } else if (page_=="dispatch") {
-            button("nav.sessions",L"返回会话",right-106,20,106);
-            const float left=x+16, form=width-32, half=(form-14)/2;
-            panel("dispatch",{x,64,right,h-35});
-            field("taskTitle",L"标题",left,79,form,"dispatch");
-            field("batch",L"批次 ID",left,141,half,"dispatch");
-            combo("role",L"角色",left+half+14,141,half,role_options,"dispatch");
-            field("workspace",L"独立工作区绝对路径",left,203,form,"dispatch");
-            field("task",L"任务",left,265,form,"dispatch",std::max(70.f,h-386));
-            button("send",L"派发任务",right-140,h-78,124,true,true,"dispatch");
         } else if (page_=="detail" && selected_.is_object()) {
             button("nav.sessions",L"返回会话",right-110,20,110);
             const float left=x+16, inner=width-32;
@@ -836,11 +884,13 @@ private:
             }
             panel("result",{x,231,right,h-30});
             label(L"结果",left,242,inner,17,"result",ColorToken::text_primary,true);
-            auto text=!output_.empty()?output_:title(selected_,"error");
+            auto text=result_loaded_?output_:title(selected_,"error");
             if (!text.empty()) {
+                button("copy_result",L"复制结果",right-104,237,88,false,true,"result");
                 auto& box=add("output",WidgetKind::textbox,L"",left,273,inner,h-318,"result");
                 TextBox(TextBoxOptions{.text=text,.read_only=true,.multiline=true,.height=h-318}).apply(box);
-            } else label(L"尚未读取结果",left,278,inner,13,"result",ColorToken::text_secondary);
+            } else label(result_loaded_?L"当前结果没有可显示的文本":L"尚未读取结果",
+                left,278,inner,13,"result",ColorToken::text_secondary);
         }
         append_widget_layout(layout_,model_);
         if (model_.focused<choice_base) model_.focused=control_id(focus_key);
@@ -883,9 +933,12 @@ private:
             if (name.starts_with("nav.")) {nav(name.substr(4));return;}
             if (name=="refresh_presets") {refresh_presets();return;}
             if (name=="copy_token") {copy_http_token();return;}
+            if (name=="copy_result") {
+                notice_=copy_text(result_loaded_?output_:title(selected_,"error"))?L"已复制结果":L"剪贴板暂不可用";
+                redraw();return;
+            }
             if (name=="enabled") {enabled_=!enabled_;redraw();return;}
-            if (name=="new") {fields_.try_emplace("role",L"developer");nav("dispatch");return;}
-            if (name.starts_with("row.")) {selected_=visible_sessions_.at(std::stoul(name.substr(4)));output_.clear();nav("detail");return;}
+            if (name.starts_with("row.")) {selected_=visible_sessions_.at(std::stoul(name.substr(4)));clear_result();nav("detail");return;}
             if (name.starts_with("pool.")) {
                 auto [is_pool,row]=pools_.at(std::stoul(name.substr(5)));
                 editing_=row;is_pool_=is_pool;enabled_=row.value("enabled",false);
@@ -924,10 +977,6 @@ private:
                 call(is_pool_?"cluster_update_pool":"cluster_update_account",input,[this](Json value) {
                     settings_=std::move(value);update_pools();nav("pools");notice_=L"调度配置已保存";
                 });
-            } else if (name=="send") {
-                call("cluster_start_session",{{"title",narrow(fields_.at("taskTitle"))},{"batch",narrow(fields_.at("batch"))},
-                    {"role",narrow(fields_.at("role"))},{"workspace",narrow(fields_.at("workspace"))},{"task",narrow(fields_.at("task"))}},
-                    [this](Json value){selected_=std::move(value);output_.clear();local_snapshot();nav("detail");});
             } else if (name.ends_with("_row") || name.starts_with("mark_")) {
                 const std::map<std::string,std::string> operations{{"refresh_row","cluster_refresh_session"},{"cancel_row","cluster_cancel_session"},
                     {"read_row","cluster_read_result"},{"mark_done","cluster_mark_receipt"}};
@@ -935,10 +984,21 @@ private:
                 if (name.starts_with("mark_")) input.update(Json{{"resultVersion",selected_.at("resultVersion")},{"processed",name=="mark_done"}});
                 call(operations.at(name),input,[this,name](Json value) {
                     if (name=="read_row") {
-                        output_.clear();
-                        for (const auto& message:value.at("messages")) output_+=title(message,"text")+L"\r\n\r\n";
-                        if (output_.empty()) output_=L"暂无输出";
-                    } else {selected_=std::move(value);local_snapshot();}
+                        clear_result();
+                        if (value.at("resultVersion")!=selected_.at("resultVersion")) {
+                            notice_=L"结果版本已变化，请先刷新状态";
+                            return;
+                        }
+                        for (const auto& message:value.at("messages")) {
+                            if (!output_.empty()) output_+=L"\r\n\r\n";
+                            output_+=title(message,"text");
+                        }
+                        result_loaded_=true;
+                    } else {
+                        if (value.at("resultVersion")!=selected_.at("resultVersion") ||
+                            value.at("status")!=selected_.at("status")) clear_result();
+                        selected_=std::move(value);local_snapshot();
+                    }
                 });
             }
         } catch (const std::exception& error) {notice_=widen(error.what());redraw();}
@@ -1017,6 +1077,7 @@ LRESULT CALLBACK dispatch_window(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         app->wheel(point.x,point.y,GET_WHEEL_DELTA_WPARAM(wp));return 0;
     }
     case WM_LBUTTONDOWN: app->down(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));return 0;
+    case WM_LBUTTONDBLCLK: app->down(GET_X_LPARAM(lp),GET_Y_LPARAM(lp),true);return 0;
     case WM_LBUTTONUP: app->up(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));return 0;
     case WM_CAPTURECHANGED: app->lost_capture();return 0;
     case WM_KEYDOWN: if (app->key(wp)) return 0;break;
@@ -1041,6 +1102,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     try {
         App app;
         WNDCLASSEXW wc{sizeof(wc)};
+        wc.style=CS_DBLCLKS;
         wc.hInstance=instance;wc.lpfnWndProc=dispatch_window;wc.lpszClassName=L"FatFishBoxWindow";
         wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
         wc.hIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_FATFISHBOX),IMAGE_ICON,
