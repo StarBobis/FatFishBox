@@ -64,7 +64,8 @@ try {
     await put(join(managed,'auth-private.json'),{origin:secondary.origin,cookie:'fixture=2'});
     await put(config,{stateDir:'../codex',service:{attachAuthFile:'../attached.json'}});
     const legacyRows = {
-        a:{sessionId:'same-id',serviceId:'attached',serviceOrigin:attached.origin,startSeq:1,cursor:3,status:'running',updatedAt:12},
+        a:{sessionId:'same-id',serviceId:'attached',serviceOrigin:attached.origin,startSeq:1,cursor:3,status:'running',updatedAt:12,
+            provider:'account-a',reasoningEffort:'low',actualReasoningEfforts:['high','max']},
         b:{sessionId:'same-id',serviceId:'svc-fixture',serviceOrigin:secondary.origin,startSeq:1,cursor:10,status:'succeeded',updatedAt:11},
     };
     await put(workers,{sessions:legacyRows});
@@ -91,6 +92,9 @@ try {
     const initial = await snapshot();
     assert.equal(initial.overview.codexSessions,2);
     assert.equal(initial.running.filter(row => row.source === 'codex').length,1);
+    const observed=initial.running.find(row => row.source === 'codex');
+    assert.equal(observed.provider,'account-a');
+    assert.equal(observed.effort,'max');
     assert.equal(initial.pending.length,0,'the turn-end receipt must match even when the registry cursor is newer');
     assert.equal(initial.liveStale,1,'a failing native session must be reported independently');
 

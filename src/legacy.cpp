@@ -172,9 +172,18 @@ Json projection(const Entry& entry) {
     if (status == "policy_violation" || status == "tool_arguments_error") status = "failed";
     const auto updated = milliseconds(row,"updatedAt");
     const auto ended = milliseconds(row,"endedAt");
+    auto effort=text(row,"reasoningEffort");
+    const auto observed=row.find("actualReasoningEfforts");
+    if (observed!=row.end() && observed->is_array()) {
+        for (auto item=observed->rbegin();item!=observed->rend();++item) {
+            if (!item->is_string() || item->get_ref<const std::string&>().empty()) continue;
+            effort=item->get<std::string>();
+            break;
+        }
+    }
     return {{"id",entry.id},{"source","codex"},{"readOnly",true},{"title",text(row,"title",text(row,"sessionId"))},
         {"dshId",text(row,"sessionId")},{"batch",text(row,"batchId")},{"workspace",text(row,"workspace")},
-        {"role",text(row,"role")},{"provider",text(row,"provider")},{"model",text(row,"model")},
+        {"role",text(row,"role")},{"provider",text(row,"provider")},{"model",text(row,"model")},{"effort",effort},
         {"status",status},{"updated",updated},{"completed",version.empty()?0:(ended?ended:updated)},
         {"resultVersion",version},{"read",read},{"processed",processed}};
 }

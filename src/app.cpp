@@ -802,16 +802,32 @@ private:
         row.enabled=!busy_;
         row.visual=WidgetVisual::list_view_item;
     }
+    std::wstring session_account(const Json& row) const {
+        const auto provider=row.value("provider","");
+        if (provider.empty()) return L"—";
+        const auto accounts=settings_.find("accounts");
+        if (accounts!=settings_.end()) {
+            const auto account=accounts->find(provider);
+            if (account!=accounts->end()) {
+                const auto name=title(*account,"name");
+                if (!name.empty()) return name;
+            }
+        }
+        return widen(provider);
+    }
     void session_section(List list,const Json& rows,float x,float y,float right,float bottom) {
         const bool running=list==List::running;
         const std::string surface=running?"running":"pending";
         const float left=x+16, table_right=right-32;
         const float width=table_right-left;
         const bool time_column=width>=650;
-        const float model=left+width*(time_column?.57f:.67f);
         const float time=table_right-92;
-        const float state_width=104;
+        const float state_width=width>=650?94.f:76.f;
         const float state=(time_column?time-8:table_right)-state_width;
+        const float effort_column=state-72;
+        const float name_columns=effort_column-left;
+        const float account=left+name_columns*.51f;
+        const float model=left+name_columns*.76f;
         const int total=int(rows.size());
         const int capacity=std::max(1,int((bottom-y-70)/row_height));
         panel(surface,{x,y,right,bottom});
@@ -823,8 +839,10 @@ private:
         label(total>capacity?std::to_wstring(start+1)+L"–"+std::to_wstring(end)+L" / "+std::to_wstring(total):
             std::to_wstring(total)+L" 个会话",table_right-113,y+15,113,12,surface,ColorToken::text_secondary);
         constexpr auto quiet=ColorToken::text_tertiary;
-        label(L"会话",left,y+42,model-left-12,12,surface,quiet);
-        label(L"模型",model,y+42,state-model-8,12,surface,quiet);
+        label(L"会话",left,y+42,account-left-12,12,surface,quiet);
+        label(L"账号",account,y+42,model-account-8,12,surface,quiet);
+        label(L"模型",model,y+42,effort_column-model-8,12,surface,quiet);
+        label(L"推理强度",effort_column,y+42,state-effort_column-8,12,surface,quiet);
         label(L"状态",state,y+42,state_width,12,surface,quiet);
         if (time_column) label(running?L"最近更新":L"完成时间",time,y+42,92,12,surface,quiet);
         if (!total) label(running?L"当前没有进行中的会话":L"当前没有已完成待处理的会话",
@@ -835,10 +853,13 @@ private:
             const auto action="row."+std::to_string(visible_sessions_.size());
             visible_sessions_.push_back(row);
             table_row("session."+row.at("id").get<std::string>(),action,x+8,line,table_right-x,surface);
-            label(title(row,"title"),left,line+7,model-left-12,14,surface);
+            label(title(row,"title"),left,line+7,account-left-12,14,surface);
+            label(session_account(row),account,line+7,model-account-8,13,surface,ColorToken::text_secondary);
             auto model_name=title(row,"model");
             if (model_name.empty()) model_name=L"—";
-            label(std::move(model_name),model,line+7,state-model-8,13,surface,ColorToken::text_secondary);
+            label(std::move(model_name),model,line+7,effort_column-model-8,13,surface,ColorToken::text_secondary);
+            const auto effort=title(row,"effort");
+            label(effort.empty()?L"—":effort,effort_column,line+7,state-effort_column-8,13,surface,ColorToken::text_secondary);
             label((row.value("stale",false)?L"◌ ":L"● ")+status(row),state,line+7,state_width,12,surface,status_color(row));
             if (time_column) label(local_stamp(row.value(running?"updated":"completed",std::int64_t(0))),
                 time,line+7,92,12,surface,ColorToken::text_secondary);
@@ -1087,6 +1108,9 @@ private:
                 (batch.empty()?L"":L"  ·  批次 "+batch)+(version.empty()?L"":L"  ·  结果版本 "+version),
                 left,107,inner,13,"session_detail",status_color(selected_));
             label(L"工作区  "+title(selected_,"workspace"),left,132,inner,13,"session_detail",ColorToken::text_secondary);
+            const auto model_name=title(selected_,"model"),effort=title(selected_,"effort");
+            label(L"账号  "+session_account(selected_)+L"    模型  "+(model_name.empty()?L"—":model_name)+
+                L"    推理强度  "+(effort.empty()?L"—":effort),left,152,inner,13,"session_detail",ColorToken::text_secondary);
             const bool linked=selected_.contains("dshId");
             const bool receipt=!selected_.value("resultVersion","").empty();
             const bool legacy=selected_.value("readOnly",false);

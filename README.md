@@ -37,6 +37,8 @@ Agent 通过 `cluster_start_session` 向授权工作区派发会话，通过 `cl
 
 可以用 `cluster_get_session_status({sessionId})` 查询已知会话，传入派发返回的 `id` 或 `dshId`。返回的 `sessionId` 是 FatFishBox 登记 ID。若 `dshId` 对应多条记录，请使用 `id`。同批次已有返修时，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 关联并释放原领取。关联时已完成的返修按关联时刻排队。
 
+同批次的开发交接和独立评审可以分别用自己的领取凭据关联同一个返修 ID。每次关联都释放当前领取，返修只排一次队，验收时通过 `session.repairLinks` 查看所有原交接及版本。
+
 ## 构建与验证
 
 需要 Windows、MSVC 和 CMake 3.26 或更高版本。

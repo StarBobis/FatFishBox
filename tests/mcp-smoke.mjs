@@ -151,6 +151,7 @@ try {
     const args = {title:'Smoke dispatch',batch:'smoke',role:'developer',task:'Return one report',workspace:a};
     const session = await one.tool('cluster_start_session',args);
     assert.equal(session.status,'queued');
+    assert.equal(session.effort,'high');
     const byDshId=await one.tool('cluster_get_session_status',{sessionId:session.dshId});
     assert.equal(byDshId.sessionId,session.id);
     assert.equal(byDshId.status,'running');
@@ -274,8 +275,9 @@ try {
     await mkdir(repairRegistry,{recursive:true});
     const parent={...old,sessionId:'repair-original',batchId:'repair-batch',assistantText:'原交付'+delivery(join(root,'original.png'))};
     const following={...old,sessionId:'follows-repair',updatedAt:30};
+    const peerReview={...old,sessionId:'shared-review',updatedAt:35};
     const unrelated={...old,sessionId:'unrelated',updatedAt:40};
-    await writeFile(join(repairRegistry,'workers.json'),JSON.stringify({sessions:{parent,following,unrelated}}));
+    await writeFile(join(repairRegistry,'workers.json'),JSON.stringify({sessions:{parent,following,peerReview,unrelated}}));
     const repair=await connect(repairRoot);
     let repairSettings=(await repair.tool('cluster_import_models',{authPath:auth,configPath:''})).settings;
     repairSettings=await repair.tool('cluster_configure',{revision:repairSettings.revision,permission:'prompt-on-risk'});
@@ -317,7 +319,16 @@ try {
     assert.equal(attachedRepair.handoffState,'repairing');
     assert.equal(attachedRepair.replayed,false);
     assert.equal(attachedRepair.claimReleased,true);
+    assert.equal(attachedRepair.linkedHandoffs,1);
     assert.equal((await repair.tool('cluster_attach_handoff_repair',attach)).replayed,true);
+    const review=await repair.tool('cluster_next_handoff');
+    assert.equal(review.session.id,'codex:shared-review');
+    const attachReview={...attach,claimToken:review.claimToken,originalVersion:review.session.resultVersion};
+    const shared=await repair.tool('cluster_attach_handoff_repair',attachReview);
+    assert.equal(shared.claimReleased,true);
+    assert.equal(shared.linkedHandoffs,2);
+    assert.equal((await repair.tool('cluster_attach_handoff_repair',attach)).replayed,true);
+    assert.equal((await repair.tool('cluster_attach_handoff_repair',attachReview)).replayed,true);
     assert.equal(prompts,previousPromptCount,'binding must not dispatch another prompt');
     const other=await repair.tool('cluster_next_handoff');
     assert.equal(other.session.id,'codex:unrelated');
@@ -342,6 +353,8 @@ try {
     const linked=await repair.tool('cluster_next_handoff');
     assert.equal(linked.session.id,existing.id,'the later-dispatched repair finished first');
     assert.equal(linked.session.repairOf.sessionId,followingClaim.session.id);
+    assert.deepEqual(linked.session.repairLinks.map(item=>item.sessionId),[followingClaim.session.id,review.session.id]);
+    assert.equal(linked.session.repairRequests,undefined);
     assert.notEqual(linked.claimToken,attach.claimToken);
     assert.deepEqual(linked.delivery.evidencePaths,[join(root,'repair.png')]);
     fixedStates.set(launched.session.dshId,{cursor:7,running:false,queue:[],pendingInput:[]});
