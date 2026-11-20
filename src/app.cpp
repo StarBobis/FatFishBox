@@ -434,7 +434,7 @@ public:
         if (usage_worker_.joinable()) usage_worker_.join();
         usage_busy_=true;
         usage_worker_=std::jthread([this](std::stop_token stop) {
-            try { cluster_.refresh_legacy_usage(stop); }
+            try { cluster_.refresh_usage(stop); }
             catch (const std::exception&) {}
             if (!stop.stop_requested()) PostMessageW(window,usage_finished,0,0);
         });
@@ -650,7 +650,9 @@ private:
             const auto url=widen(http_->url());
             setup+=L"支持 Streamable HTTP 的本机客户端可直接打开 "+url+
                 L"，无需认证。Codex 可运行：\n```powershell\n"
-                L"codex mcp add fatfishbox --url "+url+L"\n```\n\n";
+                L"codex mcp add fatfishbox --url "+url+L"\n```\n"
+                L"完成注册后，从客户端的 fatfishbox 工具列表直接调用。"
+                L"如运行中的 Codex 会话看不到该服务，请在 MCP 设置中重启连接，再用 /mcp 检查。\n\n";
         }
         setup+=L"也可以使用本地 stdio。按客户端支持的格式注册后，刷新工具列表。\n\n"
             L"stdio 配置示例：\n```json\n"+widen(config.dump(2))+
@@ -880,18 +882,18 @@ private:
         label(std::move(sync_state),right-418,27,302,12,"root",color);
         button("sync",L"同步会话",right-104,20,104);
         const auto usage=overview_.value("usage",Json::object());
-        const auto total=usage.value("total",Json::object());
+        const auto total=usage.value("today",Json::object());
         const auto input=total.value("uncachedInputTokens",0.0), read=total.value("cacheReadTokens",0.0);
         const auto output=total.value("outputTokens",0.0), write=total.value("cacheWriteTokens",0.0);
         const auto billed=input+read+write;
         const auto hourly=usage.value("hourlyTokens",Json(nullptr));
         const auto amount=[&](double tokens) {
-            return usage.value("sampled",0)>0 || !usage.value("missing",0)?compact_tokens(tokens):std::wstring(L"—");
+            return usage.value("todaySampled",0)>0 || !usage.value("missing",0)?compact_tokens(tokens):std::wstring(L"—");
         };
         const std::array<std::pair<const wchar_t*,std::wstring>,5> values{{
             {L"今日平均每小时",hourly.is_number()?compact_tokens(hourly.get<double>())+L" Token/h":L"—"},
-            {L"未缓存输入",amount(input)},{L"输出",amount(output)},
-            {L"缓存读取",amount(read)},{L"缓存命中",billed>0?fixed3(read*100/billed)+L"%":L"—"}
+            {L"今日未缓存输入",amount(input)},{L"今日输出",amount(output)},
+            {L"今日缓存读取",amount(read)},{L"今日缓存命中",billed>0?fixed3(read*100/billed)+L"%":L"—"}
         }};
         panel("usage",{x,64,right,127});
         const float usable=right-x-32, first=usable*.29f, cell=(usable-first)/4;
@@ -914,7 +916,7 @@ private:
             if (overview_.value("unreadableCodexSources",0)>0) summary+=summary.empty()?L"部分 Codex 登记不可读":L"  ·  部分登记不可读";
             if (usage.value("missing",0)>0) {
                 if (!summary.empty()) summary+=L"  ·  ";
-                summary+=usage_busy_?L"正在同步 Token 用量":std::to_wstring(usage.value("missing",0))+L" 个会话用量未同步";
+                summary+=usage_busy_?L"正在同步今日 Token 用量":std::to_wstring(usage.value("missing",0))+L" 个会话今日用量未同步";
             }
             label(std::move(summary),x,h-24,right-x,12,"root",ColorToken::text_secondary);
         }

@@ -176,7 +176,7 @@ try {
     const combined=await two.tool('cluster_overview');
     assert.equal(combined.codexSessions,1);
     assert.equal(combined.unprocessed,2);
-    assert.equal(combined.usage.missing,1);
+    assert.equal(combined.usage.missing,0,'an old completed session does not make today’s statistics incomplete');
     assert.equal(combined.usage.sampled,1);
     await one.tool('cluster_read_result',{sessionId:session.id},true);
     await one.tool('cluster_mark_receipt',{sessionId:session.id,resultVersion:'1:7',processed:true},true);

@@ -32,7 +32,7 @@ public:
                             const Json& expected,const Json& value) const;
     Json desktop_snapshot(DesktopMonitor* monitor=nullptr,std::stop_token stop={}) const;
     void migrate_repair_queue() const;
-    void refresh_legacy_usage(std::stop_token stop) const;
+    void refresh_usage(std::stop_token stop) const;
     static Json tools();
 private:
     Json start_session(const Json& input,const std::string& key,const Json& repair=Json()) const;

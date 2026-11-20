@@ -21,6 +21,8 @@ let active = true;
 let resumed = false;
 let offline = false;
 let paged = 0;
+const day = new Date().setHours(0,0,0,0);
+const usageSession = id => id === 'native-usage' || id === 'legacy-usage';
 const fixture = async (isManaged) => {
     const server = createServer(async (request, response) => {
         let raw = '';
@@ -35,16 +37,28 @@ const fixture = async (isManaged) => {
             }
             const running = isManaged ? resumed : active;
             value = {running, cursor:isManaged ? (resumed ? 19 : 10) : (active ? 3 : 12), queue:[], pendingInput:[]};
+            if (usageSession(args.sessionId)) value={running:false,cursor:8,queue:[],pendingInput:[]};
         } else if (method === 'session/page') {
-            const event = (seq, type, data = {}) => ({type:'event',event:{seq,type,data,time:1690000000123}});
-            if (!isManaged && args.beforeSeq === undefined) {
+            const event = (seq,type,data={},time=1690000000123) => ({type:'event',event:{seq,type,data,time}});
+            if (usageSession(args.address.sessionId)) {
+                const sample=(seq,values,time)=>event(seq,'assistant/message',{turn:1,step:0,
+                    usage:{inputTokens:values[0],outputTokens:values[1],cacheReadTokens:values[2],cacheWriteTokens:values[3]}},time);
+                if (args.maxMessages>4 && args.beforeSeq===undefined) {
+                    response.end(JSON.stringify({result:{ok:false,error:{code:'response_too_large'}}}));
+                    return;
+                }
+                value={records:[sample(7,[10,20,30,40],day),event(8,'turn/end',{reason:{kind:'completed'}},day+1),
+                    sample(4,[1000,2000,3000,4000],day-1),sample(6,[5,10,20,30],day)]};
+            } else if (!isManaged && args.beforeSeq === undefined) {
                 value = {records:[event(11,'system/note'),event(12,'system/note')],hasMore:true};
             } else {
                 if (!isManaged) paged++;
                 value = {records:[event(isManaged ? 9 : 8,'turn/end',{reason:{kind:'completed'}})]};
             }
         } else if (method === 'session/projections') {
-            value = {values:{tokenUsage:{uncachedInputTokens:1,outputTokens:2,cacheReadTokens:3,cacheWriteTokens:4}}};
+            value = {values:{tokenUsage:usageSession(args.sessionId)?
+                {uncachedInputTokens:1010,outputTokens:2020,cacheReadTokens:3030,cacheWriteTokens:4040}:
+                {uncachedInputTokens:1,outputTokens:2,cacheReadTokens:3,cacheWriteTokens:4}}};
         } else {
             response.writeHead(404).end();
             return;
@@ -135,6 +149,21 @@ try {
     const inbox=JSON.parse(await readFile(queue,'utf8'));
     assert.equal(inbox.claim,undefined);
     assert.equal(inbox.repair,undefined);
+    const dailyFile=JSON.parse(await readFile(file,'utf8'));
+    dailyFile.sessions={
+        today:{...native('today','native-usage'),created:day-60000,cursor:8,status:'succeeded',completed:day+1,resultVersion:'1:8'},
+        yesterday:{...native('yesterday','yesterday'),created:day-60000,cursor:8,status:'succeeded',completed:day-1,resultVersion:'1:8',
+            tokenDay:day-1,todayUsage:{uncachedInputTokens:55,outputTokens:55,cacheReadTokens:55,cacheWriteTokens:55}},
+    };
+    await put(file,dailyFile);
+    await put(workers,{sessions:{today:{sessionId:'legacy-usage',serviceId:'attached',serviceOrigin:attached.origin,
+        startSeq:1,cursor:8,status:'succeeded',updatedAt:(day+1)/1000,endedAt:(day+1)/1000,submittedAt:(day-60000)/1000}}});
+    const daily=(await snapshot('usage')).overview.usage;
+    assert.deepEqual(daily.today,{uncachedInputTokens:20,outputTokens:40,cacheReadTokens:60,cacheWriteTokens:80});
+    assert.equal(daily.todayTokens,200);
+    assert.equal(daily.total.cacheReadTokens,6060);
+    assert.equal(daily.todaySampled,2);
+    assert.equal(daily.missing,0);
     child.stdin.end();
     assert.equal((await once(child,'exit'))[0],0);
 } finally {

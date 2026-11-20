@@ -7,6 +7,7 @@ int main() {
     for (std::string line; std::getline(std::cin,line);) {
         try {
             if (line=="migrate") cluster.migrate_repair_queue();
+            if (line=="usage") cluster.refresh_usage({});
             std::cout << cluster.desktop_snapshot(&monitor).dump() << std::endl;
         }
         catch (const std::exception& error) {

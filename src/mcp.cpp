@@ -87,7 +87,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"protocolVersion",mcp_protocol_supported(version)?version:"2025-11-25"},
                 {"capabilities",{{"tools",Json::object()},{"resources",Json::object()}}},
                 {"serverInfo",{{"name","fatfishbox"},{"title","肥鱼重工"},{"version","0.1.0"}}},
-                {"instructions","完成对话由 cluster_next_handoff 按完成时间逐条领取。实际处置后提交当前领取凭据与处置结果。"}};
+                {"instructions","直接使用已连接的 fatfishbox 工具。完成对话由 cluster_next_handoff 按完成时间逐条领取。实际处置后提交当前领取凭据与处置结果。"}};
             if (initialized) *initialized=true;
         } else if (method=="ping") {
             value=Json::object();

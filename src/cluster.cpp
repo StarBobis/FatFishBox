@@ -394,6 +394,23 @@ Json report(const Dsh& dsh, const Json& row) {
     return dsh.request("session/page",request);
 }
 constexpr std::array usage_keys{"uncachedInputTokens","outputTokens","cacheReadTokens","cacheWriteTokens"};
+using TokenCounts=std::array<std::uint64_t,usage_keys.size()>;
+Json token_totals(const TokenCounts& counts) {
+    Json result=Json::object();
+    for (std::size_t i=0;i<counts.size();++i) result[usage_keys[i]]=counts[i];
+    return result;
+}
+TokenCounts token_counts(const Json& usage,bool from_event=false) {
+    TokenCounts counts{};
+    for (std::size_t i=0;i<counts.size();++i) {
+        const auto key=i==0 && from_event?"inputTokens":usage_keys[i];
+        if (from_event && i>=2 && !usage.contains(key)) continue;
+        const auto& value=usage.at(key);
+        require(value.is_number_unsigned(),"DSH 用量格式无效");
+        counts[i]=value.get<std::uint64_t>();
+    }
+    return counts;
+}
 std::int64_t midnight() {
     auto stamp = std::time(nullptr);
     std::tm local{};
@@ -402,37 +419,48 @@ std::int64_t midnight() {
     local.tm_isdst = -1;
     return std::int64_t(std::mktime(&local)) * 1000;
 }
-std::optional<std::uint64_t> token_sample(const Json& event) {
+std::optional<TokenCounts> token_sample(const Json& event) {
     const auto& data=event.at("data");
     if (data.contains("usage") && data.at("usage").is_object()) {
-        const auto& usage=data.at("usage");
-        return usage.at("inputTokens").get<std::uint64_t>()+usage.at("outputTokens").get<std::uint64_t>()+
-            usage.value("cacheReadTokens",std::uint64_t(0))+usage.value("cacheWriteTokens",std::uint64_t(0));
+        return token_counts(data.at("usage"),true);
     }
     const auto stream=data.value("stream",Json::array());
     if (stream.is_array()) for (auto it=stream.rbegin();it!=stream.rend();++it) {
         if (!it->contains("chunk") || it->at("chunk").value("type","")!="usage") continue;
-        const auto& usage=it->at("chunk").at("usage");
-        return usage.at("inputTokens").get<std::uint64_t>()+usage.at("outputTokens").get<std::uint64_t>()+
-            usage.value("cacheReadTokens",std::uint64_t(0))+usage.value("cacheWriteTokens",std::uint64_t(0));
+        return token_counts(it->at("chunk").at("usage"),true);
     }
     return {};
 }
-std::uint64_t day_usage(const Dsh& dsh, const Json& row, std::int64_t cursor, std::int64_t start) {
+TokenCounts day_usage(const Dsh& dsh,const Json& row,std::int64_t cursor,std::int64_t start,std::stop_token stop={}) {
     using Attempt=std::pair<int,int>;
-    std::vector<std::pair<Attempt,std::optional<std::uint64_t>>> events;
+    std::vector<std::pair<Attempt,std::optional<TokenCounts>>> events;
     auto before=cursor+1;
+    int page_size=16;
     for (int pages=0;pages<32;++pages) {
+        require(!stop.stop_requested(),"已停止同步用量");
         Json request{{"address",{{"kind","session"},{"sessionId",row.at("dshId")}}},
-            {"throughSeq",cursor},{"maxMessages",16}};
+            {"throughSeq",cursor},{"maxMessages",page_size}};
         if (before<=cursor) request["beforeSeq"]=before;
-        auto page=dsh.request("session/page",request);
+        Json page;
+        for (;;) {
+            try {page=dsh.request("session/page",request);break;}
+            catch (const std::length_error&) {
+                if (page_size<=1) throw;
+                page_size/=2;
+                request["maxMessages"]=page_size;
+            }
+        }
         auto earliest=before;
         bool old=false;
         const auto& records=page.at("records");
-        for (auto it=records.rbegin();it!=records.rend();++it) {
-            if (!it->contains("event")) continue;
-            const auto& event=it->at("event");
+        std::vector<const Json*> ordered;
+        for (const auto& record:records)
+            if (record.contains("event") && record.at("event").is_object() &&
+                record.at("event").value("seq",before)<before)
+                ordered.push_back(&record.at("event"));
+        std::ranges::sort(ordered,[](const Json* a,const Json* b){return a->at("seq")>b->at("seq");});
+        for (const auto* value:ordered) {
+            const auto& event=*value;
             auto seq=event.value("seq",before);
             if (seq>=before) continue;
             earliest=std::min(earliest,seq);
@@ -447,15 +475,22 @@ std::uint64_t day_usage(const Dsh& dsh, const Json& row, std::int64_t cursor, st
             else if (auto sample=token_sample(event)) events.emplace_back(attempt,sample);
         }
         if (old || !page.value("hasMore",false)) {
-            std::uint64_t total=0, previous=0;
+            TokenCounts total{},previous{};
             std::optional<Attempt> last;
+            const auto settle=[&] {
+                if (!last) return;
+                for (std::size_t i=0;i<total.size();++i) total[i]+=previous[i];
+                last.reset();
+            };
             for (auto it=events.rbegin();it!=events.rend();++it) {
                 const auto& [attempt,sample]=*it;
                 if (sample) {
-                    if (last==attempt) total-=previous;
-                    total+=*sample;previous=*sample;last=attempt;
-                } else if (last==attempt) last.reset();
+                    if (last!=attempt) settle();
+                    previous=*sample;
+                    last=attempt;
+                } else if (last==attempt) settle();
             }
+            settle();
             return total;
         }
         require(earliest<before,"用量分页无法继续");
@@ -474,34 +509,47 @@ Json telemetry_overview(const Json& sessions,const Json& legacy_cache) {
     const auto today=midnight();
     std::uint64_t total=0;
     int missing=0,sampled=0,today_sampled=0;
-    Json usage=Json::object();
-    for (auto name:usage_keys) usage[name]=std::uint64_t(0);
+    TokenCounts lifetime{},today_usage{};
     for (const auto& row:sessions) {
         const Json* sample=&row;
-        if (row.value("readOnly",false)) {
+        const auto legacy=row.value("readOnly",false);
+        const auto completed=row.value("completed",std::int64_t(0));
+        const bool relevant_today=active(row) || !completed || completed>=today;
+        if (legacy) {
             const auto found=legacy_cache.find(row.at("id").get<std::string>());
-            if (found==legacy_cache.end()) {++missing;continue;}
+            if (found==legacy_cache.end()) {
+                if (relevant_today) ++missing;
+                continue;
+            }
             sample=&*found;
-            if (sample->value("stale",false) || sample->value("updated",std::int64_t(0))!=
-                row.value("registryUpdated",row.at("updated").get<std::int64_t>()) ||
-                (active(row) && now()-sample->value("observed",std::int64_t(0))>120000)) ++missing;
-            else if (sample->value("tokenDay",std::int64_t(0))!=today) ++missing;
-        } else if (row.contains("startCursor") && (!row.contains("usage") ||
-            ((active(row) || row.value("completed",std::int64_t(0))>=today) &&
-             row.value("tokenDay",std::int64_t(0))!=today))) ++missing;
+        }
         const auto tokens=sample->value("usage",Json::object());
         if (!tokens.empty()) ++sampled;
-        for (auto name:usage_keys) usage[name]=usage.at(name).get<std::uint64_t>()+tokens.value(name,std::uint64_t(0));
-        if (sample->value("tokenDay",std::int64_t(0))==today && sample->contains("todayTokens")) {
-            total+=sample->at("todayTokens").get<std::uint64_t>();
+        for (std::size_t i=0;i<lifetime.size();++i) lifetime[i]+=tokens.value(usage_keys[i],std::uint64_t(0));
+        const bool same_day=sample->value("tokenDay",std::int64_t(0))==today && sample->contains("todayUsage");
+        if (same_day) {
+            const auto counts=token_counts(sample->at("todayUsage"));
+            for (std::size_t i=0;i<counts.size();++i) {
+                today_usage[i]+=counts[i];
+                total+=counts[i];
+            }
             ++today_sampled;
         }
+        if (!relevant_today) continue;
+        if (legacy) {
+            if (!same_day || sample->value("stale",false) || sample->value("updated",std::int64_t(0))!=
+                row.value("registryUpdated",row.value("updated",std::int64_t(0))) ||
+                (active(row) && now()-sample->value("observed",std::int64_t(0))>120000)) ++missing;
+        } else if (row.contains("startCursor") &&
+                   (!same_day || row.value("tokenCursor",Json())!=row.value("cursor",Json()))) ++missing;
     }
     const auto hours=double(now()-today)/3600000.0;
-    return {{"total",usage},{"todayTokens",total},{"hourlyTokens",hours>0 && (today_sampled || !missing)?
-        Json(double(total)/hours):Json(nullptr)},{"missing",missing},{"sampled",sampled}};
+    return {{"total",token_totals(lifetime)},{"today",token_totals(today_usage)},{"todayTokens",total},
+        {"hourlyTokens",hours>0 && (today_sampled || !missing)?Json(double(total)/hours):Json(nullptr)},
+        {"missing",missing},{"sampled",sampled},{"todaySampled",today_sampled}};
 }
-Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bool include_history_usage=true) {
+Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bool include_history_usage=true,
+             std::stop_token stop={}) {
     Json settings, prior;
     {
         Database db(data, false);
@@ -513,13 +561,21 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
     auto live = rpc_state(dsh, prior);
     auto cursor = live.at("cursor").get<std::int64_t>();
     const auto start = prior.at("startCursor").get<std::int64_t>();
+    const auto today=midnight();
+    const bool has_today=prior.value("tokenDay",std::int64_t(0))==today && prior.contains("todayUsage") &&
+        prior.value("tokenCursor",std::int64_t(-1))==cursor;
     std::string status;
     std::string version;
     auto completed = now();
     if (!live.value("pendingInput", Json::array()).empty()) status = "waiting_input";
     else if (live.at("running").get<bool>()) status = "running";
     else if (!live.value("queue", Json::array()).empty()) status = "queued";
-    else if (!active(prior) && prior.value("cursor", start) == cursor) return public_row(prior);
+    else if (!active(prior) && prior.value("cursor", start) == cursor) {
+        if (has_today || !include_history_usage || prior.value("completed",std::int64_t(0))<today)
+            return public_row(prior);
+        status=prior.at("status").get<std::string>();
+        version=prior.at("resultVersion").get<std::string>();
+    }
     else if (cursor <= start) status = "queued";
     else {
         status = "unknown";
@@ -529,19 +585,18 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
             if (ending->time>0) completed=ending->time;
         }
     }
-    const auto today=midnight();
     Json usage;
-    std::optional<std::uint64_t> tokens;
+    std::optional<TokenCounts> today_usage;
     try {
         const auto projections=dsh.request("session/projections",{{"sessionId",prior.at("dshId")}});
-        usage=projections.at("/values/tokenUsage"_json_pointer);
-        std::uint64_t sum=0;
-        for (auto name:usage_keys) sum+=usage.at(name).get<std::uint64_t>();
-        if (prior.value("created",std::int64_t(0))>=today) tokens=sum;
-        else if (prior.value("tokenDay",std::int64_t(0))==today && prior.value("cursor",start)==cursor &&
-                 prior.contains("todayTokens")) tokens=prior.at("todayTokens").get<std::uint64_t>();
-        else if (include_history_usage) tokens=day_usage(dsh,prior,cursor,today);
+        const auto counts=token_counts(projections.at("/values/tokenUsage"_json_pointer));
+        usage=token_totals(counts);
+        if (prior.value("created",std::int64_t(0))>=today) today_usage=counts;
     } catch (const std::exception&) {}
+    if (!has_today && include_history_usage && prior.value("created",std::int64_t(0))<today) {
+        try {today_usage=day_usage(dsh,prior,cursor,today,stop);}
+        catch (const std::exception&) {}
+    }
     Database db(data, true);
     auto& row = db.state["sessions"].at(key);
     if (row.value("cursor",start)<=cursor && row.at("startCursor")==start &&
@@ -550,7 +605,11 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
         row["status"] = status;
         row["cursor"] = cursor;
         if (usage.is_object()) row["usage"]=usage;
-        if (tokens) {row["tokenDay"]=today;row["todayTokens"]=*tokens;}
+        if (today_usage) {
+            row["tokenDay"]=today;
+            row["todayUsage"]=token_totals(*today_usage);
+            row["tokenCursor"]=cursor;
+        }
         if (row.value("resultVersion","") != version) {
             row["resultVersion"] = version;
             row["read"] = false;
@@ -758,14 +817,35 @@ Json Cluster::desktop_snapshot(DesktopMonitor* monitor,std::stop_token stop) con
         {"liveChecked",legacy.live_checked+native.first},{"liveStale",legacy.live_stale+native.second}};
 }
 
-void Cluster::refresh_legacy_usage(std::stop_token stop) const {
+void Cluster::refresh_usage(std::stop_token stop) const {
+    const auto day=midnight(), observed=now();
+    std::vector<std::string> native;
+    {
+        Database db(data_,false);
+        for (const auto& [key,row]:db.state.at("sessions").items()) {
+            if (!row.contains("startCursor") || (!active(row) && row.value("completed",std::int64_t(0))<day)) continue;
+            if (row.value("tokenDay",std::int64_t(0))!=day || !row.contains("todayUsage") ||
+                row.value("tokenCursor",Json())!=row.value("cursor",Json())) native.push_back(key);
+        }
+    }
+    std::atomic_size_t next_native{};
+    std::vector<std::jthread> native_workers;
+    for (std::size_t i=0;i<std::min<std::size_t>(4,native.size());++i) {
+        native_workers.emplace_back([&] {
+            while (!stop.stop_requested()) {
+                const auto index=next_native.fetch_add(1);
+                if (index>=native.size()) return;
+                try {refresh(data_,native[index],1500,true,stop);}
+                catch (const std::exception&) {}
+            }
+        });
+    }
     const auto settings=invoke("cluster_get_settings");
     const auto legacy=read_legacy_sessions(settings,true);
     if (legacy.rows.empty()) return;
     const auto connection=discover(settings,Json::object());
     if (connection.auth.empty()) return;
     const Dsh dsh(connection.auth,2500);
-    const auto day=midnight(), observed=now();
     const auto cache=legacy_usage_cache(data_);
     struct Job {
         std::string id;
@@ -781,7 +861,7 @@ void Cluster::refresh_legacy_usage(std::stop_token stop) const {
         if (old!=cache.end() && !active(row) && !old->value("stale",false) &&
             old->value("observed",std::int64_t(0))>=observed-5*60*1000 &&
             old->value("updated",std::int64_t(0))==row.at("updated") &&
-            old->value("tokenDay",std::int64_t(0))==day) continue;
+            old->value("tokenDay",std::int64_t(0))==day && old->contains("todayUsage")) continue;
         jobs.push_back({id,&row,&candidate,old==cache.end()?Json::object():*old});
     }
     std::sort(jobs.begin(),jobs.end(),[](const Job& a,const Job& b){return a.row->at("updated")>b.row->at("updated");});
@@ -797,28 +877,20 @@ void Cluster::refresh_legacy_usage(std::stop_token stop) const {
                 const auto& candidate=*job.candidate;
                 try {
                     const auto projections=dsh.request("session/projections",{{"sessionId",candidate.at("dshId")}});
-                    const auto& usage=projections.at("/values/tokenUsage"_json_pointer);
-                    Json totals=Json::object();
-                    std::uint64_t session_tokens=0;
-                    for (auto key:usage_keys) {
-                        const auto& count=usage.at(key);
-                        require(count.is_number_unsigned(),"DSH 用量格式无效");
-                        totals[key]=count;
-                        session_tokens+=count.get<std::uint64_t>();
-                    }
-                    job.sample["usage"]=std::move(totals);
+                    const auto counts=token_counts(projections.at("/values/tokenUsage"_json_pointer));
+                    job.sample["usage"]=token_totals(counts);
                     job.sample["observed"]=observed;
                     job.sample["updated"]=row.at("updated");
-                    std::uint64_t today_tokens=0;
-                    if (candidate.value("first",std::int64_t(0))>=day) today_tokens=session_tokens;
+                    TokenCounts today_counts{};
+                    if (candidate.value("first",std::int64_t(0))>=day) today_counts=counts;
                     else {
                         // The live cursor covers turns that resumed after a registry snapshot.
                         const auto state=dsh.request("session/state",{{"sessionId",candidate.at("dshId")}});
                         const auto cursor=state.at("cursor").get<std::int64_t>();
-                        if (cursor>=0) today_tokens=day_usage(dsh,row,cursor,day);
+                        if (cursor>=0) today_counts=day_usage(dsh,row,cursor,day,stop);
                     }
                     job.sample["tokenDay"]=day;
-                    job.sample["todayTokens"]=today_tokens;
+                    job.sample["todayUsage"]=token_totals(today_counts);
                     job.sample["stale"]=false;
                 } catch (const std::exception&) {
                     job.sample["stale"]=true;
