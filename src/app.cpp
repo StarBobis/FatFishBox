@@ -637,33 +637,20 @@ private:
         return copied;
     }
     void copy_agent_setup() {
-        std::wstring executable(32768,L'\0');
-        const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
-        if (!length || length>=executable.size()) throw std::runtime_error("无法获取肥鱼重工程序路径");
-        executable.resize(length);
-
-        const Json config{{"mcpServers",{{"fatfishbox",{{"command",narrow(executable)},{"args",Json::array({"--mcp"})}}}}}};
-        auto quoted=executable;
-        for (std::size_t i=0;(i=quoted.find(L'\'',i))!=std::wstring::npos;i+=2) quoted.insert(i,1,L'\'');
-        std::wstring setup=L"请接入这台 Windows 机器上的肥鱼重工（FatFishBox），服务名为 fatfishbox。";
+        std::wstring setup=L"肥鱼重工已启动。请直接使用客户端里的 fatfishbox MCP 工具。";
         if (http_) {
-            const auto url=widen(http_->url());
-            setup+=L"支持 Streamable HTTP 的本机客户端可直接打开 "+url+
-                L"，无需认证。Codex 可运行：\n```powershell\n"
-                L"codex mcp add fatfishbox --url "+url+L"\n```\n"
-                L"完成注册后，从客户端的 fatfishbox 工具列表直接调用。"
-                L"如运行中的 Codex 会话看不到该服务，请在 MCP 设置中重启连接，再用 /mcp 检查。\n\n";
+            setup+=L"如果工具列表还没有 fatfishbox，请通过 Streamable HTTP 连接 "+
+                widen(http_->url())+L"，无需认证。";
+        } else {
+            std::wstring executable(32768,L'\0');
+            const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
+            if (!length || length>=executable.size()) throw std::runtime_error("无法获取肥鱼重工程序路径");
+            executable.resize(length);
+            setup+=L"本机 HTTP 未启动。可将「"+executable+L"」以 --mcp 参数注册为 stdio 服务。";
         }
-        setup+=L"也可以使用本地 stdio。按客户端支持的格式注册后，刷新工具列表。\n\n"
-            L"stdio 配置示例：\n```json\n"+widen(config.dump(2))+
-            L"\n```\n\n如果你是 Codex，可以在 PowerShell 运行：\n```powershell\n"
-            L"codex mcp add fatfishbox -- '"+quoted+L"' --mcp\n```\n\n"
-            L"接入后先调用 cluster_overview 验证连接。仅在用户授权时用 cluster_start_session 派发。"
-            L"用 cluster_next_handoff({}) 按完成时间领取最早的待处理会话。完成实际处置后，"
-            L"用同一工具提交 claimToken 和 outcome，确认当前结果后领取下一条。"
-            L"只想重读当前结果时仅传 claimToken。需要返修时用 cluster_repair_handoff。"
-            L"完整示例可读取 MCP 资源 fatfish://workflow。\n\n"
-            L"如果你无法启动本机进程或修改 MCP 配置，请说明需要用户在客户端完成哪一步。";
+        setup+=L"\n\n仅在用户授权时派发。用 cluster_next_handoff({}) 领取最早完成的待处理交接，"
+            L"实际处置后提交 claimToken 和 outcome，确认当前交接并领取下一条。"
+            L"派发和返修的完整流程见 MCP 资源 fatfish://workflow。";
         notice_=copy_text(setup)?L"已复制接入说明，粘贴给 Agent 即可":L"剪贴板暂不可用";
         redraw();
     }

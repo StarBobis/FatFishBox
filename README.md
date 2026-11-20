@@ -17,7 +17,7 @@
 
 ## MCP
 
-在「连接与 MCP」点击「复制接入说明」，把剪贴板内容粘贴给 Agent。说明包含当前 EXE 路径、通用 MCP 配置和派发与交接流程。支持本机 MCP 的客户端可按说明注册服务。
+在「连接与 MCP」点击「复制接入说明」，把剪贴板内容粘贴给 Agent。说明优先引导 Agent 直接调用已注册的工具，并提供当前 HTTP 地址和交接规则。HTTP 未启动时会提供 stdio 接入信息。
 
 双击 `FatFishBox.exe` 会自动启动 Streamable HTTP 本机监听，默认地址是 `http://127.0.0.1:17863/mcp`，可用 `FATFISHBOX_MCP_PORT` 修改。本机客户端可直接连接，无需认证。Codex 可通过 `codex mcp add fatfishbox --url http://127.0.0.1:17863/mcp` 注册。关闭桌面会关闭随窗口启动的监听。用 `FatFishBox.exe --mcp-http` 可运行无界面服务。
 
