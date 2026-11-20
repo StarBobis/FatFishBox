@@ -15,6 +15,8 @@ Token 用量显示未缓存输入、输出、缓存读取、缓存命中和当�
 
 ## MCP
 
+在「连接与 MCP」点击「复制接入说明」，把剪贴板内容粘贴给 Agent。说明包含当前 EXE 路径、通用 MCP 配置和派发与交接流程。支持本机 MCP 的客户端可按说明注册服务。
+
 双击 `FatFishBox.exe` 会自动启动 Streamable HTTP 本机监听，默认地址是 `http://127.0.0.1:17863/mcp`，可用 `FATFISHBOX_MCP_PORT` 修改。客户端发送 `Authorization: Bearer <令牌>`，令牌从「连接与 MCP」复制，或从数据目录的 `mcp-http.token` 读取。关闭桌面会关闭随窗口启动的监听。用 `FatFishBox.exe --mcp-http` 可运行无界面服务。
 
 同一个 EXE 带 `--mcp` 参数时以标准输入输出提供 MCP。Codex 的 stdio 配置示例见下方。

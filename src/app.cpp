@@ -558,6 +558,31 @@ private:
         notice_=copy_text(widen(http_->token()))?L"已复制 MCP 令牌":L"剪贴板暂不可用";
         redraw();
     }
+    void copy_agent_setup() {
+        std::wstring executable(32768,L'\0');
+        const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
+        if (!length || length>=executable.size()) throw std::runtime_error("无法获取肥鱼重工程序路径");
+        executable.resize(length);
+
+        const Json config{{"mcpServers",{{"fatfishbox",{{"command",narrow(executable)},{"args",Json::array({"--mcp"})}}}}}};
+        auto quoted=executable;
+        for (std::size_t i=0;(i=quoted.find(L'\'',i))!=std::wstring::npos;i+=2) quoted.insert(i,1,L'\'');
+        std::wstring setup=
+            L"请接入这台 Windows 机器上的肥鱼重工（FatFishBox），使用名为 fatfishbox 的本地 stdio MCP 服务。"
+            L"如果你能修改本机 MCP 配置，请按客户端支持的格式注册，然后刷新工具列表。\n\n"
+            L"通用 MCP 配置示例：\n```json\n"+widen(config.dump(2))+
+            L"\n```\n\n如果你是 Codex，可以在 PowerShell 运行：\n```powershell\n"
+            L"codex mcp add fatfishbox -- '"+quoted+L"' --mcp\n```\n\n"
+            L"接入后先调用 cluster_overview 验证连接。仅在用户授权时用 cluster_start_session 派发。"
+            L"用 cluster_next_handoff({}) 按完成时间领取最早的待处理会话。完成实际处置后，"
+            L"用同一工具提交 claimToken 和 outcome，确认当前结果后领取下一条。"
+            L"只想重读当前结果时仅传 claimToken。更多说明可读取 MCP 资源 fatfish://workflow。\n\n"
+            L"如果你无法启动本机进程或修改 MCP 配置，请说明需要用户在客户端完成哪一步。";
+        if (http_) setup+=L" 仅支持 HTTP 且也在此 Windows 主机上的客户端可连接 "+widen(http_->url())+
+            L"，令牌请由用户从设置页单独填入客户端认证配置。";
+        notice_=copy_text(setup)?L"已复制接入说明，粘贴给 Agent 即可":L"剪贴板暂不可用";
+        redraw();
+    }
     void local_snapshot() {
         try {
             auto snapshot=cluster_.desktop_snapshot();
@@ -770,7 +795,8 @@ private:
         const float mcp_x=side?config_right+12:x;
         const float mcp_y=side?64.f:358.f;
         panel("mcp",{mcp_x,mcp_y,right,mcp_y+(side?166.f:106.f)});
-        label(L"MCP 连接",mcp_x+16,mcp_y+12,right-mcp_x-32,17,"mcp",ColorToken::text_primary,true);
+        label(L"MCP 连接",mcp_x+16,mcp_y+12,right-mcp_x-172,17,"mcp",ColorToken::text_primary,true);
+        button("copy_agent_setup",L"复制接入说明",right-144,mcp_y+6,128,true,true,"mcp");
         if (http_) {
             label(L"HTTP 监听中",mcp_x+16,mcp_y+42,right-mcp_x-132,12,"mcp",ColorToken::status_success);
             label(widen(http_->url()),mcp_x+16,mcp_y+62,right-mcp_x-132,13,"mcp");
@@ -965,6 +991,7 @@ private:
         try {
             if (name.starts_with("nav.")) {nav(name.substr(4));return;}
             if (name=="refresh_presets") {refresh_presets();return;}
+            if (name=="copy_agent_setup") {copy_agent_setup();return;}
             if (name=="copy_token") {copy_http_token();return;}
             if (name=="copy_result") {
                 notice_=copy_text(result_loaded_?output_:title(selected_,"error"))?L"已复制结果":L"剪贴板暂不可用";
