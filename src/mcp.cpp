@@ -9,6 +9,22 @@
 namespace {
 using fatfish::Json;
 using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
+constexpr auto workflow=R"workflow(# 肥鱼重工 · 主代理工作流
+
+以下示例以「第 15 轮透明度蒙版」为例。将路径、池 ID 和提交哈希替换成实际值。
+
+1. 主代理确定本轮基线和验收条件。在主仓库核对 HEAD 后，从该提交创建隔离工作树，例如 `git worktree add -b codex/mask-b15 C:/Dev/worktrees/mask-b15 HEAD`。为每个并行子会话准备独立工作树。
+2. 用 `cluster_get_settings` 查询已启用模型的池 ID，然后调用 `cluster_start_session`。例如 `{"batch":"mask-b15","title":"实现透明度蒙版","workspace":"C:/Dev/worktrees/mask-b15","allowedPoolIds":["<GitHub 池 ID>","<Outlook 池 ID>"],"task":"实现蒙版并运行专项测试。提交候选，保存截图，报告实际命令与退出码。"}`。批次首次设置允许池后，后续派发及返修沿用该清单。省略 `poolId` 可在范围内自动换池。若返回派发诊断，检查 `pools[].reason`、`occupied`、`concurrency` 和 `availablePools`。提交状态不确定时先同步，确认原任务状态后再决定是否重试。
+3. 子会话负责实现、自测和证据，最终回复包含 `fatfish-delivery` 围栏里的 JSON，例如：
+
+```fatfish-delivery
+{"candidateSha":"<完整 Git SHA>","worktreeClean":true,"tests":[{"command":"ctest -C Release -R mask","exitCode":0}],"evidencePaths":["C:/Dev/worktrees/mask-b15/build/mask.png"]}
+```
+
+4. 主代理调用 `cluster_next_handoff({})` 领队首，保存 `claimToken` 和 `session.resultVersion`。核对 `delivery` 中自报的提交、工作树、测试和证据。主代理在候选上跑累计构建和回归，亲自打开实窗检查布局、交互以及截图覆盖不到的行为。
+5. 发现问题时，从已核对的候选 SHA 建返修工作树，例如 `git worktree add -b codex/mask-b15-repair C:/Dev/worktrees/mask-b15-repair <候选 SHA>`。调用 `cluster_repair_handoff`，传入 `claimToken`、原 `session.resultVersion` 作为 `originalVersion`、稳定的 `requestId`、`candidateSha`、`screenshotPaths`、`acceptance`、`title`、返修 `workspace` 和 `task`。例如验收条件可以写「在目标缩放下打开实窗，标题与按钮仍可读，累计构建和蒙版回归通过」。网络重试时沿用同一 `requestId`。
+6. 用 `cluster_next_handoff({claimToken})` 重读队首。返修结束后，从 `repair.delivery` 获取候选并重新做累计验证和实窗验收。确认实际处置后提交 `cluster_next_handoff({claimToken,outcome:"已核对返修提交、完成累计构建和实窗验收，已合入。"})`。工具确认当前交接并返回下一条。已领取凭据过期时，用空参数重新领取原队首。
+)workflow";
 
 File open_stream(DWORD standard_handle, const char* mode, int flags) {
     HANDLE handle = GetStdHandle(standard_handle);
@@ -84,7 +100,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"resourceTemplates",Json::array()}};
         } else if (method=="resources/read" && params.value("uri","")=="fatfish://workflow") {
             value={{"contents",Json::array({{{"uri","fatfish://workflow"},{"mimeType","text/markdown"},
-                {"text","# 肥鱼重工\n自动派发按账号负载均衡，遵守模型并发上限。结果按版本读取和确认。项目验收由主会话负责。"}}})}};
+                {"text",workflow}}})}};
         } else if (method=="tools/call") {
             try {
                 const auto tool=params.at("name").get<std::string>();
@@ -96,6 +112,9 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
                     {"errors",data.at("errors").size()},{"total",data.at("total")}};
                 if (tool=="cluster_cancel_session") data={{"status",data.at("status")}};
                 value={{"content",Json::array()},{"structuredContent",std::move(data)}};
+            } catch (const fatfish::DispatchError& error) {
+                value={{"isError",true},{"structuredContent",error.details},
+                    {"content",Json::array({{{"type","text"},{"text",error.what()}}})}};
             } catch (const std::exception& error) {
                 value={{"isError",true},{"content",Json::array({{{"type","text"},{"text",error.what()}}})}};
             }

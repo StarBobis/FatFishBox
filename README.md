@@ -31,6 +31,10 @@ args = ["--mcp"]
 
 Agent 通过 `cluster_start_session` 向授权工作区派发会话，通过 `cluster_next_handoff({})` 领取最早完成的未处理对话。采取处置后用同一工具提交 `{claimToken, outcome}`，回执生效后返回下一条。仅提交令牌可重读当前结果。回执绑定结果版本。领取有效期为 30 分钟，过期后原结果会重新排队。MCP 还提供计数、导入、调度、同步和取消工具，以及 `fatfish://workflow` 流程资源。
 
+首次派发可用 `allowedPoolIds` 为批次保存允许池清单。自动派发可在清单内处理模型不可用或账号限流，固定池使用 `poolId`。提交任务后遇到状态不明时先同步，避免重复派发。派发诊断提供池的状态、占用、上限和备选池。
+
+用 `cluster_repair_handoff` 从当前队首派发返修。返修结果挂在原交接下，主代理验收后确认原交接。结构化 `delivery` 包含子会话自报的提交、工作树状态、测试退出码和证据路径。完整操作示例见 `fatfish://workflow`。
+
 ## 构建与验证
 
 需要 Windows、MSVC 和 CMake 3.26 或更高版本。

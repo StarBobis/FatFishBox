@@ -126,7 +126,7 @@ Json Dsh::call(std::string_view method, const Json& args) const {
     DWORD status = 0, status_length = sizeof(status);
     verify(WinHttpQueryHeaders(request.handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_length, WINHTTP_NO_HEADER_INDEX), "DSH 响应没有 HTTP 状态");
-    if (status != 200) throw std::runtime_error(std::string(method) + " HTTP " + std::to_string(status));
+    if (status != 200) throw DshError(std::string(method) + " HTTP " + std::to_string(status),"http_"+std::to_string(status));
     std::string body;
     std::vector<char> buffer(32 * 1024);
     for (;;) {
@@ -140,9 +140,10 @@ Json Dsh::call(std::string_view method, const Json& args) const {
     const auto& result = envelope.at("result");
     if (!result.value("ok", false)) {
         const auto error=result.find("error");
-        if (error!=result.end() && error->is_object() && error->value("code","")=="response_too_large")
+        const auto code=error!=result.end() && error->is_object()?error->value("code",error->value("type","")):result.value("code","");
+        if (code=="response_too_large")
             throw std::length_error("DSH 响应超过大小上限");
-        throw std::runtime_error("DSH 拒绝了 " + std::string(method));
+        throw DshError("DSH 拒绝了 " + std::string(method),code);
     }
     return result.value("value", Json(nullptr));
 }

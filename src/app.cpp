@@ -67,6 +67,9 @@ std::wstring title(const Json& object, const char* member) {
     return widen(object.value(member, ""));
 }
 std::wstring status(const Json& row) {
+    const auto handoff=row.value("handoffState","");
+    if (handoff=="repairing") return L"返修中";
+    if (handoff=="awaiting_acceptance") return L"待主代理验收";
     static const std::map<std::string,std::wstring> labels{
         {"starting",L"启动中"},{"queued",L"排队"},{"running",L"运行中"},{"waiting_input",L"等待输入"},
         {"cancelling_policy_violation",L"正在停止"},
@@ -76,6 +79,7 @@ std::wstring status(const Json& row) {
 }
 ColorToken status_color(const Json& row) {
     const auto state=row.value("status","");
+    if (row.contains("handoffState")) return ColorToken::status_warning;
     if (row.value("stale",false)) return ColorToken::status_warning;
     if (state=="succeeded") return ColorToken::status_success;
     if (state=="failed" || state=="interrupted") return ColorToken::status_error;
@@ -657,7 +661,8 @@ private:
             L"接入后先调用 cluster_overview 验证连接。仅在用户授权时用 cluster_start_session 派发。"
             L"用 cluster_next_handoff({}) 按完成时间领取最早的待处理会话。完成实际处置后，"
             L"用同一工具提交 claimToken 和 outcome，确认当前结果后领取下一条。"
-            L"只想重读当前结果时仅传 claimToken。更多说明可读取 MCP 资源 fatfish://workflow。\n\n"
+            L"只想重读当前结果时仅传 claimToken。需要返修时用 cluster_repair_handoff。"
+            L"完整示例可读取 MCP 资源 fatfish://workflow。\n\n"
             L"如果你无法启动本机进程或修改 MCP 配置，请说明需要用户在客户端完成哪一步。";
         notice_=copy_text(setup)?L"已复制接入说明，粘贴给 Agent 即可":L"剪贴板暂不可用";
         redraw();
@@ -806,8 +811,9 @@ private:
         const float width=table_right-left;
         const bool time_column=width>=650;
         const float model=left+width*(time_column?.57f:.67f);
-        const float state=table_right-(time_column?175.f:78.f);
         const float time=table_right-92;
+        const float state_width=104;
+        const float state=(time_column?time-8:table_right)-state_width;
         const int total=int(rows.size());
         const int capacity=std::max(1,int((bottom-y-70)/row_height));
         panel(surface,{x,y,right,bottom});
@@ -821,7 +827,7 @@ private:
         constexpr auto quiet=ColorToken::text_tertiary;
         label(L"会话",left,y+42,model-left-12,12,surface,quiet);
         label(L"模型",model,y+42,state-model-8,12,surface,quiet);
-        label(L"状态",state,y+42,time_column?75.f:78.f,12,surface,quiet);
+        label(L"状态",state,y+42,state_width,12,surface,quiet);
         if (time_column) label(running?L"最近更新":L"完成时间",time,y+42,92,12,surface,quiet);
         if (!total) label(running?L"当前没有进行中的会话":L"当前没有已完成待处理的会话",
             left,y+73,width,14,surface,ColorToken::text_secondary);
@@ -835,7 +841,7 @@ private:
             auto model_name=title(row,"model");
             if (model_name.empty()) model_name=L"—";
             label(std::move(model_name),model,line+7,state-model-8,13,surface,ColorToken::text_secondary);
-            label((row.value("stale",false)?L"◌ ":L"● ")+status(row),state,line+7,time_column?76.f:78.f,12,surface,status_color(row));
+            label((row.value("stale",false)?L"◌ ":L"● ")+status(row),state,line+7,state_width,12,surface,status_color(row));
             if (time_column) label(local_stamp(row.value(running?"updated":"completed",std::int64_t(0))),
                 time,line+7,92,12,surface,ColorToken::text_secondary);
         }

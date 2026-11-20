@@ -3,6 +3,12 @@
 #include <optional>
 
 namespace fatfish {
+struct DshError : std::runtime_error {
+    DshError(std::string message,std::string error_code)
+        :std::runtime_error(std::move(message)),code(std::move(error_code)) {}
+    std::string code;
+};
+
 struct DshConnection {
     fs::path config;
     fs::path auth;

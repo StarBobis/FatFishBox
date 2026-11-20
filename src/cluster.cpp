@@ -132,6 +132,53 @@ std::string field(const Json& source, std::string_view key, std::size_t max) {
     require(!value.empty() && value.size() <= max && value.find('\0') == std::string::npos, "缺少字段或长度无效");
     return value;
 }
+bool commit_sha(std::string_view sha) {
+    return (sha.size()==40 || sha.size()==64) && std::ranges::all_of(sha,[](unsigned char ch) {
+        return (ch>='0' && ch<='9') || (ch>='a' && ch<='f') || (ch>='A' && ch<='F');
+    });
+}
+bool evidence_paths(const Json& paths) {
+    return paths.is_array() && paths.size()<=16 && std::ranges::all_of(paths,[](const Json& path) {
+        if (!path.is_string()) return false;
+        const auto& value=path.get_ref<const std::string&>();
+        return !value.empty() && value.size()<=1000 && value.find('\0')==std::string::npos &&
+            path_from_utf8(value).is_absolute();
+    });
+}
+Json extract_delivery(Json& messages) {
+    for (auto it=messages.rbegin();it!=messages.rend();++it) {
+        const auto kind=it->value("type","");
+        if (kind!="assistant/message" && kind!="assistant/response") continue;
+        auto output=it->value("text","");
+        constexpr std::string_view fence="```fatfish-delivery";
+        const auto begin=output.rfind(fence);
+        if (begin==std::string::npos) continue;
+        const auto after=begin+fence.size();
+        const auto end=output.find("```",after);
+        if (end==std::string::npos || end-after>6000) continue;
+        const auto parsed=Json::parse(std::string_view(output).substr(after,end-after),nullptr,false);
+        if (!parsed.is_object()) continue;
+        const auto sha=parsed.value("candidateSha",Json());
+        const auto clean=parsed.value("worktreeClean",Json());
+        const auto tests=parsed.value("tests",Json());
+        const auto paths=parsed.value("evidencePaths",Json());
+        if (!parsed.contains("candidateSha") || (!sha.is_null() && (!sha.is_string() || !commit_sha(sha.get_ref<const std::string&>()))) ||
+            !clean.is_boolean() || !tests.is_array() || tests.size()>16 || !evidence_paths(paths)) continue;
+        Json checks=Json::array();
+        for (const auto& test:tests) {
+            if (!test.is_object()) break;
+            const auto command=test.value("command",Json()),code=test.value("exitCode",Json());
+            if (!command.is_string() || command.get_ref<const std::string&>().empty() ||
+                command.get_ref<const std::string&>().size()>600 || !code.is_number_integer()) break;
+            checks.push_back({{"command",command},{"exitCode",code}});
+        }
+        if (tests.size()!=checks.size()) continue;
+        output.erase(begin,end+3-begin);
+        (*it)["text"]=std::move(output);
+        return {{"candidateSha",sha},{"worktreeClean",clean},{"tests",checks},{"evidencePaths",paths},{"source","agent_reported"}};
+    }
+    return nullptr;
+}
 void validate_configuration(const Json& settings) {
     for (const auto name : {"configPath","authPath"}) {
         auto path = settings.at(name).get<std::string>();
@@ -168,26 +215,122 @@ Json public_row(Json row) {
     row.erase("dispatchOperation");
     return row;
 }
-std::string choose_pool(const Json& settings, const Json& sessions,const std::string& pinned) {
+using CatalogModels=std::map<std::pair<std::string,std::string>,Json>;
+CatalogModels catalog_models(const Json& catalog) {
+    CatalogModels models;
+    for (const auto& group:catalog.at("groups")) {
+        if (!group.value("enabled",true) || !group.value("available",true)) continue;
+        for (const auto& model:group.at("models"))
+            if (model.value("enabled",true) && model.value("available",true))
+                models.emplace(std::pair(group.at("id").get<std::string>(),model.at("id").get<std::string>()),model);
+    }
+    return models;
+}
+
+std::set<std::string> batch_allowlist(const Json& input) {
+    if (!input.contains("allowedPoolIds")) return {};
+    const auto& pools=input.at("allowedPoolIds");
+    require(pools.is_array() && !pools.empty() && pools.size()<=64,"批次允许池需要 1 至 64 个池 ID");
+    std::set<std::string> keys;
+    for (const auto& item:pools) {
+        require(item.is_string() && !item.get_ref<const std::string&>().empty() &&
+            item.get_ref<const std::string&>().size()<=100,"批次允许池 ID 无效");
+        keys.insert(item.get<std::string>());
+    }
+    return keys;
+}
+
+struct PoolSelection {
+    std::string key;
+    Json diagnostics;
+};
+PoolSelection choose_pool(const Json& settings,const Json& sessions,const CatalogModels& models,
+    const std::set<std::string>& allowed,const std::string& pinned,const Json& cooldowns,
+    const std::map<std::string,std::string>& rejected) {
     std::vector<std::tuple<int,int,std::string>> scores;
+    Json diagnostics{{"pools",Json::array()},{"availablePools",Json::array()}};
     for (const auto& [key, pool] : settings.at("pools").items()) {
-        if (!pool.at("enabled").get<bool>() || (!pinned.empty() && key != pinned)) continue;
         const auto provider = pool.at("provider").get<std::string>();
-        int account_count=0,pool_count=0;
+        const auto model=pool.at("model").get<std::string>();
+        const auto enabled=pool.at("enabled").get<bool>();
+        const bool in_batch=allowed.empty() || allowed.contains(key);
+        if (!enabled && key!=pinned && !allowed.contains(key)) continue;
+        int account_count=0,pool_count=0,unverified=0;
         for (const auto& row : sessions) {
             if (!active(row)) continue;
             if (row.at("provider")==provider) ++account_count;
             const auto legacy_model = row.value("source","") == "codex" && row.at("provider") == provider &&
                 row.value("model","") == pool.at("model").get<std::string>();
-            if (row.value("poolId","")==key || legacy_model) ++pool_count;
+            if (row.value("poolId","")==key || legacy_model) {
+                ++pool_count;
+                if (row.value("stale",false)) ++unverified;
+            }
         }
         const auto cap = pool.at("concurrency").get<int>();
-        if (pool_count>=cap) continue;
+        const auto cooldown=cooldowns.value(provider,std::int64_t(0));
+        const auto refusal=rejected.find(key);
+        const std::string_view reason=!in_batch?"batch_restricted":!enabled?"disabled":
+            cooldown>now()?"account_cooldown":!models.contains({provider,model})?"model_unavailable":
+            refusal!=rejected.end()?std::string_view(refusal->second):pool_count>=cap?"slots_full":"available";
+        Json diagnostic{{"poolId",key},{"account",settings.at("accounts").at(provider).value("name",provider)},
+            {"model",pool.value("name",model)},{"occupied",pool_count},{"concurrency",cap},{"reason",reason}};
+        if (unverified) diagnostic["unverifiedSlots"]=unverified;
+        if (reason=="account_cooldown") diagnostic["retryAt"]=cooldown;
+        if (diagnostics.at("pools").size()<64 || key==pinned) diagnostics["pools"].push_back(diagnostic);
+        if (reason!="available") continue;
+        if (diagnostics.at("availablePools").size()<24)
+            diagnostics["availablePools"].push_back(diagnostic);
+        if (!pinned.empty() && key!=pinned) continue;
         const auto load = 100000 * pool_count / cap;
         scores.emplace_back(account_count,load,key);
     }
-    require(!scores.empty(), "没有具备可用并发额度的启用模型池");
-    return std::get<2>(*std::min_element(scores.begin(), scores.end()));
+    if (!pinned.empty() && !settings.at("pools").contains(pinned))
+        diagnostics["pools"].push_back({{"poolId",pinned},{"reason","unknown_pool"}});
+    return {scores.empty()?"":std::get<2>(*std::min_element(scores.begin(),scores.end())),std::move(diagnostics)};
+}
+
+std::string selection_rejection(const DshError& error) {
+    if (error.code=="http_429" || error.code=="rate_limited" || error.code=="account_cooldown" ||
+        error.code=="quota_exceeded") return "account_cooldown";
+    if (error.code=="model_unavailable" || error.code=="model_not_found" ||
+        error.code=="provider_unavailable" || error.code=="provider_not_found") return "model_unavailable";
+    return {};
+}
+
+std::string pool_failure(const Json& diagnostics,const std::string& pinned) {
+    const auto& pools=diagnostics.at("pools");
+    const auto selected=std::ranges::find_if(pools,[&](const Json& entry) {return entry.at("poolId")==pinned;});
+    const auto describe=[](const Json& entry) {
+        const auto reason=entry.at("reason").get<std::string>();
+        if (reason=="unknown_pool") return std::string("池 ID 不存在");
+        const auto name=entry.at("account").get<std::string>()+" / "+entry.at("model").get<std::string>();
+        if (reason=="slots_full") return name+" 槽位已满（"+entry.at("occupied").dump()+"/"+entry.at("concurrency").dump()+"）";
+        if (reason=="account_cooldown") return name+" 的账号正在冷却";
+        if (reason=="batch_restricted") return name+" 不在批次允许池清单中";
+        if (reason=="model_unavailable") return name+" 在 DSH 中不可用";
+        return name+" 未启用";
+    };
+    std::string message;
+    if (selected!=pools.end()) message=describe(*selected);
+    else {
+        for (const auto& entry:pools) {
+            if (entry.at("reason")=="batch_restricted") continue;
+            if (!message.empty()) message+="。";
+            message+=describe(entry);
+            if (message.size()>400) break;
+        }
+        if (message.empty()) message="派发范围内没有启用的模型池";
+    }
+    const auto& available=diagnostics.at("availablePools");
+    if (!available.empty()) {
+        message+="。可用池";
+        for (std::size_t i=0;i<std::min<std::size_t>(3,available.size());++i) {
+            const auto& entry=available.at(i);
+            message+=(i?", ":" ")+entry.at("account").get<std::string>()+" / "+entry.at("model").get<std::string>()+
+                " ("+entry.at("poolId").get<std::string>()+")";
+        }
+    }
+    return message;
 }
 Json catalog_import(Json& settings, const Json& catalog) {
     int group_count = 0, model_count = 0;
@@ -434,7 +577,7 @@ Json session_overview(const Json& settings,const Json& sessions,const LegacySess
     int running=0, pending=0;
     for (const auto& row:sessions) {
         if (active(row)) ++running;
-        else if (!row.value("processed",false)) ++pending;
+        else if (!row.contains("repairOf") && !row.value("processed",false)) ++pending;
     }
     return {{"active",running},{"unprocessed",pending},{"accounts",settings.at("accounts").size()},
         {"models",settings.at("pools").size()},{"connected",!settings.at("authPath").get<std::string>().empty()},
@@ -499,16 +642,29 @@ Json Cluster::desktop_snapshot(DesktopMonitor* monitor,std::stop_token stop) con
         sessions=db.state.at("sessions");
     }
     sessions.update(legacy.rows);
+    Json repair;
+    try {
+        const auto file=data_/L"handoff.json";
+        if (fs::exists(file)) repair=read_json(file).value("repair",Json());
+    } catch (const std::exception&) {}
     std::vector<Json> running,pending;
-    for (const auto& row:sessions) {
+    for (auto row:sessions) {
         if (active(row)) running.push_back(public_row(row));
-        else if (!row.value("processed",false)) pending.push_back(public_row(row));
+        else if (!row.contains("repairOf") && !row.value("processed",false)) {
+            if (repair.is_object() && repair.at("parentId")==row.at("id") &&
+                repair.at("parentVersion")==row.at("resultVersion")) {
+                const auto child=sessions.find(repair.at("sessionId").get<std::string>());
+                row["handoffState"]=child==sessions.end() || active(*child)?"repairing":"awaiting_acceptance";
+            }
+            pending.push_back(public_row(row));
+        }
     }
     const auto order=[](const Json& row,const char* stamp) {
         return std::pair(row.value(stamp,std::int64_t(0)),row.at("id").get<std::string>());
     };
     std::sort(running.begin(),running.end(),[&](const Json& a,const Json& b) {return order(a,"updated")>order(b,"updated");});
-    std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return order(a,"completed")<order(b,"completed");});
+    const auto pending_order=[&](const Json& row) {return std::pair(!row.contains("handoffState"),order(row,"completed"));};
+    std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return pending_order(a)<pending_order(b);});
     return {{"overview",session_overview(settings,sessions,legacy,data_)},{"settings",settings},
         {"running",std::move(running)},{"pending",std::move(pending)},
         {"liveChecked",legacy.live_checked+native.first},{"liveStale",legacy.live_stale+native.second}};
@@ -597,6 +753,174 @@ void Cluster::refresh_legacy_usage(std::stop_token stop) const {
     write_state_file(data_/L"legacy-usage.json",updated);
 }
 
+Json Cluster::start_session(const Json& input,const std::string& key,const Json& repair) const {
+    const auto title = field(input,"title",400), batch = field(input,"batch",400);
+    const auto role=input.contains("role")?field(input,"role",32):"developer", task=field(input,"task",64000);
+    require(roles.contains(role), "未知角色");
+    const auto work = path_from_utf8(field(input,"workspace",4000));
+    require(work.is_absolute() && fs::is_directory(work) && work.has_relative_path(), "工作区必须是现有的绝对子目录");
+    const auto workspace = fs::canonical(work);
+    require(workspace.has_relative_path(), "工作区不能指向磁盘根目录");
+    const auto settings=invoke("cluster_get_settings");
+    require(settings.at("permission")!="","派发前需要设置并验证 DSH 权限预设");
+    const auto pinned=input.contains("poolId")?field(input,"poolId",100):"";
+    const auto requested=batch_allowlist(input);
+    const Dsh dsh(path_from_utf8(settings.at("authPath").get<std::string>()));
+    CatalogModels models;
+    try {models=catalog_models(dsh.request("session/modelCatalog"));}
+    catch (const std::exception&) {
+        throw DispatchError("无法读取 DSH 实时模型目录",{{"reason","catalog_unavailable"},{"availablePools",Json::array()}});
+    }
+    LegacyObservations observations;
+    const auto legacy=read_legacy_sessions(settings,false,&observations);
+    Json pool,row,diagnostics;
+    std::map<std::string,std::string> rejected;
+    const auto reserve=[&](const std::string& cooling_account={}) {
+        Database db(data_, true);
+        const auto& current=db.state.at("settings");
+        for (const auto name:{"authPath","configPath","permission","preset"})
+            require(current.at(name)==settings.at(name),"DSH 连接设置已变化，请重新派发");
+        auto& sessions = db.state["sessions"];
+        if (row.empty()) require(!sessions.contains(key),"此派发请求已存在");
+        auto occupied = sessions;
+        occupied.erase(key);
+        occupied.update(legacy.rows);
+        for (const auto& value : occupied) {
+            if (active(value)) require(_wcsicmp(widen(value.at("workspace").get<std::string>()).c_str(),
+                workspace.c_str()) != 0, "该工作区已有活动会话");
+        }
+        auto& batches=db.state["batchPools"];
+        auto allowed=requested;
+        if (batches.contains(batch)) {
+            allowed=batches.at(batch).get<std::set<std::string>>();
+            if (!requested.empty() && requested!=allowed)
+                throw DispatchError("此批次已有允许池清单",{{"reason","batch_allowlist_conflict"},{"allowedPoolIds",allowed}});
+        }
+        for (const auto& pool_id:allowed)
+            if (!current.at("pools").contains(pool_id))
+                throw DispatchError("批次清单包含未知池",{{"reason","unknown_pool"},{"poolId",pool_id}});
+        auto& cooldowns=db.state["accountCooldowns"];
+        if (cooldowns.is_null()) cooldowns=Json::object();
+        if (!cooling_account.empty()) {
+            cooldowns[cooling_account]=now()+60000;
+            db.save();
+        }
+        auto choice=choose_pool(current,occupied,models,allowed,pinned,cooldowns,rejected);
+        diagnostics=std::move(choice.diagnostics);
+        if (choice.key.empty()) throw DispatchError(pool_failure(diagnostics,pinned),diagnostics);
+        if (!allowed.empty()) batches[batch]=allowed;
+        pool=current.at("pools").at(choice.key);
+        if (row.empty()) row={{"id",key},{"title",title},{"role",role},{"batch",batch},{"workspace",utf8(workspace)},
+            {"status","starting"},{"created",now()},{"resultVersion",""},{"read",false},{"processed",false}};
+        row.update({{"poolId",choice.key},{"provider",pool.at("provider")},{"model",pool.at("model")},{"updated",now()}});
+        if (!repair.is_null()) row["repairOf"]=repair;
+        sessions[key] = row;
+        db.save();
+    };
+    reserve();
+    bool may_have_dispatched = false;
+    std::string stage="create_session";
+    try {
+        Json create{{"cwd",utf8(workspace)}};
+        if (settings.at("preset") != "") create["agentPreset"] = settings.at("preset");
+        const auto created = dsh.request("session/create", create);
+        const auto sid = field(created, "sessionId", 200);
+        row["dshId"] = sid;
+        row["owner"] = dsh.owner();
+        if (created.contains("agentPreset") && settings.at("preset") != "")
+            require(created.at("agentPreset") == settings.at("preset"), "DSH 未保留 Agent 预设");
+        stage="permission_preset";
+        const auto permission = settings.at("permission").get<std::string>();
+        const auto applied = dsh.call("commands/execute", {{"agentId",sid},{"line","/permission " + permission},
+            {"submittedAttachments",Json::array()}});
+        require(applied.value("result", applied).value("kind","") == "success", "DSH 没有应用权限预设");
+        bool verified = false;
+        for (int attempt = 0; attempt < 8 && !verified; ++attempt) {
+            const auto value = dsh.request("session/projections", {{"sessionId",sid}});
+            const auto path = "/values/permissions/currentValue"_json_pointer;
+            verified = value.contains(path) && value.at(path) == permission;
+            if (!verified) Sleep(100);
+        }
+        require(verified, "DSH 权限预设复核失败");
+        stage="select_model";
+        for (;;) {
+            const auto provider=pool.at("provider").get<std::string>(),model=pool.at("model").get<std::string>();
+            const auto reasoning=models.at({provider,model}).value("reasoning",Json::object());
+            const auto efforts=reasoning.is_object()?reasoning.value("efforts",Json::array()):Json::array();
+            const auto supports=[&](const std::string& value) {
+                return !value.empty() && std::ranges::any_of(efforts,[&](const Json& item) {
+                    return item.is_object() && item.value("id","")==value;
+                });
+            };
+            auto effort=pool.at("effort").get<std::string>();
+            if (!supports(effort)) effort=reasoning.is_object()?reasoning.value("defaultEffort",""):"";
+            if (!supports(effort)) effort.clear();
+            Json select{{"sessionId",sid},{"provider",provider},{"model",model}};
+            if (!effort.empty()) select["reasoningEffort"]=effort;
+            try {
+                const auto result=dsh.request("session/selectModel",select);
+                const auto& selected=result.at("selected");
+                require(selected.at("provider")==provider && selected.at("model")==model &&
+                    (effort.empty() || selected.value("reasoningEffort","")==effort),"DSH 所选模型或思考强度与配置不符");
+                row["effort"]=effort;
+                break;
+            } catch (const DshError& error) {
+                const auto reason=selection_rejection(error);
+                if (reason.empty()) throw;
+                rejected[row.at("poolId").get<std::string>()]=reason;
+                reserve(reason=="account_cooldown"?provider:"");
+            }
+        }
+        stage="session_state";
+        const auto live = rpc_state(dsh, row);
+        row["startCursor"] = live.at("cursor");
+        row["cursor"] = live.at("cursor");
+        {
+            Database db(data_, true);
+            db.state["sessions"][key] = row;
+            db.save();
+        }
+        stage="submit_prompt";
+        may_have_dispatched = true;
+        const auto prompt = "Work in the assigned workspace only. Do not change provider/model, start nested agents, "
+            "or publish changes without authorization. Return verifiable evidence. In the final answer include a fenced "
+            "```fatfish-delivery JSON block with candidateSha (full commit hash or null), worktreeClean (boolean), "
+            "tests (array of {command,exitCode}), and evidencePaths (array of local absolute paths). "
+            "Only report tests you actually ran.\n\n" + task;
+        const auto reply = dsh.request("session/prompt", {{"sessionId",sid},{"requestId",key},{"mode","queue"},
+            {"content",Json::array({{{"type","text"},{"text",prompt}}})}});
+        may_have_dispatched = reply.value("accepted",true);
+        require(may_have_dispatched, "DSH 拒绝了任务");
+        row["status"] = "queued";
+        if (!rejected.empty()) row["poolFallbacks"]=rejected;
+    } catch (const std::exception& e) {
+        row["status"] = may_have_dispatched ? "unknown" : "failed";
+        row["error"] = e.what();
+        row["dispatch"]={{"stage",stage},{"diagnostics",diagnostics},{"mayHaveDispatched",may_have_dispatched}};
+        if (const auto* failure=dynamic_cast<const DshError*>(&e)) {
+            const auto reason=selection_rejection(*failure);
+            if (!reason.empty()) row["dispatch"]["reason"]=reason;
+        }
+        if (!may_have_dispatched) {
+            row["resultVersion"] = "dispatch:failed";
+            row["completed"] = now();
+            row.erase("startCursor");
+        }
+    }
+    Database db(data_, true);
+    auto& stored = db.state["sessions"].at(key);
+    if (stored.at("status")=="starting" || row.at("status")=="failed" ||
+        (stored.at("status")=="queued" && row.at("status")=="unknown" &&
+         stored.value("cursor",Json())==row.value("cursor",Json()))) {
+        stored = row;
+        db.save();
+    } else if (row.contains("poolFallbacks")) {
+        stored["poolFallbacks"]=row.at("poolFallbacks");
+        db.save();
+    }
+    return public_row(stored);
+}
+
 Json Cluster::invoke(std::string_view tool, const Json& input) const {
     require(input.is_object(), "工具参数必须为 JSON 对象");
     if (tool == "cluster_overview" || tool == "cluster_get_settings") {
@@ -611,6 +935,58 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         const auto legacy=read_legacy_sessions(settings,false,&observations);
         sessions.update(legacy.rows);
         return session_overview(settings,sessions,legacy,data_);
+    }
+    if (tool=="cluster_repair_handoff") {
+        const auto token=field(input,"claimToken",100),version=field(input,"originalVersion",100);
+        const auto request=field(input,"requestId",100),sha=field(input,"candidateSha",64);
+        require(commit_sha(sha),"候选 SHA 必须是完整的 Git 提交哈希");
+        const auto paths=input.value("screenshotPaths",Json::array());
+        require(evidence_paths(paths),"请提供有效的截图绝对路径");
+        const auto acceptance=field(input,"acceptance",8000);
+        const auto task=field(input,"task",50000);
+        const auto queue_file=data_/L"handoff.json";
+        const ExclusiveStateLock lock(data_/L"handoff.lock");
+        auto queue=fs::exists(queue_file)?read_json(queue_file):Json::object();
+        const auto claim=queue.value("claim",Json::object());
+        require(claim.value("claimToken","")==token && claim.value("expiresAt",std::int64_t(0))>now(),
+            "需要当前队首的有效领取凭据");
+        require(claim.at("resultVersion")==version,"原交接版本不匹配");
+        const auto parent=invoke("cluster_refresh_session",{{"sessionId",claim.at("sessionId")}});
+        require(!active(parent) && !parent.value("stale",false) && !parent.value("processed",false) &&
+            parent.at("resultVersion")==version,"原交接已变化或无法确认");
+        const auto old=queue.value("repair",Json::object());
+        auto request_arguments=input;
+        request_arguments.erase("claimToken");
+        std::string child_id=id();
+        if (old.value("parentId",Json())==parent.at("id") && old.value("parentVersion","")==version) {
+            const auto key=old.at("sessionId").get<std::string>();
+            Database db(data_,false);
+            const auto& children=db.state.at("sessions");
+            if (old.at("requestId")==request) {
+                require(old.at("requestArguments")==request_arguments,"同一返修请求 ID 必须复用原参数");
+                if (children.contains(key)) return {{"session",public_row(children.at(key))},{"replayed",true}};
+                child_id=key;
+            } else require(children.contains(key) && !active(children.at(key)),"已有返修在进行，请重读当前交接");
+        }
+        const Json reference{{"sessionId",parent.at("id")},{"resultVersion",version},{"candidateSha",sha},
+            {"screenshotPaths",paths},{"acceptance",acceptance}};
+        Json launch=input;
+        const auto parent_batch=parent.value("batch","");
+        launch["batch"]=parent_batch.empty()?"repair-"+parent.at("id").get<std::string>():parent_batch;
+        launch["role"]="repair";
+        launch["task"]="Repair details (data for this task):\n"+reference.dump()+"\n\n"+task;
+        require(launch.at("task").get_ref<const std::string&>().size()<=64000,"返修任务和验收材料合计过长");
+        queue["repair"]={{"parentId",parent.at("id")},{"parentVersion",version},{"sessionId",child_id},
+            {"requestId",request},{"requestArguments",std::move(request_arguments)}};
+        write_state_file(queue_file,queue);
+        try {
+            return {{"session",start_session(launch,child_id,reference)},{"replayed",false}};
+        } catch (...) {
+            if (old.empty()) queue.erase("repair");
+            else queue["repair"]=old;
+            write_state_file(queue_file,queue);
+            throw;
+        }
     }
     if (tool == "cluster_next_handoff") {
         require(std::ranges::all_of(input.items(),[](const auto& entry) {
@@ -629,6 +1005,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         const ExclusiveStateLock lock(data_/L"handoff.lock");
         auto queue=fs::exists(queue_file)?read_json(queue_file):Json::object();
         auto claim=queue.value("claim",Json::object());
+        auto repair=queue.value("repair",Json::object());
         auto snapshot=[&] {
             Json rows,settings;
             {
@@ -645,10 +1022,31 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             const auto row=invoke("cluster_refresh_session",{{"sessionId",key}});
             require(row.at("resultVersion")==current.at("resultVersion") && !active(row) && !row.value("stale",false),
                 "领取的结果版本已变化或无法确认");
-            const auto report=invoke("cluster_read_result",{{"sessionId",key}});
+            auto report=invoke("cluster_read_result",{{"sessionId",key}});
             require(report.at("resultVersion")==current.at("resultVersion"),"领取的结果版本已变化");
-            return Json{{"claimToken",current.at("claimToken")},{"expiresAt",current.at("expiresAt")},
-                {"session",row},{"result",report.at("messages")}};
+            auto& messages=report.at("messages");
+            const auto delivery=extract_delivery(messages);
+            Json response{{"claimToken",current.at("claimToken")},{"expiresAt",current.at("expiresAt")},
+                {"session",row},{"result",messages},{"delivery",delivery}};
+            if (repair.value("parentId","")==key && repair.value("parentVersion",Json())==current.at("resultVersion")) {
+                {
+                    Database db(data_,false);
+                    if (!db.state.at("sessions").contains(repair.at("sessionId").get<std::string>())) {
+                        response["handoffState"]="repairing";
+                        return response;
+                    }
+                }
+                const auto child=invoke("cluster_refresh_session",{{"sessionId",repair.at("sessionId")}});
+                response["handoffState"]=active(child)?"repairing":"awaiting_acceptance";
+                response["repair"]={{"session",child}};
+                if (!active(child)) {
+                    auto child_report=invoke("cluster_read_result",{{"sessionId",child.at("id")}});
+                    auto& child_messages=child_report.at("messages");
+                    response["repair"]["delivery"]=extract_delivery(child_messages);
+                    response["repair"]["result"]=std::move(child_messages);
+                }
+            }
+            return response;
         };
         if (!claim.empty() && claim.value("expiresAt",std::int64_t(0))<=now()) {
             claim=Json::object();
@@ -672,8 +1070,15 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             require(!current.value("stale",false),"暂时无法确认已领取的结果，请重试");
             if (current.at("resultVersion")!=version || active(current)) {
                 queue.erase("claim");
+                if (repair.value("parentId","")==key) queue.erase("repair");
                 write_state_file(queue_file,queue);
                 return {{"changed",true}};
+            }
+            if (repair.value("parentId","")==key && repair.value("parentVersion","")==version) {
+                const auto child=invoke("cluster_refresh_session",{{"sessionId",repair.at("sessionId")}});
+                require(!active(child),"返修仍在进行，完成主代理验收后才能确认交接");
+                queue.erase("repair");
+                repair=Json::object();
             }
             if (key.starts_with("codex:")) {
                 const auto settings=invoke("cluster_get_settings");
@@ -694,21 +1099,41 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         } else require(token.empty(),"领取凭据过期，请重新领取");
 
         auto rows=snapshot();
+        if (!repair.empty()) {
+            const auto parent=rows.find(repair.at("parentId").get<std::string>());
+            if (parent==rows.end()) return {{"busy",true},{"handoffState","pending_sync"}};
+            if (parent->value("stale",false)) {
+                *parent=invoke("cluster_refresh_session",{{"sessionId",parent->at("id")}});
+                if (parent->value("stale",false)) return {{"busy",true},{"handoffState","pending_sync"}};
+            }
+            if (active(*parent) || parent->value("processed",false) || parent->at("resultVersion")!=repair.at("parentVersion")) {
+                queue.erase("repair");
+                repair=Json::object();
+                write_state_file(queue_file,queue);
+            }
+        }
         std::vector<Json> pending;
         const auto sort_key=[](const Json& row) {
             return std::pair(row.value("completed",std::int64_t(0)),row.at("id").get<std::string>());
         };
         for (auto& row:rows) {
-            if (active(row) || row.value("processed",false) || row.value("resultVersion","").empty()) continue;
+            if (active(row) || row.contains("repairOf") || row.value("processed",false) || row.value("resultVersion","").empty()) continue;
             pending.push_back(std::move(row));
         }
-        std::ranges::sort(pending,[&](const Json& a,const Json& b){return sort_key(a)<sort_key(b);});
+        const auto priority=[&](const Json& row) {
+            return std::pair(!(repair.value("parentId",Json())==row.at("id") &&
+                repair.value("parentVersion",Json())==row.at("resultVersion")),sort_key(row));
+        };
+        std::ranges::sort(pending,[&](const Json& a,const Json& b){return priority(a)<priority(b);});
         for (const auto& candidate:pending) {
             auto row=candidate;
             if (row.value("source","")=="codex") {
                 row=invoke("cluster_refresh_session",{{"sessionId",candidate.at("id")}});
                 if (row.value("stale",false) || active(row) || row.value("processed",false) ||
-                    row.at("resultVersion")!=candidate.at("resultVersion")) continue;
+                    row.at("resultVersion")!=candidate.at("resultVersion")) {
+                    if (repair.value("parentId",Json())==candidate.at("id")) return {{"busy",true},{"handoffState","pending_sync"}};
+                    continue;
+                }
             }
             claim={{"source",row.value("source","fatfishbox")},{"sessionId",row.at("id")},
                 {"resultVersion",row.at("resultVersion")},{"claimToken",id()},
@@ -783,119 +1208,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         db.save();
         return settings;
     }
-    if (tool == "cluster_start_session") {
-        const auto title = field(input,"title",400), batch = field(input,"batch",400);
-        const auto role=input.contains("role")?field(input,"role",32):"developer", task=field(input,"task",64000);
-        require(roles.contains(role), "未知角色");
-        const auto work = path_from_utf8(field(input,"workspace",4000));
-        require(work.is_absolute() && fs::is_directory(work) && work.has_relative_path(), "工作区必须是现有的绝对子目录");
-        const auto workspace = fs::canonical(work);
-        require(workspace.has_relative_path(), "工作区不能指向磁盘根目录");
-        const auto key = id();
-        Json settings, pool, row;
-        {
-            Database db(data_, true);
-            settings = db.state.at("settings");
-            require(settings.at("permission") != "", "派发前需要设置并验证 DSH 权限预设");
-            auto& sessions = db.state["sessions"];
-            auto occupied = sessions;
-            occupied.update(read_legacy_sessions(settings).rows);
-            for (const auto& value : occupied) {
-                if (active(value)) require(_wcsicmp(widen(value.at("workspace").get<std::string>()).c_str(),
-                    workspace.c_str()) != 0, "该工作区已有活动会话");
-            }
-            auto pool_id = choose_pool(settings,occupied,input.value("poolId",""));
-            pool = settings.at("pools").at(pool_id);
-            row = {{"id",key},{"title",title},{"role",role},{"batch",batch},{"workspace",utf8(workspace)},
-                {"poolId",pool_id},{"provider",pool.at("provider")},{"model",pool.at("model")},{"status","starting"},
-                {"created",now()},{"updated",now()},{"resultVersion",""},{"read",false},{"processed",false}};
-            sessions[key] = row;
-            db.save();
-        }
-        bool may_have_dispatched = false;
-        std::string error;
-        try {
-            Dsh dsh(path_from_utf8(settings.at("authPath").get<std::string>()));
-            const auto catalog = dsh.request("session/modelCatalog");
-            Json live_model;
-            for (auto& group : catalog.at("groups"))
-                if (group.at("id") == pool.at("provider"))
-                    for (auto& model : group.at("models"))
-                        if (model.at("id") == pool.at("model")) live_model = model;
-            require(live_model.is_object(), "账号和模型已不在 DSH 实时目录中");
-            auto effort = pool.at("effort").get<std::string>();
-            const auto reasoning = live_model.value("reasoning", Json::object());
-            const auto efforts=reasoning.is_object()?reasoning.value("efforts",Json::array()):Json::array();
-            const auto has_effort=[&](const std::string& name) {
-                return !name.empty() && std::ranges::any_of(efforts,[&](const Json& item) {
-                    return item.is_object() && item.value("id","")==name;
-                });
-            };
-            if (!has_effort(effort)) {
-                effort=reasoning.is_object()?reasoning.value("defaultEffort",std::string{}):std::string{};
-                if (!has_effort(effort)) effort.clear();
-            }
-            Json create{{"cwd",utf8(workspace)}};
-            if (settings.at("preset") != "") create["agentPreset"] = settings.at("preset");
-            const auto created = dsh.request("session/create", create);
-            const auto sid = field(created, "sessionId", 200);
-            row["dshId"] = sid;
-            row["owner"] = dsh.owner();
-            if (created.contains("agentPreset") && settings.at("preset") != "")
-                require(created.at("agentPreset") == settings.at("preset"), "DSH 未保留 Agent 预设");
-            const auto permission = settings.at("permission").get<std::string>();
-            const auto applied = dsh.call("commands/execute", {{"agentId",sid},{"line","/permission " + permission},
-                {"submittedAttachments",Json::array()}});
-            require(applied.value("result", applied).value("kind","") == "success", "DSH 没有应用权限预设");
-            bool verified = false;
-            for (int attempt = 0; attempt < 8 && !verified; ++attempt) {
-                const auto value = dsh.request("session/projections", {{"sessionId",sid}});
-                const auto path = "/values/permissions/currentValue"_json_pointer;
-                verified = value.contains(path) && value.at(path) == permission;
-                if (!verified) Sleep(100);
-            }
-            require(verified, "DSH 权限预设复核失败");
-            Json select{{"sessionId",sid},{"provider",pool.at("provider")},{"model",pool.at("model")}};
-            if (!effort.empty()) select["reasoningEffort"] = effort;
-            const auto result = dsh.request("session/selectModel", select);
-            const auto& selected = result.at("selected");
-            require(selected.at("provider") == pool.at("provider") && selected.at("model") == pool.at("model") &&
-                (effort.empty() || selected.value("reasoningEffort","") == effort), "DSH 所选模型或思考强度与配置不符");
-            const auto live = rpc_state(dsh, row);
-            row["startCursor"] = live.at("cursor");
-            row["cursor"] = live.at("cursor");
-            row["effort"] = effort;
-            {
-                Database db(data_, true);
-                db.state["sessions"][key] = row;
-                db.save();
-            }
-            may_have_dispatched = true;
-            const auto prompt = "Work in the assigned workspace only. Do not change provider/model, start nested agents, "
-                "or publish changes without authorization. Return verifiable evidence.\n\n" + task;
-            const auto reply = dsh.request("session/prompt", {{"sessionId",sid},{"requestId",key},{"mode","queue"},
-                {"content",Json::array({{{"type","text"},{"text",prompt}}})}});
-            may_have_dispatched = reply.value("accepted",true);
-            require(may_have_dispatched, "DSH 拒绝了任务");
-            row["status"] = "queued";
-        } catch (const std::exception& e) {
-            error = e.what();
-            row["status"] = may_have_dispatched ? "unknown" : "failed";
-            row["error"] = error;
-            if (!may_have_dispatched) {
-                row["resultVersion"] = "dispatch:failed";
-                row["completed"] = now();
-                row.erase("startCursor");
-            }
-        }
-        Database db(data_, true);
-        auto& stored = db.state["sessions"].at(key);
-        if (stored.at("status") == "starting" || row.at("status") == "failed") {
-            stored = row;
-            db.save();
-        }
-        return public_row(stored);
-    }
+    if (tool == "cluster_start_session") return start_session(input,id());
     if (tool == "cluster_refresh_sessions") {
         const auto limit = input.value("limit", 12);
         require(limit >= 1 && limit <= 20, "同步数量必须在 1 至 20 之间");
@@ -926,6 +1239,12 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
     }
     if (tool == "cluster_refresh_session") return refresh(data_,key);
     if (tool == "cluster_mark_receipt") {
+        const ExclusiveStateLock lock(data_/L"handoff.lock");
+        const auto queue_file=data_/L"handoff.json";
+        if (fs::exists(queue_file)) {
+            const auto repair=read_json(queue_file).value("repair",Json::object());
+            require(repair.value("parentId","")!=key,"请使用当前领取凭据完成返修验收和确认");
+        }
         refresh(data_, key);
         Database db(data_, true);
         auto& row = db.state["sessions"].at(key);
@@ -942,6 +1261,9 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         row = db.state.at("sessions").at(key);
     }
     if (tool == "cluster_get_session") return public_row(row);
+    if (tool=="cluster_read_result" && row.value("resultVersion","")=="dispatch:failed")
+        return {{"sessionId",key},{"resultVersion","dispatch:failed"},{"messages",Json::array({
+            {{"type","dispatch/error"},{"text",row.value("error","派发失败")}}})}};
     Dsh dsh(path_from_utf8(settings.at("authPath").get<std::string>()));
     rpc_state(dsh, row);
     if (tool == "cluster_cancel_session") {
@@ -960,10 +1282,12 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             if (row.contains("startCursor") && event.value("seq",std::int64_t(-1))<=row.at("startCursor").get<std::int64_t>())
                 continue;
             const auto type = event.value("type","");
-            if (type != "assistant/message" && type != "user/message") continue;
-            const auto path = "/data/message/content"_json_pointer;
+            if (type!="assistant/message" && type!="assistant/response" && type!="user/message") continue;
+            const auto message_path="/data/message/content"_json_pointer;
+            const auto direct_path="/data/content"_json_pointer;
+            const auto path=event.contains(message_path)?message_path:direct_path;
             if (!event.contains(path)) continue;
-            const auto& content = event.at(path);
+            const auto& content=event.at(path);
             std::string text;
             if (content.is_string()) text = content.get<std::string>();
             else if (content.is_array()) for (const auto& part : content)
@@ -986,7 +1310,9 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
 
 Json Cluster::tools() {
     Json tools = Json::array();
-    const Json text{{"type","string"}}, integer{{"type","integer"}}, boolean{{"type","boolean"}};
+    const Json text{{"type","string"}}, integer{{"type","integer"}}, boolean{{"type","boolean"}},
+        pool_list{{"type","array"},{"items",text},{"minItems",1},{"maxItems",64}},
+        path_list{{"type","array"},{"items",text},{"maxItems",16}};
     auto add = [&](const char* name, const char* description, Json fields = Json::object(), Json required = Json::array()) {
         tools.push_back({{"name",name},{"description",description},
             {"inputSchema",{{"type","object"},{"properties",fields},{"required",required},{"additionalProperties",false}}}});
@@ -1004,9 +1330,13 @@ Json Cluster::tools() {
     add("cluster_next_handoff","获取下一个需处理对话。完成实际处置后，传回 claimToken 和 outcome 自动确认并领取下一条。省略 outcome 可用领取凭据重读本条。",
         {{"claimToken",text},{"outcome",text}});
     tools.back()["title"]="获取下一个需处理对话";
-    add("cluster_start_session","在授权工作区派发会话。自动选池会优先分配至占用较少的账号。Agent 可指定任务角色。",
-        {{"title",text},{"batch",text},{"role",text},{"workspace",text},{"task",text},{"poolId",text}},
+    add("cluster_start_session","在授权工作区派发会话。allowedPoolIds 为批次允许池清单，首次设置后同批次沿用。poolId 固定单池，省略时可在范围内自动换池。",
+        {{"title",text},{"batch",text},{"role",text},{"workspace",text},{"task",text},{"poolId",text},{"allowedPoolIds",pool_list}},
         {"title","batch","workspace","task"});
+    add("cluster_repair_handoff","从当前领取的交接派发返修。返修结果挂在原队首，主代理验收后确认。重试同一请求时复用 requestId。",
+        {{"claimToken",text},{"originalVersion",text},{"requestId",text},{"candidateSha",text},{"screenshotPaths",path_list},
+         {"acceptance",text},{"title",text},{"workspace",text},{"task",text},{"poolId",text},{"allowedPoolIds",pool_list}},
+        {"claimToken","originalVersion","requestId","candidateSha","acceptance","title","workspace","task"});
     add("cluster_refresh_sessions","同步本地登记的最早活动会话，每次最多 20 个。",{{"limit",integer}});
     add("cluster_cancel_session","取消已知的活动会话。",{{"sessionId",text}},{"sessionId"});
     return tools;

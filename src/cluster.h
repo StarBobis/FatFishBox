@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <stop_token>
+#include <stdexcept>
 #include <nlohmann/json.hpp>
 
 namespace fatfish {
@@ -17,6 +18,11 @@ inline fs::path path_from_utf8(std::string_view value) { return fs::path(widen(v
 std::string id();
 std::int64_t now();
 struct DesktopMonitor;
+struct DispatchError : std::runtime_error {
+    DispatchError(const std::string& message,Json diagnostics)
+        :std::runtime_error(message),details(std::move(diagnostics)) {}
+    Json details;
+};
 
 class Cluster {
 public:
@@ -28,6 +34,7 @@ public:
     void refresh_legacy_usage(std::stop_token stop) const;
     static Json tools();
 private:
+    Json start_session(const Json& input,const std::string& key,const Json& repair=Json()) const;
     fs::path data_;
 };
 }

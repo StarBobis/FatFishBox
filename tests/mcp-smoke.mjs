@@ -14,6 +14,13 @@ let selected;
 let prompts = 0;
 let terminal = false;
 let offerMax = true;
+let rejectProvider = '';
+let hiddenProvider = '';
+let deliveryReport = false;
+let submittedPrompt = '';
+const sha='0123456789abcdef0123456789abcdef01234567';
+const delivery=(path)=>'\n```fatfish-delivery\n'+JSON.stringify({candidateSha:sha,worktreeClean:true,
+    tests:[{command:'ctest -R mask',exitCode:0}],evidencePaths:[path]})+'\n```';
 const server = createServer(async (req,res) => {
     let raw = '';
     for await (const buffer of req) raw += buffer;
@@ -34,17 +41,26 @@ const server = createServer(async (req,res) => {
                 {id:'light',name:'Light'},
             ]},
             {id:'account-b', name:'Account B', models:[{id:'fast',name:'Fast'}]},
-        ]};
+        ].filter(group=>group.id!==hiddenProvider)};
         break;
     case 'session/create': value = {sessionId:'external-session'}; break;
     case 'commands/execute': value = {result:{kind:'success'}}; break;
     case 'session/projections': value = {values:{permissions:{currentValue:'prompt-on-risk'},
         tokenUsage:{uncachedInputTokens:100,outputTokens:20,cacheReadTokens:40,cacheWriteTokens:5}}}; break;
-    case 'session/selectModel': selected = args.request; value = {selected}; break;
-    case 'session/state': value = {cursor:terminal?7:running?2:1,running,queue:[],pendingInput:[]}; break;
-    case 'session/prompt': running = true; prompts++; value = {accepted:true}; break;
+    case 'session/selectModel':
+        if (args.request.provider===rejectProvider) {
+            res.end(JSON.stringify({result:{ok:false,error:{code:'rate_limited'}}}));
+            return;
+        }
+        selected = args.request; value = {selected}; break;
+    case 'session/state':
+        value=args.request.sessionId==='stale-slot' ? {cursor:7,running:false,queue:[],pendingInput:[]} :
+            {cursor:terminal?7:running?2:1,running,queue:[],pendingInput:[]};
+        break;
+    case 'session/prompt': running = true; prompts++; submittedPrompt=args.request.content[0].text; value = {accepted:true}; break;
     case 'session/page': value = {records:[
-        {type:'event',event:{seq:6,type:'assistant/message',data:{message:{content:[{text:'交接证据'}]}}}},
+        {type:'event',event:{seq:6,type:'assistant/message',data:{message:{content:[
+            {text:'交接证据'+(deliveryReport?delivery(join(root,'repair.png')):'')}]}}}},
         {type:'event',event:{seq:7,type:'turn/end',data:{reason:{kind:'completed'}}}},
     ]}; break;
     default: res.writeHead(404).end(); return;
@@ -122,19 +138,25 @@ try {
     assert.equal(replay.settings.pools[pool.id].concurrency,1);
     assert.equal(replay.settings.pools[pool.id].effort,'max');
     assert.deepEqual(replay.settings.pools[pool.id].efforts,['high']);
+    const registry=join(root,'codex-state','registry');
+    await mkdir(registry,{recursive:true});
+    await writeFile(join(registry,'workers.json'),JSON.stringify({sessions:{slot:{
+        sessionId:'stale-slot',serviceId:'attached',serviceOrigin:`http://127.0.0.1:${server.address().port}`,
+        startSeq:1,cursor:2,status:'running',updatedAt:1,provider:'account-a',model:'fast',
+    }}}));
     const args = {title:'Smoke dispatch',batch:'smoke',role:'developer',task:'Return one report',workspace:a};
     const session = await one.tool('cluster_start_session',args);
     assert.equal(session.status,'queued');
     assert.equal(selected.reasoningEffort,'high');
     assert.equal(session.owner,undefined);
-    await two.tool('cluster_start_session',{...args,workspace:b},true);
+    const unavailable=await two.tool('cluster_start_session',{...args,workspace:b,poolId:pool.id},true);
+    assert.deepEqual(unavailable.pools.map(({poolId,reason,occupied,concurrency})=>({poolId,reason,occupied,concurrency})),
+        [{poolId:pool.id,reason:'slots_full',occupied:1,concurrency:1}]);
     assert.equal(prompts,1);
     running=false;terminal=true;
     const page=await two.tool('cluster_refresh_sessions');
     assert.equal(page.synced,1);
     assert.equal((await two.tool('cluster_overview')).usage.todayTokens,165);
-    const registry=join(root,'codex-state','registry');
-    await mkdir(registry,{recursive:true});
     const origin='http://127.0.0.1:42';
     const old={sessionId:'old-session',serviceOrigin:origin,status:'succeeded',startSeq:1,cursor:7,
         updatedAt:10,batchId:'legacy',title:'历史任务',assistantText:'原插件证据'};
@@ -205,6 +227,86 @@ try {
     assert.equal(spread[0],'account-a');
     assert.equal(spread[1],'account-b');
     assert.deepEqual(spread.sort(),['account-a','account-a','account-b','account-b']);
+    const fallback=await connect(join(root,'fallback'));
+    let fallbackSettings=(await fallback.tool('cluster_import_models',{authPath:auth,configPath:''})).settings;
+    fallbackSettings=await fallback.tool('cluster_configure',{revision:fallbackSettings.revision,permission:'prompt-on-risk'});
+    const fastPools=Object.values(fallbackSettings.pools).filter(row=>row.model==='fast').sort((a,b)=>a.id.localeCompare(b.id,'en'));
+    for (const row of fastPools)
+        fallbackSettings=await fallback.tool('cluster_update_pool',{revision:fallbackSettings.revision,id:row.id,enabled:true,concurrency:3});
+    const allowed=fastPools.map(row=>row.id);
+    rejectProvider=fastPools[0].provider;
+    running=false;terminal=false;
+    const promptBefore=prompts;
+    const switched=await fallback.tool('cluster_start_session',{...args,allowedPoolIds:allowed});
+    assert.equal(switched.provider,fastPools[1].provider);
+    assert.equal(switched.poolFallbacks[fastPools[0].id],'account_cooldown');
+    assert.equal(prompts,promptBefore+1);
+    const blocked=await fallback.tool('cluster_start_session',{...args,workspace:b,poolId:fastPools[0].id},true);
+    assert.equal(blocked.pools.find(p=>p.poolId===fastPools[0].id).reason,'account_cooldown');
+    assert.ok(blocked.pools.find(p=>p.poolId===fastPools[0].id).retryAt>Date.now());
+    assert.ok(blocked.availablePools.some(p=>p.poolId===fastPools[1].id));
+    const restricted=await fallback.tool('cluster_start_session',{...args,workspace:b,poolId:
+        Object.values(fallbackSettings.pools).find(row=>row.model==='light').id},true);
+    assert.ok(restricted.pools.some(p=>p.reason==='batch_restricted'));
+    assert.equal((await fallback.tool('cluster_start_session',{...args,workspace:b,allowedPoolIds:[fastPools[0].id]},true)).reason,
+        'batch_allowlist_conflict');
+    hiddenProvider=fastPools[1].provider;
+    const missing=await fallback.tool('cluster_start_session',{...args,workspace:b,poolId:fastPools[1].id},true);
+    assert.equal(missing.pools.find(p=>p.poolId===fastPools[1].id).reason,'model_unavailable');
+    hiddenProvider='';
+    rejectProvider='';
+
+    const repairRoot=join(root,'repair');
+    const repairRegistry=join(repairRoot,'codex-state','registry');
+    await mkdir(repairRegistry,{recursive:true});
+    const parent={...old,sessionId:'repair-original',batchId:'repair-batch',assistantText:'原交付'+delivery(join(root,'original.png'))};
+    const following={...old,sessionId:'follows-repair',updatedAt:30};
+    await writeFile(join(repairRegistry,'workers.json'),JSON.stringify({sessions:{parent,following}}));
+    const repair=await connect(repairRoot);
+    let repairSettings=(await repair.tool('cluster_import_models',{authPath:auth,configPath:''})).settings;
+    repairSettings=await repair.tool('cluster_configure',{revision:repairSettings.revision,permission:'prompt-on-risk'});
+    const repairPool=Object.values(repairSettings.pools).find(row=>row.provider==='account-b');
+    await repair.tool('cluster_update_pool',{revision:repairSettings.revision,id:repairPool.id,enabled:true,concurrency:2});
+    const repairClaim=await repair.tool('cluster_next_handoff');
+    assert.equal(repairClaim.session.id,'codex:repair-original');
+    assert.equal(repairClaim.delivery.candidateSha,sha);
+    assert.equal(repairClaim.delivery.tests[0].exitCode,0);
+    assert.equal(repairClaim.delivery.source,'agent_reported');
+    assert.ok(!repairClaim.result[0].text.includes('fatfish-delivery'));
+    const request={claimToken:repairClaim.claimToken,originalVersion:repairClaim.session.resultVersion,requestId:'repair-once',
+        candidateSha:sha,screenshotPaths:[join(root,'original.png')],acceptance:'Check the real window',
+        title:'Repair transparency',workspace:c,task:'Fix the mask.'};
+    running=false;terminal=false;
+    await repair.tool('cluster_repair_handoff',{...request,originalVersion:'wrong'},true);
+    const launched=await repair.tool('cluster_repair_handoff',request);
+    assert.equal(launched.session.status,'queued');
+    assert.equal(launched.session.batch,'repair-batch');
+    assert.equal(launched.session.repairOf.candidateSha,sha);
+    assert.ok(submittedPrompt.includes(request.acceptance));
+    assert.equal((await repair.tool('cluster_repair_handoff',request)).session.id,launched.session.id);
+    await repair.tool('cluster_repair_handoff',{...request,task:'Different request payload'},true);
+    assert.equal((await repair.tool('cluster_next_handoff',{claimToken:request.claimToken})).handoffState,'repairing');
+    await repair.tool('cluster_next_handoff',{claimToken:request.claimToken,outcome:'Too early'},true);
+    assert.equal((await repair.tool('cluster_next_handoff')).busy,true);
+    const repairQueue=join(repairRoot,'handoff.json');
+    const expired=JSON.parse(await readFile(repairQueue,'utf8'));
+    expired.claim.expiresAt=1;
+    await writeFile(repairQueue,JSON.stringify(expired));
+    const reclaimed=await repair.tool('cluster_next_handoff');
+    assert.equal(reclaimed.session.id,repairClaim.session.id);
+    assert.equal(reclaimed.handoffState,'repairing');
+    assert.notEqual(reclaimed.claimToken,request.claimToken);
+    running=false;terminal=true;deliveryReport=true;
+    const acceptance=await repair.tool('cluster_next_handoff',{claimToken:reclaimed.claimToken});
+    assert.equal(acceptance.handoffState,'awaiting_acceptance');
+    assert.deepEqual(acceptance.repair.delivery.evidencePaths,[join(root,'repair.png')]);
+    const followingClaim=await repair.tool('cluster_next_handoff',{claimToken:reclaimed.claimToken,outcome:'Verified cumulative build and real window.'});
+    assert.equal(followingClaim.session.id,'codex:follows-repair');
+    assert.equal((await repair.tool('cluster_next_handoff',{claimToken:followingClaim.claimToken,outcome:'Verified.'})).empty,true);
+    const workflow=await repair.rpc('resources/read',{uri:'fatfish://workflow'});
+    for (const marker of ['git worktree add','allowedPoolIds','cluster_repair_handoff','实窗验收'])
+        assert.ok(workflow.contents[0].text.includes(marker));
+    console.log('Dispatch diagnostics, batch fallback and linked repair handoff passed.');
     console.log('stdio MCP passed: DSH presets, scheduling, FIFO claims, shared receipts and denied bypasses.');
     if (process.env.FATFISH_TEST_LIVE_DSH === '1') {
         const directory = join(root,'real');
@@ -215,6 +317,9 @@ try {
         const livePresets=await real.tool('cluster_get_presets');
         assert(livePresets.permissions.length>0 && livePresets.agents.length>0);
         console.log(`Live DSH presets: ${livePresets.permissions.length} permission, ${livePresets.agents.length} agent.`);
+        await real.tool('cluster_configure',{revision:result.settings.revision,permission:livePresets.permissions[0].id});
+        const preflight=await real.tool('cluster_start_session',{...args,allowedPoolIds:['nonexistent-smoke-pool']},true);
+        assert.equal(preflight.reason,'unknown_pool','read the real catalog without creating a DSH session');
     }
 } finally {
     for (const child of live) child.stdin.end();

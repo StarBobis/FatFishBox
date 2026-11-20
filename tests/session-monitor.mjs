@@ -117,6 +117,19 @@ try {
     const recovered = await snapshot();
     assert.equal(recovered.running.find(row => row.id===reopened.id).stale,false);
     assert.equal(recovered.liveStale,1);
+    const stored=JSON.parse(await readFile(file,'utf8'));
+    const link={sessionId:finished.id,resultVersion:finished.resultVersion};
+    stored.sessions.first.repairOf=link;
+    stored.sessions.second.repairOf=link;
+    await put(file,stored);
+    const queue=join(state,'handoff.json');
+    const reference={parentId:finished.id,parentVersion:finished.resultVersion};
+    await put(queue,{repair:{...reference,sessionId:'first'}});
+    const repairing=await snapshot();
+    assert.equal(repairing.pending[0].handoffState,'repairing');
+    assert.equal(repairing.pending.some(row=>row.id==='second'),false);
+    await put(queue,{repair:{...reference,sessionId:'second'}});
+    assert.equal((await snapshot()).pending[0].handoffState,'awaiting_acceptance');
     child.stdin.end();
     assert.equal((await once(child,'exit'))[0],0);
 } finally {
