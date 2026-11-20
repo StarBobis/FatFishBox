@@ -8,8 +8,13 @@ FetchContent_Declare(nlohmann_json
     URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
     URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_Declare(httplib
+    URL https://codeload.github.com/yhirose/cpp-httplib/tar.gz/refs/tags/v0.67.0
+    URL_HASH SHA256=be711ddaf7a3655d8f23aa5655709250b24d247aedd4b2629989d18b6164e5be
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR unused)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(nlohmann_json)
+FetchContent_MakeAvailable(nlohmann_json httplib)
 
 function(fatfish_target target)
     target_compile_features(${target} PUBLIC cxx_std_20)
@@ -31,10 +36,11 @@ block()
     set(NATIVE_UI_BUILD_GALLERY OFF)
     add_subdirectory("${NATIVE_WIN_UI_SOURCE}/ui" native_ui EXCLUDE_FROM_ALL)
 endblock()
-add_executable(FatFishBox WIN32 src/app.cpp src/app.rc src/mcp.cpp)
+add_executable(FatFishBox WIN32 src/app.cpp src/app.rc src/mcp.cpp src/mcp_http.cpp)
 fatfish_target(FatFishBox)
+target_include_directories(FatFishBox SYSTEM PRIVATE "${httplib_SOURCE_DIR}")
 target_link_options(FatFishBox PRIVATE /MANIFEST:NO)
-target_link_libraries(FatFishBox PRIVATE fatfish_core NativeUI::UI user32 ole32 shell32)
+target_link_libraries(FatFishBox PRIVATE fatfish_core NativeUI::UI user32 ole32 shell32 ws2_32 bcrypt)
 install(TARGETS FatFishBox RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(DIRECTORY skills DESTINATION .)

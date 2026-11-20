@@ -1,6 +1,7 @@
 #include "cluster.h"
 #include "dsh.h"
 #include "legacy.h"
+#include "state_file.h"
 #include <windows.h>
 #include <objbase.h>
 #include <algorithm>
@@ -415,15 +416,12 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         const auto legacy = read_legacy_sessions(settings);
         sessions.update(legacy.rows);
         if (tool == "cluster_overview") {
-            int running = 0, pending = 0, unread = 0;
+            int running = 0, pending = 0;
             for (const auto& row : sessions) {
                 if (active(row)) ++running;
-                else if (!row.value("processed", false)) {
-                    ++pending;
-                    if (!row.value("read", false)) ++unread;
-                }
+                else if (!row.value("processed", false)) ++pending;
             }
-            return {{"active",running},{"handoffs",pending},{"unread",unread},{"accounts",settings.at("accounts").size()},
+            return {{"active",running},{"unprocessed",pending},{"accounts",settings.at("accounts").size()},
                 {"models",settings.at("pools").size()},{"connected",!settings.at("authPath").get<std::string>().empty()},
                 {"codexSessions",legacy.rows.size()},{"codexSources",legacy.sources},{"unreadableCodexSources",legacy.unreadable},
                 {"usage",telemetry_overview(sessions)}};
@@ -446,13 +444,129 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         const auto next = std::int64_t(offset) + limit;
         return {{"sessions",answer},{"total",sorted.size()},{"nextOffset",next < std::int64_t(sorted.size()) ? Json(next) : Json(nullptr)}};
     }
-    if (tool == "cluster_import_models") {
+    if (tool == "cluster_next_handoff") {
+        require(std::ranges::all_of(input.items(),[](const auto& entry) {
+            return entry.key()=="claimToken" || entry.key()=="outcome";
+        }),"只能凭当前领取凭据提交处理结果");
+        const auto token=input.contains("claimToken")?field(input,"claimToken",100):"";
+        const auto outcome=input.contains("outcome")?field(input,"outcome",2000):"";
+        require(!input.contains("outcome") || outcome.find_first_not_of(" \t\r\n")!=std::string::npos,"请说明实际采取的处置");
+        require(outcome.empty() || !token.empty(),"提交处理结果需要当前领取凭据");
+        const auto queue_file=data_/L"handoff.json";
+        const auto previous=fs::exists(queue_file)?read_json(queue_file):Json::object();
+        const auto previous_claim=previous.value("claim",Json::object());
+        if (previous_claim.empty() || previous_claim.value("expiresAt",std::int64_t(0))<=now() ||
+            (!outcome.empty() && previous_claim.value("claimToken","")==token))
+            invoke("cluster_refresh_sessions");
+        const ExclusiveStateLock lock(data_/L"handoff.lock");
+        auto queue=fs::exists(queue_file)?read_json(queue_file):Json::object();
+        auto claim=queue.value("claim",Json::object());
+        auto snapshot=[&] {
+            Database db(data_,false);
+            auto rows=db.state.at("sessions");
+            rows.update(read_legacy_sessions(db.state.at("settings")).rows);
+            return rows;
+        };
+        auto present=[&](const Json& current) {
+            const auto key=current.at("sessionId").get<std::string>();
+            const auto row=invoke("cluster_refresh_session",{{"sessionId",key}});
+            require(row.at("resultVersion")==current.at("resultVersion") && !active(row),"领取的结果版本已变化");
+            const auto report=invoke("cluster_read_result",{{"sessionId",key}});
+            require(report.at("resultVersion")==current.at("resultVersion"),"领取的结果版本已变化");
+            return Json{{"claimToken",current.at("claimToken")},{"expiresAt",current.at("expiresAt")},
+                {"session",row},{"result",report.at("messages")}};
+        };
+        if (!claim.empty() && claim.value("expiresAt",std::int64_t(0))<=now()) {
+            claim=Json::object();
+            queue.erase("claim");
+            write_state_file(queue_file,queue);
+        }
+        if (!token.empty() && token==claim.value("claimToken","") && outcome.empty()) return present(claim);
+        if (!token.empty() && token==queue.value("lastToken","")) {
+            if (!claim.empty() && queue.value("nextToken","")==claim.value("claimToken","")) {
+                auto response=present(claim);
+                response["completed"]=true;
+                return response;
+            }
+            return {{"completed",true},{"busy",!claim.empty()}};
+        }
+        if (!claim.empty()) {
+            if (claim.at("claimToken")!=token) return {{"busy",true},{"expiresAt",claim.at("expiresAt")}};
+            const auto key=claim.at("sessionId").get<std::string>();
+            const auto version=claim.at("resultVersion").get<std::string>();
+            if (!key.starts_with("codex:")) refresh(data_,key);
+            const auto rows=snapshot();
+            if (!rows.contains(key) || rows.at(key).at("resultVersion")!=version || active(rows.at(key))) {
+                queue.erase("claim");
+                write_state_file(queue_file,queue);
+                return {{"changed",true}};
+            }
+            if (key.starts_with("codex:")) {
+                const auto settings=invoke("cluster_get_settings");
+                complete_legacy_handoff(settings,key,version,outcome);
+            } else {
+                Database db(data_,true);
+                auto& row=db.state["sessions"].at(key);
+                require(!active(row) && row.at("resultVersion")==version,"会话的结果版本已变化");
+                row["read"]=true;
+                row["processed"]=true;
+                row["handoffOutcome"]=outcome;
+                db.save();
+            }
+            queue["lastToken"]=token;
+            queue.erase("nextToken");
+            queue.erase("claim");
+            write_state_file(queue_file,queue);
+        } else require(token.empty(),"领取凭据过期，请重新领取");
+
+        const auto rows=snapshot();
+        const Json* oldest=nullptr;
+        const auto sort_key=[](const Json& row) {
+            return std::pair(row.value("completed",std::int64_t(0)),row.at("id").get<std::string>());
+        };
+        for (const auto& row:rows) {
+            if (active(row) || row.value("processed",false) || row.value("resultVersion","").empty()) continue;
+            if (!oldest || sort_key(row)<sort_key(*oldest)) oldest=&row;
+        }
+        if (!oldest) return {{"empty",true},{"completed",!token.empty()}};
+        claim={{"source",oldest->value("source","fatfishbox")},{"sessionId",oldest->at("id")},
+            {"resultVersion",oldest->at("resultVersion")},{"claimToken",id()},
+            {"expiresAt",now()+30*60*1000}};
+        auto result=present(claim);
+        queue["claim"]=claim;
+        if (!token.empty()) queue["nextToken"]=claim.at("claimToken");
+        write_state_file(queue_file,queue);
+        result["completed"]=!token.empty();
+        return result;
+    }
+    if (tool == "cluster_get_presets" || tool == "cluster_import_models") {
         Json settings;
         {
             Database db(data_, false);
             settings = db.state.at("settings");
         }
         const auto connection = discover(settings, input);
+        if (tool == "cluster_get_presets") {
+            Json permissions=Json::array(), agents=Json::array();
+            const auto append=[](Json& list,const std::string& key,const std::string& label) {
+                if (!key.empty() && std::ranges::none_of(list,[&](const Json& row){return row.at("id")==key;}))
+                    list.push_back({{"id",key},{"label",label.empty()?key:label}});
+            };
+            if (!connection.auth.empty()) {
+                Dsh dsh(connection.auth);
+                const auto catalog=dsh.request("permissionPresets/catalog");
+                for (const auto& row:catalog.at("defaultOptions"))
+                    append(permissions,row.at("value").get<std::string>(),row.value("name",""));
+                const auto roster=dsh.request("agentPresets/list");
+                for (const auto& row:roster.at("presets"))
+                    if (row.value("broken","").empty())
+                        append(agents,row.at("id").get<std::string>(),row.value("name",""));
+            } else {
+                append(permissions,connection.permission,"");
+                append(agents,connection.preset,"");
+            }
+            return {{"permissions",permissions},{"agents",agents},{"connected",!connection.auth.empty()}};
+        }
         require(!connection.auth.empty(), "请指定已授权的 DSH 配置或本机授权文件");
         const auto catalog = Dsh(connection.auth).request("session/modelCatalog");
         auto summary = catalog_import(settings, catalog);
@@ -698,6 +812,8 @@ Json Cluster::tools() {
     };
     add("cluster_overview","查看活动会话、待交接、未读和模型账号汇总。");
     add("cluster_get_settings","读取当前连接配置、账号、模型池与 revision。");
+    add("cluster_get_presets","读取 DSH 权限预设和可用 Agent 预设。",
+        {{"authPath",text},{"configPath",text}});
     add("cluster_import_models","从 DSH 实时目录导入所有已配置账号和模型。",
         {{"authPath",text},{"configPath",text}});
     add("cluster_configure","更新 DSH 连接设置和全局负载均衡策略。",
@@ -707,17 +823,14 @@ Json Cluster::tools() {
     add("cluster_update_pool","设置模型、角色并发、思考强度、调度优先级和权重。",
         {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer},{"roles",object},
          {"effort",text},{"priority",integer},{"weight",integer}}, {"revision","id"});
-    add("cluster_list_sessions","分页查看会话，或按完成时间查询待交接。",
-        {{"limit",integer},{"offset",integer},{"batch",text},{"handoffOnly",boolean}});
+    add("cluster_next_handoff","获取下一个需处理对话。完成实际处置后，传回 claimToken 和 outcome 自动确认并领取下一条。省略 outcome 可用领取凭据重读本条。",
+        {{"claimToken",text},{"outcome",text}});
+    tools.back()["title"]="获取下一个需处理对话";
     add("cluster_start_session","在授权工作区和角色并发范围内派发一个会话。",
         {{"title",text},{"batch",text},{"role",text},{"workspace",text},{"task",text},{"poolId",text}},
         {"title","batch","role","workspace","task"});
     add("cluster_refresh_sessions","同步本地登记的最早活动会话，每次最多 20 个。",{{"limit",integer}});
-    for (auto [name, label] : {std::pair{"cluster_get_session","读取本地会话"}, {"cluster_refresh_session","刷新 DSH 运行状态"},
-        {"cluster_cancel_session","取消指定会话"}, {"cluster_read_result","读取会话输出和结果版本"}})
-        add(name,label,{{"sessionId",text}},{"sessionId"});
-    add("cluster_mark_receipt","确认或标记已读，通过精确结果版本防止错认。",
-        {{"sessionId",text},{"resultVersion",text},{"processed",boolean}}, {"sessionId","resultVersion"});
+    add("cluster_cancel_session","取消已知的活动会话。",{{"sessionId",text}},{"sessionId"});
     return tools;
 }
 }

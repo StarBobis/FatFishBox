@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -19,6 +19,12 @@ const server = createServer(async (req,res) => {
     const args = payload.args;
     let value;
     switch (method) {
+    case 'permissionPresets/catalog':
+        value = {defaultOptions:[{value:'prompt-on-risk',name:'Prompt on risk'}]};
+        break;
+    case 'agentPresets/list':
+        value = {presets:[{id:'ptc',name:'PTC'}, {id:'broken',broken:'Unavailable'}]};
+        break;
     case 'session/modelCatalog':
         value = {groups:[
             {id:'account-a', name:'Account A', models:[
@@ -86,6 +92,10 @@ try {
     const two = await connect(root);
     const inventory = (await one.rpc('tools/list')).tools;
     assert(inventory.some(tool => tool.name==='cluster_refresh_sessions'));
+    assert(!inventory.some(tool => ['cluster_list_sessions','cluster_get_session','cluster_read_result','cluster_mark_receipt'].includes(tool.name)));
+    const presets=await one.tool('cluster_get_presets',{authPath:auth,configPath:''});
+    assert.deepEqual(presets.permissions,[{id:'prompt-on-risk',label:'Prompt on risk'}]);
+    assert.deepEqual(presets.agents,[{id:'ptc',label:'PTC'}]);
     const initial = await one.tool('cluster_import_models',{authPath:auth,configPath:''});
     assert.equal(initial.accounts,2);
     assert.equal(initial.models,3);
@@ -105,14 +115,8 @@ try {
     assert.equal(prompts,1);
     running=false;terminal=true;
     const page=await two.tool('cluster_refresh_sessions');
-    assert.equal(page.sessions[0].resultVersion,'1:7');
+    assert.equal(page.synced,1);
     assert.equal((await two.tool('cluster_overview')).usage.todayTokens,165);
-    const report=await one.tool('cluster_read_result',{sessionId:session.id});
-    assert.equal(report.messages[0].text,'交接证据');
-    await one.tool('cluster_mark_receipt',{sessionId:session.id,resultVersion:'1:6',processed:true},true);
-    assert.equal((await one.tool('cluster_list_sessions',{handoffOnly:true})).total,1);
-    await two.tool('cluster_mark_receipt',{sessionId:session.id,resultVersion:'1:7',processed:true});
-    assert.equal((await one.tool('cluster_list_sessions')).total,0);
     const registry=join(root,'codex-state','registry');
     await mkdir(registry,{recursive:true});
     const origin='http://127.0.0.1:42';
@@ -124,22 +128,38 @@ try {
     await writeFile(receipts,JSON.stringify({[oldKey]:{version:'1:6',read:true,processed:true}}));
     const combined=await two.tool('cluster_overview');
     assert.equal(combined.codexSessions,1);
-    assert.equal(combined.handoffs,1);
-    assert.equal(combined.unread,1);
-    const shared=(await one.tool('cluster_list_sessions',{handoffOnly:true})).sessions[0];
-    assert.equal(shared.readOnly,true);
-    assert.equal((await two.tool('cluster_read_result',{sessionId:shared.id})).messages[0].text,'原插件证据');
-    await one.tool('cluster_mark_receipt',{sessionId:shared.id,resultVersion:'1:7',processed:true},true);
-    await writeFile(receipts,JSON.stringify({[oldKey]:{version:'1:7',read:true,processed:true}}));
-    assert.equal((await one.tool('cluster_overview')).handoffs,0);
-    assert.equal((await two.tool('cluster_list_sessions')).total,0);
-    console.log('MCP round trip: catalog, two processes, caps, effort, output and versioned receipts passed.');
+    assert.equal(combined.unprocessed,2);
+    await one.tool('cluster_read_result',{sessionId:session.id},true);
+    await one.tool('cluster_mark_receipt',{sessionId:session.id,resultVersion:'1:7',processed:true},true);
+    await one.tool('cluster_next_handoff',{sessionId:session.id},true);
+    const [first, second] = await Promise.all([one.tool('cluster_next_handoff'),two.tool('cluster_next_handoff')]);
+    const oldest=first.busy?second:first;
+    assert.equal((first.busy?first:second).busy,true);
+    assert.equal(oldest.session.id,'codex:old-session');
+    assert.equal(oldest.result[0].text,'原插件证据');
+    assert.equal((await one.tool('cluster_overview')).unprocessed,2);
+    assert.equal((await two.tool('cluster_next_handoff',{claimToken:oldest.claimToken})).claimToken,oldest.claimToken);
+    const ack={claimToken:oldest.claimToken,outcome:'Checked the legacy worktree and recorded its result.'};
+    const next=await two.tool('cluster_next_handoff',ack);
+    assert.equal(next.session.id,session.id);
+    assert.equal(next.result[0].text,'交接证据');
+    assert.equal((await one.tool('cluster_next_handoff',ack)).claimToken,next.claimToken);
+    const updated=JSON.parse(await readFile(receipts,'utf8'))[oldKey];
+    assert.equal(updated.version,'1:7');
+    assert.equal(updated.processed,true);
+    assert.equal(updated.outcome,ack.outcome);
+    assert.equal((await two.tool('cluster_next_handoff',{claimToken:next.claimToken,outcome:'Verified report.'})).empty,true);
+    assert.equal((await one.tool('cluster_overview')).unprocessed,0);
+    console.log('stdio MCP passed: DSH presets, scheduling, FIFO claims, shared receipts and denied bypasses.');
     if (process.env.FATFISH_TEST_LIVE_DSH === '1') {
         const directory = join(root,'real');
         const real = await connect(directory);
         const result = await real.tool('cluster_import_models');
         assert(result.accounts > 0 && result.models > 0);
         console.log(`Live DSH catalog: ${result.accounts} accounts, ${result.models} models.`);
+        const livePresets=await real.tool('cluster_get_presets');
+        assert(livePresets.permissions.length>0 && livePresets.agents.length>0);
+        console.log(`Live DSH presets: ${livePresets.permissions.length} permission, ${livePresets.agents.length} agent.`);
     }
 } finally {
     for (const child of live) child.stdin.end();

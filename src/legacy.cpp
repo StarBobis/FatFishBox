@@ -1,5 +1,6 @@
 #include "legacy.h"
 #include "dsh.h"
+#include "state_file.h"
 #include <windows.h>
 #include <algorithm>
 #include <map>
@@ -64,6 +65,8 @@ struct Entry {
     Json record;
     Json mark;
     std::string id;
+    fs::path review_path, registry;
+    std::string review_key;
 };
 
 std::map<std::string,Entry> load(const Json& settings, int& sources, int& unreadable) {
@@ -86,6 +89,7 @@ std::map<std::string,Entry> load(const Json& settings, int& sources, int& unread
             if (!marks.is_object()) throw std::runtime_error("回执格式无效");
         } catch (const std::exception&) {
             ++unreadable;
+            marks=Json::object();
         }
         for (const auto& [key,row] : data.at("sessions").items()) {
             const auto sid = text(row,"sessionId");
@@ -103,7 +107,8 @@ std::map<std::string,Entry> load(const Json& settings, int& sources, int& unread
             const auto local = "codex:" + sid;
             auto existing = records.find(local);
             if (existing == records.end() || milliseconds(row,"updatedAt") > milliseconds(existing->second.record,"updatedAt"))
-                records.insert_or_assign(local,Entry{row,matched,local});
+                records.insert_or_assign(local,Entry{row,matched,local,mark_path,registry,
+                    marks.contains(ref.dump()) && !marks.contains(spaced)?ref.dump():spaced});
         }
     }
     return records;
@@ -123,10 +128,11 @@ Json projection(const Entry& entry) {
     const auto processed = exact && entry.mark.value("processed",false);
     if (status == "policy_violation" || status == "tool_arguments_error") status = "failed";
     const auto updated = milliseconds(row,"updatedAt");
+    const auto ended = milliseconds(row,"endedAt");
     return {{"id",entry.id},{"source","codex"},{"readOnly",true},{"title",text(row,"title",text(row,"sessionId"))},
         {"dshId",text(row,"sessionId")},{"batch",text(row,"batchId")},{"workspace",text(row,"workspace")},
         {"role",text(row,"role")},{"provider",text(row,"provider")},{"model",text(row,"model")},
-        {"status",status},{"updated",updated},{"completed",version.empty()?0:updated},
+        {"status",status},{"updated",updated},{"completed",version.empty()?0:(ended?ended:updated)},
         {"resultVersion",version},{"read",read},{"processed",processed}};
 }
 }
@@ -155,5 +161,29 @@ Json legacy_result(const Json& settings, const std::string& id) {
     Json messages=Json::array();
     if (!output.empty()) messages.push_back({{"type","assistant/message"},{"text",output},{"truncated",clipped}});
     return {{"sessionId",id},{"source","codex"},{"readOnly",true},{"resultVersion",row.at("resultVersion")},{"messages",messages}};
+}
+
+void complete_legacy_handoff(const Json& settings,const std::string& id,const std::string& version,
+                             const std::string& outcome) {
+    int sources=0, unreadable=0;
+    const auto entries=load(settings,sources,unreadable);
+    const auto& entry=entries.at(id);
+    auto lock_path=entry.review_path;
+    lock_path.replace_extension(L".lock");
+    const ExclusiveStateLock lock(lock_path);
+    const auto registry=read_json(entry.registry,max_registry);
+    const auto& sessions=registry.at("sessions");
+    const auto record=std::ranges::find_if(sessions,[&](const Json& row) {
+        return text(row,"sessionId")==text(entry.record,"sessionId") &&
+            text(row,"serviceOrigin")==text(entry.record,"serviceOrigin");
+    });
+    if (record==sessions.end() || projection(Entry{*record,{},id,{}, {}, {}}).at("resultVersion")!=version)
+        throw std::runtime_error("Codex 会话的结果版本已变化");
+    auto marks=fs::exists(entry.review_path)?read_json(entry.review_path,max_registry):Json::object();
+    if (!marks.is_object()) throw std::runtime_error("Codex 回执格式无效");
+    auto& mark=marks[entry.review_key];
+    if (mark.is_object() && mark.value("version","")==version && mark.value("processed",false)) return;
+    mark={{"version",version},{"read",true},{"processed",true},{"outcome",outcome}};
+    write_state_file(entry.review_path,marks);
 }
 }
