@@ -33,9 +33,9 @@ Agent 通过 `cluster_start_session` 向授权工作区派发会话，通过 `cl
 
 首次派发可用 `allowedPoolIds` 为批次保存允许池清单。自动派发可在清单内处理模型不可用或账号限流，固定池使用 `poolId`。提交任务后遇到状态不明时先同步，避免重复派发。派发诊断提供池的状态、占用、上限和备选池。
 
-用 `cluster_repair_handoff` 从当前队首派发返修。返修结果挂在原交接下，主代理验收后确认原交接。结构化 `delivery` 包含子会话自报的提交、工作树状态、测试退出码和证据路径。完整操作示例见 `fatfish://workflow`。
+用 `cluster_repair_handoff` 从当前交接派发返修。返回 `claimReleased: true` 后可立即领取其他结果。返修完成后独立按时间排队，由主代理用新的领取凭据验收。结构化 `delivery` 包含子会话自报的提交、工作树状态、测试退出码和证据路径。完整操作示例见 `fatfish://workflow`。
 
-可以用 `cluster_get_session_status({sessionId})` 查询已知会话，传入派发返回的 `id` 或 `dshId`。返回的 `sessionId` 是 FatFishBox 登记 ID。若 `dshId` 对应多条记录，请使用 `id`。同批次已有返修时，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 将它绑定给当前交接，再用原领取凭据验收确认。
+可以用 `cluster_get_session_status({sessionId})` 查询已知会话，传入派发返回的 `id` 或 `dshId`。返回的 `sessionId` 是 FatFishBox 登记 ID。若 `dshId` 对应多条记录，请使用 `id`。同批次已有返修时，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 关联并释放原领取。关联时已完成的返修按关联时刻排队。
 
 ## 构建与验证
 

@@ -67,9 +67,6 @@ std::wstring title(const Json& object, const char* member) {
     return widen(object.value(member, ""));
 }
 std::wstring status(const Json& row) {
-    const auto handoff=row.value("handoffState","");
-    if (handoff=="repairing") return L"返修中";
-    if (handoff=="awaiting_acceptance") return L"待主代理验收";
     static const std::map<std::string,std::wstring> labels{
         {"starting",L"启动中"},{"queued",L"排队"},{"running",L"运行中"},{"waiting_input",L"等待输入"},
         {"cancelling_policy_violation",L"正在停止"},
@@ -79,7 +76,6 @@ std::wstring status(const Json& row) {
 }
 ColorToken status_color(const Json& row) {
     const auto state=row.value("status","");
-    if (row.contains("handoffState")) return ColorToken::status_warning;
     if (row.value("stale",false)) return ColorToken::status_warning;
     if (state=="succeeded") return ColorToken::status_success;
     if (state=="failed" || state=="interrupted") return ColorToken::status_error;
@@ -156,6 +152,8 @@ public:
         logo_ = embedded_logo();
         renderer_.initialize();
         renderer_.set_dpi(GetDpiForWindow(window));
+        try {cluster_.migrate_repair_queue();}
+        catch (const std::exception& error) {notice_=widen(error.what());}
         try { http_=std::make_unique<fatfish::McpHttpServer>(cluster_); }
         catch (const std::exception& error) { http_error_=widen(error.what()); }
         redraw();

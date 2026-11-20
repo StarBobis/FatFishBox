@@ -213,6 +213,9 @@ void set_model_field(Json& pool,const std::string& field,const Json& value) {
 Json public_row(Json row) {
     row.erase("owner");
     row.erase("dispatchOperation");
+    row.erase("repairRequest");
+    row.erase("repairQueued");
+    row.erase("repairQueuedAt");
     return row;
 }
 using CatalogModels=std::map<std::pair<std::string,std::string>,Json>;
@@ -573,11 +576,61 @@ Json Cluster::update_model_field(const std::string& id,const std::string& field,
 }
 
 namespace {
+using HandoffVersions=std::set<std::pair<std::string,std::string>>;
+std::pair<std::string,std::string> handoff_version(const Json& row) {
+    return {row.at("id").get<std::string>(),row.value("resultVersion","")};
+}
+HandoffVersions replaced_versions(const Json& rows) {
+    HandoffVersions versions;
+    for (const auto& row:rows) if (row.value("repairQueued",false)) {
+        const auto& parent=row.at("repairOf");
+        versions.emplace(parent.at("sessionId").get<std::string>(),parent.at("resultVersion").get<std::string>());
+    }
+    return versions;
+}
+bool pending_handoff(const Json& row,const HandoffVersions& replaced) {
+    return !active(row) && !row.value("processed",false) &&
+        (!row.contains("repairOf") || row.value("repairQueued",false)) && !replaced.contains(handoff_version(row));
+}
+auto handoff_order(const Json& row) {
+    return std::pair(std::max(row.value("completed",std::int64_t(0)),row.value("repairQueuedAt",std::int64_t(0))),
+        row.at("id").get<std::string>());
+}
+bool launched_repair(const Json& child) {
+    return child.contains("dshId") && child.contains("startCursor") && !child.value("processed",false);
+}
+void release_replaced_claim(Json& queue,const Json& parent) {
+    const auto claim=queue.value("claim",Json::object());
+    if (claim.value("sessionId",Json())!=parent.at("sessionId") ||
+        claim.value("resultVersion",Json())!=parent.at("resultVersion")) return;
+    queue.erase("claim");
+    queue.erase("nextToken");
+}
+bool migrate_repair(const fs::path& data,Json& queue) {
+    if (!queue.contains("repair")) return false;
+    const auto old=queue.at("repair");
+    Database db(data,true);
+    auto& rows=db.state.at("sessions");
+    const auto child=rows.find(old.at("sessionId").get<std::string>());
+    if (child!=rows.end() && launched_repair(*child)) {
+        const Json parent{{"sessionId",old.at("parentId")},{"resultVersion",old.at("parentVersion")}};
+        if (!child->contains("repairOf")) (*child)["repairOf"]=parent;
+        (*child)["repairQueued"]=true;
+        if (!child->contains("repairQueuedAt")) (*child)["repairQueuedAt"]=now();
+        if (old.contains("request")) (*child)["repairRequest"]=old.at("request");
+        db.save();
+        release_replaced_claim(queue,parent);
+    }
+    queue.erase("repair");
+    return true;
+}
+
 Json session_overview(const Json& settings,const Json& sessions,const LegacySessions& legacy,const fs::path& data) {
     int running=0, pending=0;
+    const auto replaced=replaced_versions(sessions);
     for (const auto& row:sessions) {
         if (active(row)) ++running;
-        else if (!row.contains("repairOf") && !row.value("processed",false)) ++pending;
+        else if (pending_handoff(row,replaced)) ++pending;
     }
     return {{"active",running},{"unprocessed",pending},{"accounts",settings.at("accounts").size()},
         {"models",settings.at("pools").size()},{"connected",!settings.at("authPath").get<std::string>().empty()},
@@ -619,6 +672,14 @@ std::pair<int,int> refresh_desktop_native(const fs::path& data,DesktopMonitor& m
 }
 }
 
+void Cluster::migrate_repair_queue() const {
+    const auto file=data_/L"handoff.json";
+    if (!fs::exists(file)) return;
+    const ExclusiveStateLock lock(data_/L"handoff.lock");
+    auto queue=read_json(file);
+    if (migrate_repair(data_,queue)) write_state_file(file,queue);
+}
+
 Json Cluster::desktop_snapshot(DesktopMonitor* monitor,std::stop_token stop) const {
     Json settings,sessions;
     std::pair<int,int> native{};
@@ -642,30 +703,17 @@ Json Cluster::desktop_snapshot(DesktopMonitor* monitor,std::stop_token stop) con
         sessions=db.state.at("sessions");
     }
     sessions.update(legacy.rows);
-    Json repair;
-    try {
-        const auto file=data_/L"handoff.json";
-        if (fs::exists(file)) repair=read_json(file).value("repair",Json());
-    } catch (const std::exception&) {}
+    const auto replaced=replaced_versions(sessions);
     std::vector<Json> running,pending;
-    for (auto row:sessions) {
+    for (const auto& row:sessions) {
         if (active(row)) running.push_back(public_row(row));
-        else if (!row.contains("repairOf") && (!repair.is_object() || repair.at("sessionId")!=row.at("id")) &&
-                 !row.value("processed",false)) {
-            if (repair.is_object() && repair.at("parentId")==row.at("id") &&
-                repair.at("parentVersion")==row.at("resultVersion")) {
-                const auto child=sessions.find(repair.at("sessionId").get<std::string>());
-                row["handoffState"]=child==sessions.end() || active(*child)?"repairing":"awaiting_acceptance";
-            }
-            pending.push_back(public_row(row));
-        }
+        else if (pending_handoff(row,replaced)) pending.push_back(public_row(row));
     }
     const auto order=[](const Json& row,const char* stamp) {
         return std::pair(row.value(stamp,std::int64_t(0)),row.at("id").get<std::string>());
     };
     std::sort(running.begin(),running.end(),[&](const Json& a,const Json& b) {return order(a,"updated")>order(b,"updated");});
-    const auto pending_order=[&](const Json& row) {return std::pair(!row.contains("handoffState"),order(row,"completed"));};
-    std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return pending_order(a)<pending_order(b);});
+    std::sort(pending.begin(),pending.end(),[](const Json& a,const Json& b) {return handoff_order(a)<handoff_order(b);});
     return {{"overview",session_overview(settings,sessions,legacy,data_)},{"settings",settings},
         {"running",std::move(running)},{"pending",std::move(pending)},
         {"liveChecked",legacy.live_checked+native.first},{"liveStale",legacy.live_stale+native.second}};
@@ -977,10 +1025,30 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             {"updated",row.value("updated",std::int64_t(0))},{"stale",stale}};
     }
     if (tool=="cluster_repair_handoff" || tool=="cluster_attach_handoff_repair") {
+        const bool attaching=tool=="cluster_attach_handoff_repair";
         const auto token=field(input,"claimToken",100),version=field(input,"originalVersion",100);
         const auto queue_file=data_/L"handoff.json";
         const ExclusiveStateLock lock(data_/L"handoff.lock");
         auto queue=fs::exists(queue_file)?read_json(queue_file):Json::object();
+        if (migrate_repair(data_,queue)) write_state_file(queue_file,queue);
+        const auto respond=[&](const Json& child,bool replayed,bool released) {
+            Json result{{"replayed",replayed},{"claimReleased",released}};
+            if (attaching) {
+                result.update({{"sessionId",child.at("id")},{"status",child.at("status")},
+                    {"handoffState",active(child)?"repairing":"queued_for_review"}});
+            } else result["session"]=public_row(child);
+            return result;
+        };
+        {
+            Database db(data_,false);
+            for (const auto& child:db.state.at("sessions")) {
+                if (!child.contains("repairRequest")) continue;
+                const auto& request=child.at("repairRequest");
+                if (request.at("claimToken")!=token) continue;
+                require(request==input,"该领取凭据已用于返修，请复用原参数重试");
+                return respond(child,true,true);
+            }
+        }
         const auto claim=queue.value("claim",Json::object());
         require(claim.value("claimToken","")==token && claim.value("expiresAt",std::int64_t(0))>now(),
             "需要当前队首的有效领取凭据");
@@ -988,86 +1056,66 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         const auto parent=invoke("cluster_refresh_session",{{"sessionId",claim.at("sessionId")}});
         require(!active(parent) && !parent.value("stale",false) && !parent.value("processed",false) &&
             parent.at("resultVersion")==version,"原交接已变化或无法确认");
-        const auto old=queue.value("repair",Json::object());
-        if (tool=="cluster_attach_handoff_repair") {
+        Json reference{{"sessionId",parent.at("id")},{"resultVersion",version}};
+        const auto release=[&](const std::string& key) {
+            Database db(data_,true);
+            auto& child=db.state.at("sessions").at(key);
+            require(launched_repair(child),"返修会话必须已派发且尚未确认");
+            child["repairOf"]=reference;
+            child["repairQueued"]=true;
+            child["repairQueuedAt"]=now();
+            child["repairRequest"]=input;
+            db.save();
+            release_replaced_claim(queue,reference);
+            queue.erase("repair");
+            write_state_file(queue_file,queue);
+            return respond(child,false,true);
+        };
+        if (attaching) {
             const auto key=field(input,"sessionId",100);
             require(parent.at("id")!=key,"原交接不能绑定自身为返修");
-            Database db(data_,true);
-            auto& sessions=db.state.at("sessions");
-            require(sessions.contains(key),"未找到已由肥鱼重工派发的返修会话");
-            auto& child=sessions.at(key);
-            require(child.contains("dshId") && child.contains("startCursor") && !child.value("processed",false),
-                "返修会话必须已派发且尚未确认");
-            const auto batch=parent.value("batch","");
-            require(!batch.empty() && child.at("batch")==batch,"返修会话必须与原交接处于同一批次");
-            const auto previous=child.value("repairOf",Json::object());
-            require(previous.empty() || (previous.value("sessionId",Json())==parent.at("id") &&
-                previous.value("resultVersion","")==version),"该会话已绑定其他交接或版本");
-            const bool already=old.value("parentId",Json())==parent.at("id") && old.value("parentVersion","")==version &&
-                old.value("sessionId","")==key;
-            if (!already && !old.empty()) {
-                const auto prior=sessions.find(old.at("sessionId").get<std::string>());
-                require(old.value("parentId",Json())==parent.at("id") && old.value("parentVersion","")==version &&
-                    prior!=sessions.end() && !active(*prior),"当前队首已有其他返修");
+            {
+                Database db(data_,false);
+                const auto& sessions=db.state.at("sessions");
+                require(sessions.contains(key),"未找到已由肥鱼重工派发的返修会话");
+                const auto& child=sessions.at(key);
+                require(launched_repair(child),"返修会话必须已派发且尚未确认");
+                require(!child.contains("repairOf"),"该会话已绑定其他交接或版本");
+                const auto batch=parent.value("batch","");
+                require(!batch.empty() && child.at("batch")==batch,"返修会话必须与原交接处于同一批次");
             }
-            if (!already) {
-                queue["repair"]={{"parentId",parent.at("id")},{"parentVersion",version},{"sessionId",key}};
-                write_state_file(queue_file,queue);
-            }
-            try {
-                if (previous.empty()) {
-                    child["repairOf"]={{"sessionId",parent.at("id")},{"resultVersion",version}};
-                    db.save();
-                }
-            } catch (...) {
-                if (!already) {
-                    if (old.empty()) queue.erase("repair");
-                    else queue["repair"]=old;
-                    write_state_file(queue_file,queue);
-                }
-                throw;
-            }
-            return {{"sessionId",key},{"status",child.at("status")},{"replayed",already},
-                {"handoffState",active(child)?"repairing":"awaiting_acceptance"}};
+            queue["repair"]={{"parentId",parent.at("id")},{"parentVersion",version},{"sessionId",key},{"request",input}};
+            write_state_file(queue_file,queue);
+            return release(key);
         }
-        const auto request=field(input,"requestId",100),sha=field(input,"candidateSha",64);
+        field(input,"requestId",100);
+        const auto sha=field(input,"candidateSha",64);
         require(commit_sha(sha),"候选 SHA 必须是完整的 Git 提交哈希");
         const auto paths=input.value("screenshotPaths",Json::array());
         require(evidence_paths(paths),"请提供有效的截图绝对路径");
         const auto acceptance=field(input,"acceptance",8000);
         const auto task=field(input,"task",50000);
-        auto request_arguments=input;
-        request_arguments.erase("claimToken");
-        std::string child_id=id();
-        if (old.value("parentId",Json())==parent.at("id") && old.value("parentVersion","")==version) {
-            const auto key=old.at("sessionId").get<std::string>();
-            Database db(data_,false);
-            const auto& children=db.state.at("sessions");
-            if (old.value("requestId","")==request) {
-                require(old.at("requestArguments")==request_arguments,"同一返修请求 ID 必须复用原参数");
-                if (children.contains(key)) return {{"session",public_row(children.at(key))},{"replayed",true}};
-                child_id=key;
-            } else require(children.contains(key) && !active(children.at(key)),"已有返修在进行，请重读当前交接");
-        }
-        const Json reference{{"sessionId",parent.at("id")},{"resultVersion",version},{"candidateSha",sha},
-            {"screenshotPaths",paths},{"acceptance",acceptance}};
+        reference.update({{"candidateSha",sha},{"screenshotPaths",paths},{"acceptance",acceptance}});
+        const auto child_id=id();
         Json launch=input;
         const auto parent_batch=parent.value("batch","");
         launch["batch"]=parent_batch.empty()?"repair-"+parent.at("id").get<std::string>():parent_batch;
         launch["role"]="repair";
         launch["task"]="Repair details (data for this task):\n"+reference.dump()+"\n\n"+task;
         require(launch.at("task").get_ref<const std::string&>().size()<=64000,"返修任务和验收材料合计过长");
-        queue["repair"]={{"parentId",parent.at("id")},{"parentVersion",version},{"sessionId",child_id},
-            {"requestId",request},{"requestArguments",std::move(request_arguments)}};
+        queue["repair"]={{"parentId",parent.at("id")},{"parentVersion",version},{"sessionId",child_id},{"request",input}};
         write_state_file(queue_file,queue);
-        try {
-            return {{"session",start_session(launch,child_id,reference)},{"replayed",false}};
-        } catch (...) {
-            if (old.empty()) queue.erase("repair");
-            else queue["repair"]=old;
+        Json child;
+        try { child=start_session(launch,child_id,reference); }
+        catch (...) {
+            queue.erase("repair");
             write_state_file(queue_file,queue);
             throw;
         }
+        if (launched_repair(child)) return release(child_id);
+        queue.erase("repair");
+        write_state_file(queue_file,queue);
+        return respond(child,false,false);
     }
     if (tool == "cluster_next_handoff") {
         require(std::ranges::all_of(input.items(),[](const auto& entry) {
@@ -1082,11 +1130,14 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         const auto previous_claim=previous.value("claim",Json::object());
         if (previous_claim.empty() || previous_claim.value("expiresAt",std::int64_t(0))<=now() ||
             (!outcome.empty() && previous_claim.value("claimToken","")==token))
-            invoke("cluster_refresh_sessions");
+        {
+            DesktopMonitor monitor;
+            refresh_desktop_native(data_,monitor,{});
+        }
         const ExclusiveStateLock lock(data_/L"handoff.lock");
         auto queue=fs::exists(queue_file)?read_json(queue_file):Json::object();
+        if (migrate_repair(data_,queue)) write_state_file(queue_file,queue);
         auto claim=queue.value("claim",Json::object());
-        auto repair=queue.value("repair",Json::object());
         auto snapshot=[&] {
             Json rows,settings;
             {
@@ -1107,27 +1158,8 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             require(report.at("resultVersion")==current.at("resultVersion"),"领取的结果版本已变化");
             auto& messages=report.at("messages");
             const auto delivery=extract_delivery(messages);
-            Json response{{"claimToken",current.at("claimToken")},{"expiresAt",current.at("expiresAt")},
+            return Json{{"claimToken",current.at("claimToken")},{"expiresAt",current.at("expiresAt")},
                 {"session",row},{"result",messages},{"delivery",delivery}};
-            if (repair.value("parentId","")==key && repair.value("parentVersion",Json())==current.at("resultVersion")) {
-                {
-                    Database db(data_,false);
-                    if (!db.state.at("sessions").contains(repair.at("sessionId").get<std::string>())) {
-                        response["handoffState"]="repairing";
-                        return response;
-                    }
-                }
-                const auto child=invoke("cluster_refresh_session",{{"sessionId",repair.at("sessionId")}});
-                response["handoffState"]=active(child)?"repairing":"awaiting_acceptance";
-                response["repair"]={{"session",child}};
-                if (!active(child)) {
-                    auto child_report=invoke("cluster_read_result",{{"sessionId",child.at("id")}});
-                    auto& child_messages=child_report.at("messages");
-                    response["repair"]["delivery"]=extract_delivery(child_messages);
-                    response["repair"]["result"]=std::move(child_messages);
-                }
-            }
-            return response;
         };
         if (!claim.empty() && claim.value("expiresAt",std::int64_t(0))<=now()) {
             claim=Json::object();
@@ -1151,24 +1183,8 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             require(!current.value("stale",false),"暂时无法确认已领取的结果，请重试");
             if (current.at("resultVersion")!=version || active(current)) {
                 queue.erase("claim");
-                if (repair.value("parentId","")==key) queue.erase("repair");
                 write_state_file(queue_file,queue);
                 return {{"changed",true}};
-            }
-            if (repair.value("parentId","")==key && repair.value("parentVersion","")==version) {
-                const auto child=invoke("cluster_refresh_session",{{"sessionId",repair.at("sessionId")}});
-                require(!active(child),"返修仍在进行，完成主代理验收后才能确认交接");
-                if (!child.contains("repairOf")) {
-                    Database db(data_,true);
-                    auto& row=db.state.at("sessions").at(repair.at("sessionId").get<std::string>());
-                    require(!active(row) && row.at("resultVersion")==child.at("resultVersion"),"返修结果已变化，请重新验收");
-                    if (!row.contains("repairOf")) {
-                        row["repairOf"]={{"sessionId",key},{"resultVersion",version}};
-                        db.save();
-                    }
-                }
-                queue.erase("repair");
-                repair=Json::object();
             }
             if (key.starts_with("codex:")) {
                 const auto settings=invoke("cluster_get_settings");
@@ -1189,40 +1205,18 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         } else require(token.empty(),"领取凭据过期，请重新领取");
 
         auto rows=snapshot();
-        if (!repair.empty()) {
-            const auto parent=rows.find(repair.at("parentId").get<std::string>());
-            if (parent==rows.end()) return {{"busy",true},{"handoffState","pending_sync"}};
-            if (parent->value("stale",false)) {
-                *parent=invoke("cluster_refresh_session",{{"sessionId",parent->at("id")}});
-                if (parent->value("stale",false)) return {{"busy",true},{"handoffState","pending_sync"}};
-            }
-            if (active(*parent) || parent->value("processed",false) || parent->at("resultVersion")!=repair.at("parentVersion")) {
-                queue.erase("repair");
-                repair=Json::object();
-                write_state_file(queue_file,queue);
-            }
-        }
+        const auto replaced=replaced_versions(rows);
         std::vector<Json> pending;
-        const auto sort_key=[](const Json& row) {
-            return std::pair(row.value("completed",std::int64_t(0)),row.at("id").get<std::string>());
-        };
         for (auto& row:rows) {
-            if (active(row) || row.contains("repairOf") || repair.value("sessionId",Json())==row.at("id") ||
-                row.value("processed",false) || row.value("resultVersion","").empty()) continue;
-            pending.push_back(std::move(row));
+            if (pending_handoff(row,replaced) && !row.value("resultVersion","").empty()) pending.push_back(std::move(row));
         }
-        const auto priority=[&](const Json& row) {
-            return std::pair(!(repair.value("parentId",Json())==row.at("id") &&
-                repair.value("parentVersion",Json())==row.at("resultVersion")),sort_key(row));
-        };
-        std::ranges::sort(pending,[&](const Json& a,const Json& b){return priority(a)<priority(b);});
+        std::ranges::sort(pending,[](const Json& a,const Json& b){return handoff_order(a)<handoff_order(b);});
         for (const auto& candidate:pending) {
             auto row=candidate;
             if (row.value("source","")=="codex") {
                 row=invoke("cluster_refresh_session",{{"sessionId",candidate.at("id")}});
                 if (row.value("stale",false) || active(row) || row.value("processed",false) ||
                     row.at("resultVersion")!=candidate.at("resultVersion")) {
-                    if (repair.value("parentId",Json())==candidate.at("id")) return {{"busy",true},{"handoffState","pending_sync"}};
                     continue;
                 }
             }
@@ -1331,14 +1325,10 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
     if (tool == "cluster_refresh_session") return refresh(data_,key);
     if (tool == "cluster_mark_receipt") {
         const ExclusiveStateLock lock(data_/L"handoff.lock");
-        const auto queue_file=data_/L"handoff.json";
-        if (fs::exists(queue_file)) {
-            const auto repair=read_json(queue_file).value("repair",Json::object());
-            require(repair.value("parentId","")!=key,"请使用当前领取凭据完成返修验收和确认");
-        }
         refresh(data_, key);
         Database db(data_, true);
         auto& row = db.state["sessions"].at(key);
+        require(!replaced_versions(db.state.at("sessions")).contains(handoff_version(row)),"请验收排队中的返修交接");
         require(!active(row) && row.at("resultVersion") == field(input,"resultVersion",100), "结果版本已变化，无法确认");
         row["read"] = true;
         row["processed"] = row.at("processed").get<bool>() || input.value("processed", false);
@@ -1424,14 +1414,14 @@ Json Cluster::tools() {
     add("cluster_start_session","在授权工作区派发会话。allowedPoolIds 为批次允许池清单，首次设置后同批次沿用。poolId 固定单池，省略时可在范围内自动换池。",
         {{"title",text},{"batch",text},{"role",text},{"workspace",text},{"task",text},{"poolId",text},{"allowedPoolIds",pool_list}},
         {"title","batch","workspace","task"});
-    add("cluster_repair_handoff","从当前领取的交接派发返修。返修结果挂在原队首，主代理验收后确认。重试同一请求时复用 requestId。",
+    add("cluster_repair_handoff","派发返修后释放原领取，返修完成后重新按时间排队。重试同一请求时复用原参数和 requestId。",
         {{"claimToken",text},{"originalVersion",text},{"requestId",text},{"candidateSha",text},{"screenshotPaths",path_list},
          {"acceptance",text},{"title",text},{"workspace",text},{"task",text},{"poolId",text},{"allowedPoolIds",pool_list}},
         {"claimToken","originalVersion","requestId","candidateSha","acceptance","title","workspace","task"});
     add("cluster_refresh_sessions","同步本地登记的最早活动会话，每次最多 20 个。",{{"limit",integer}});
     add("cluster_get_session_status","用派发返回的 id 或 dshId 查询已知会话。dshId 有歧义时用 id。stale 为 true 时返回最近一次已知状态。",
         {{"sessionId",text}},{"sessionId"});
-    add("cluster_attach_handoff_repair","把同批次内已派发的会话绑定到当前交接。绑定不会重新派发。",
+    add("cluster_attach_handoff_repair","关联同批次已有返修并释放原领取。返修结果按时间排队。",
         {{"claimToken",text},{"originalVersion",text},{"sessionId",text}},{"claimToken","originalVersion","sessionId"});
     add("cluster_cancel_session","取消已知的活动会话。",{{"sessionId",text}},{"sessionId"});
     return tools;

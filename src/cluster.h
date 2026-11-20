@@ -31,6 +31,7 @@ public:
     Json update_model_field(const std::string& id,const std::string& field,
                             const Json& expected,const Json& value) const;
     Json desktop_snapshot(DesktopMonitor* monitor=nullptr,std::stop_token stop={}) const;
+    void migrate_repair_queue() const;
     void refresh_legacy_usage(std::stop_token stop) const;
     static Json tools();
 private:

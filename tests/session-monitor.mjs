@@ -80,8 +80,8 @@ try {
         FATFISHBOX_LEGACY_STATE_DIR:'',DSH_WORKERS_STATE:join(root,'unused'),DSH_WORKERS_CONFIG:config},
         windowsHide:true,stdio:['pipe','pipe','inherit']});
     const lines = createInterface({input:child.stdout})[Symbol.asyncIterator]();
-    const snapshot = async () => {
-        child.stdin.write('\n');
+    const snapshot = async (command='') => {
+        child.stdin.write(command+'\n');
         const {value,done} = await lines.next();
         assert.equal(done,false);
         const result = JSON.parse(value);
@@ -119,17 +119,18 @@ try {
     assert.equal(recovered.liveStale,1);
     const stored=JSON.parse(await readFile(file,'utf8'));
     const link={sessionId:finished.id,resultVersion:finished.resultVersion};
-    stored.sessions.first.repairOf=link;
     stored.sessions.second.repairOf=link;
     await put(file,stored);
     const queue=join(state,'handoff.json');
     const reference={parentId:finished.id,parentVersion:finished.resultVersion};
-    await put(queue,{repair:{...reference,sessionId:'first'}});
-    const repairing=await snapshot();
-    assert.equal(repairing.pending[0].handoffState,'repairing');
-    assert.equal(repairing.pending.some(row=>row.id==='second'),false);
-    await put(queue,{repair:{...reference,sessionId:'second'}});
-    assert.equal((await snapshot()).pending[0].handoffState,'awaiting_acceptance');
+    await put(queue,{repair:{...reference,sessionId:'second'},claim:{...link,claimToken:'old-claim',expiresAt:Date.now()+60000}});
+    const migrated=await snapshot('migrate');
+    assert.equal(migrated.pending[0].id,'second');
+    assert.deepEqual(migrated.pending[0].repairOf,link);
+    assert.equal(migrated.pending.some(row=>row.id===finished.id),false);
+    const inbox=JSON.parse(await readFile(queue,'utf8'));
+    assert.equal(inbox.claim,undefined);
+    assert.equal(inbox.repair,undefined);
     child.stdin.end();
     assert.equal((await once(child,'exit'))[0],0);
 } finally {
