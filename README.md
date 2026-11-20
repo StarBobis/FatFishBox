@@ -35,7 +35,7 @@ Agent 通过 `cluster_start_session` 向授权工作区派发会话，通过 `cl
 
 用 `cluster_repair_handoff` 从当前队首派发返修。返修结果挂在原交接下，主代理验收后确认原交接。结构化 `delivery` 包含子会话自报的提交、工作树状态、测试退出码和证据路径。完整操作示例见 `fatfish://workflow`。
 
-可以用 `cluster_get_session_status({sessionId})` 查询已知会话，`stale: true` 表示只能返回最近已知状态。同批次已有返修时，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 将它绑定给当前交接，再用原领取凭据验收确认。
+可以用 `cluster_get_session_status({sessionId})` 查询已知会话，传入派发返回的 `id` 或 `dshId`。返回的 `sessionId` 是 FatFishBox 登记 ID。若 `dshId` 对应多条记录，请使用 `id`。同批次已有返修时，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 将它绑定给当前交接，再用原领取凭据验收确认。
 
 ## 构建与验证
 

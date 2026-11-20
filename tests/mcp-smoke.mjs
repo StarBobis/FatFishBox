@@ -148,6 +148,10 @@ try {
     const args = {title:'Smoke dispatch',batch:'smoke',role:'developer',task:'Return one report',workspace:a};
     const session = await one.tool('cluster_start_session',args);
     assert.equal(session.status,'queued');
+    const byDshId=await one.tool('cluster_get_session_status',{sessionId:session.dshId});
+    assert.equal(byDshId.sessionId,session.id);
+    assert.equal(byDshId.status,'running');
+    assert.deepEqual(await one.tool('cluster_get_session_status',{sessionId:session.id}),byDshId);
     assert.equal(selected.reasoningEffort,'high');
     assert.equal(session.owner,undefined);
     const unavailable=await two.tool('cluster_start_session',{...args,workspace:b,poolId:pool.id},true);
@@ -177,6 +181,7 @@ try {
     const oldest=first.busy?second:first;
     assert.equal((first.busy?first:second).busy,true);
     assert.equal(oldest.session.id,'codex:old-session');
+    assert.equal((await two.tool('cluster_get_session_status',{sessionId:old.sessionId})).sessionId,oldest.session.id);
     assert.equal(oldest.result[0].text,'原插件证据');
     assert.equal((await one.tool('cluster_overview')).unprocessed,2);
     assert.equal((await two.tool('cluster_next_handoff',{claimToken:oldest.claimToken})).claimToken,oldest.claimToken);
@@ -315,7 +320,11 @@ try {
     assert.equal(attachedRepair.replayed,false);
     assert.equal((await repair.tool('cluster_attach_handoff_repair',attach)).replayed,true);
     assert.equal(prompts,previousPromptCount,'binding must not dispatch another prompt');
-    await repair.tool('cluster_get_session_status',{sessionId:'unknown'},true);
+    for (const [sessionId,expected] of [['unknown',/找不到该会话/],[existing.dshId,/多条登记.*FatFishBox id/],[42,/请提供 sessionId/]]) {
+        const refused=await repair.rpc('tools/call',{name:'cluster_get_session_status',arguments:{sessionId}});
+        assert.equal(refused.isError,true);
+        assert.match(refused.content[0].text,expected);
+    }
     for (const [status,flags] of [
         ['queued',{cursor:1,queue:[{}]}],['running',{cursor:2,running:true}],['waiting_input',{cursor:3,pendingInput:[{}]}],
         ['succeeded',{cursor:7}],

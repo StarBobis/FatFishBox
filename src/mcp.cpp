@@ -23,7 +23,7 @@ constexpr auto workflow=R"workflow(# 肥鱼重工 · 主代理工作流
 
 4. 主代理调用 `cluster_next_handoff({})` 领队首，保存 `claimToken` 和 `session.resultVersion`。核对 `delivery` 中自报的提交、工作树、测试和证据。主代理在候选上跑累计构建和回归，亲自打开实窗检查布局、交互以及截图覆盖不到的行为。
 5. 发现问题时，从已核对的候选 SHA 建返修工作树，例如 `git worktree add -b codex/mask-b15-repair C:/Dev/worktrees/mask-b15-repair <候选 SHA>`。调用 `cluster_repair_handoff`，传入 `claimToken`、原 `session.resultVersion` 作为 `originalVersion`、稳定的 `requestId`、`candidateSha`、`screenshotPaths`、`acceptance`、`title`、返修 `workspace` 和 `task`。例如验收条件可以写「在目标缩放下打开实窗，标题与按钮仍可读，累计构建和蒙版回归通过」。网络重试时沿用同一 `requestId`。
-6. 同批次已有返修时，调用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 绑定已派发会话。使用 `cluster_get_session_status({sessionId})` 看队列状态或是否需要输入。若 `stale` 为 true，稍后重查。
+6. 同批次已有返修时，调用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 绑定已派发会话。使用 `cluster_get_session_status({sessionId})` 看队列状态或是否需要输入，查询时可填派发返回的 `id` 或 `dshId`。若 `stale` 为 true，稍后重查。
 7. 用 `cluster_next_handoff({claimToken})` 重读队首。返修结束后，从 `repair.delivery` 获取候选并重新做累计验证和实窗验收。确认实际处置后提交 `cluster_next_handoff({claimToken,outcome:"已核对返修提交、完成累计构建和实窗验收，已合入。"})`。工具确认当前交接并返回下一条。已领取凭据过期时，用空参数重新领取原队首。
 )workflow";
 

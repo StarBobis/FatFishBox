@@ -938,7 +938,35 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         return session_overview(settings,sessions,legacy,data_);
     }
     if (tool=="cluster_get_session_status") {
-        const auto key=field(input,"sessionId",100);
+        const auto supplied=input.find("sessionId");
+        require(supplied!=input.end() && supplied->is_string(),"请提供 sessionId，可以填写派发结果中的 id 或 dshId");
+        const auto& requested=supplied->get_ref<const std::string&>();
+        require(!requested.empty() && requested.size()<=256 && requested.find('\0')==std::string::npos,
+            "sessionId 无效，请填写派发结果中的 id 或 dshId");
+        std::string key;
+        Json settings;
+        std::vector<std::string> matches;
+        {
+            Database db(data_,false);
+            const auto& rows=db.state.at("sessions");
+            if (rows.contains(requested)) key=requested;
+            else {
+                settings=db.state.at("settings");
+                for (const auto& [id,row]:rows.items())
+                    if (row.value("dshId","")==requested) matches.push_back(id);
+            }
+        }
+        if (key.empty()) {
+            const auto legacy=read_legacy_sessions(settings);
+            if (legacy.rows.contains(requested)) key=requested;
+            else {
+                for (const auto& [id,row]:legacy.rows.items())
+                    if (row.value("dshId","")==requested) matches.push_back(id);
+                require(!matches.empty(),"找不到该会话，请检查派发结果中的 id 或 dshId");
+                require(matches.size()==1,"同一个 dshId 对应多条登记，请使用派发结果中的 FatFishBox id 查询");
+                key=matches.front();
+            }
+        }
         auto row=invoke("cluster_get_session",{{"sessionId",key}});
         bool stale=false;
         try {
@@ -1291,7 +1319,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         }
         return {{"sessions",sessions},{"errors",errors},{"total",candidates.size()}};
     }
-    const auto key = field(input,"sessionId",100);
+    const auto key = field(input,"sessionId",256);
     if (key.starts_with("codex:")) {
         const auto settings=invoke("cluster_get_settings");
         if (tool == "cluster_read_result") return legacy_result(settings,key);
@@ -1401,7 +1429,7 @@ Json Cluster::tools() {
          {"acceptance",text},{"title",text},{"workspace",text},{"task",text},{"poolId",text},{"allowedPoolIds",pool_list}},
         {"claimToken","originalVersion","requestId","candidateSha","acceptance","title","workspace","task"});
     add("cluster_refresh_sessions","同步本地登记的最早活动会话，每次最多 20 个。",{{"limit",integer}});
-    add("cluster_get_session_status","按已知会话 ID 同步并读取状态。stale 为 true 时返回的是最近一次已知状态。",
+    add("cluster_get_session_status","用派发返回的 id 或 dshId 查询已知会话。dshId 有歧义时用 id。stale 为 true 时返回最近一次已知状态。",
         {{"sessionId",text}},{"sessionId"});
     add("cluster_attach_handoff_repair","把同批次内已派发的会话绑定到当前交接。绑定不会重新派发。",
         {{"claimToken",text},{"originalVersion",text},{"sessionId",text}},{"claimToken","originalVersion","sessionId"});

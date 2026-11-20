@@ -13,4 +13,4 @@ description: 通过肥鱼重工管理 DeepSeek Harness 的账号、模型池、�
 
 同一批次首次派发可传入 `allowedPoolIds` 限定自动换池范围。从队首返修用 `cluster_repair_handoff`，完成后仍用原交接凭据验收。读取 `fatfish://workflow` 查看隔离工作树、结构化交付、返修和主代理实窗验收的完整示例。
 
-用 `cluster_get_session_status({sessionId})` 查询已知会话。若同批次已有返修，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 绑定已有会话。
+用 `cluster_get_session_status({sessionId})` 查询已知会话，可传派发返回的 `id` 或 `dshId`。若同批次已有返修，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 绑定已有会话。
