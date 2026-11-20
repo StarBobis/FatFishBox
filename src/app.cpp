@@ -36,6 +36,8 @@ using fatfish::Json;
 using fatfish::narrow;
 using fatfish::widen;
 constexpr UINT finished = WM_APP + 1;
+constexpr UINT usage_finished = WM_APP + 2;
+constexpr UINT_PTR usage_timer = 1;
 constexpr int minimum_width=740, minimum_height=520;
 constexpr float row_height=34;
 enum class List { running, pending, pools };
@@ -130,7 +132,11 @@ std::wstring compact_tokens(double value) {
 class App {
 public:
     HWND window{};
-    ~App() { if (worker_.joinable()) worker_.join(); }
+    ~App() {
+        usage_worker_.request_stop();
+        if (usage_worker_.joinable()) usage_worker_.join();
+        if (worker_.joinable()) worker_.join();
+    }
     void init() {
         model_.theme = Theme::dark;
         model_.theme_resources = desktop_theme();
@@ -140,7 +146,9 @@ public:
         try { http_=std::make_unique<fatfish::McpHttpServer>(cluster_); }
         catch (const std::exception& error) { http_error_=widen(error.what()); }
         redraw();
+        sync_usage();
         reload();
+        SetTimer(window,usage_timer,60000,nullptr);
     }
     void size(int width, int height) {
         if (!width || !height) return;
@@ -385,6 +393,23 @@ public:
         }
         redraw();
     }
+    void sync_usage() {
+        if (usage_busy_) return;
+        if (usage_worker_.joinable()) usage_worker_.join();
+        usage_busy_=true;
+        usage_worker_=std::jthread([this](std::stop_token stop) {
+            try { cluster_.refresh_legacy_usage(stop); }
+            catch (const std::exception&) {}
+            if (!stop.stop_requested()) PostMessageW(window,usage_finished,0,0);
+        });
+    }
+    void receive_usage() {
+        if (usage_worker_.joinable()) usage_worker_.join();
+        usage_busy_=false;
+        try { overview_["usage"]=cluster_.invoke("cluster_overview").at("usage"); }
+        catch (const std::exception&) {}
+        if (page_=="sessions" && GetCapture()!=window) redraw();
+    }
 private:
     Cluster cluster_;
     std::unique_ptr<fatfish::McpHttpServer> http_;
@@ -400,6 +425,8 @@ private:
     std::vector<std::pair<bool,Json>> pools_;
     std::vector<Json> visible_sessions_;
     std::jthread worker_;
+    std::jthread usage_worker_;
+    bool usage_busy_=false;
     std::optional<Json> result_;
     std::function<void(Json)> callback_;
     std::wstring notice_, error_, output_;
@@ -689,10 +716,13 @@ private:
         const auto output=total.value("outputTokens",0.0), write=total.value("cacheWriteTokens",0.0);
         const auto billed=input+read+write;
         const auto hourly=usage.value("hourlyTokens",Json(nullptr));
+        const auto amount=[&](double tokens) {
+            return usage.value("sampled",0)>0 || !usage.value("missing",0)?compact_tokens(tokens):std::wstring(L"—");
+        };
         const std::array<std::pair<const wchar_t*,std::wstring>,5> values{{
             {L"今日平均每小时",hourly.is_number()?compact_tokens(hourly.get<double>())+L" Token/h":L"—"},
-            {L"未缓存输入",compact_tokens(input)},{L"输出",compact_tokens(output)},
-            {L"缓存读取",compact_tokens(read)},{L"缓存命中",billed>0?fixed3(read*100/billed)+L"%":L"—"}
+            {L"未缓存输入",amount(input)},{L"输出",amount(output)},
+            {L"缓存读取",amount(read)},{L"缓存命中",billed>0?fixed3(read*100/billed)+L"%":L"—"}
         }};
         panel("usage",{x,64,right,127});
         const float usable=right-x-32, first=usable*.29f, cell=(usable-first)/4;
@@ -713,7 +743,10 @@ private:
             auto summary=overview_.value("codexSources",0)>0?
                 L"Codex 登记快照 · "+std::to_wstring(overview_.value("codexSessions",0))+L" 个会话":L"";
             if (overview_.value("unreadableCodexSources",0)>0) summary+=summary.empty()?L"部分 Codex 登记不可读":L"  ·  部分登记不可读";
-            if (usage.value("missing",0)>0) summary+=summary.empty()?L"Token 统计不完整":L"  ·  Token 统计不完整";
+            if (usage.value("missing",0)>0) {
+                if (!summary.empty()) summary+=L"  ·  ";
+                summary+=usage_busy_?L"正在同步 Token 用量":std::to_wstring(usage.value("missing",0))+L" 个会话用量未同步";
+            }
             label(std::move(summary),x,h-24,right-x,12,"root",ColorToken::text_secondary);
         }
     }
@@ -951,6 +984,7 @@ private:
                 nav("edit");return;
             }
             if (name=="sync") {
+                sync_usage();
                 call("cluster_refresh_sessions",Json::object(),[this](Json value) {
                     local_snapshot();
                     notice_=L"已读取 Codex 登记并同步 "+std::to_wstring(value.at("sessions").size())+L" 个本地会话";
@@ -1084,6 +1118,8 @@ LRESULT CALLBACK dispatch_window(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSKEYDOWN: if ((wp==VK_UP || wp==VK_DOWN) && app->key(wp)) return 0;break;
     case WM_CHAR: app->type(static_cast<wchar_t>(wp));return 0;
     case finished: app->receive();return 0;
+    case usage_finished: app->receive_usage();return 0;
+    case WM_TIMER: if (wp==usage_timer) { app->sync_usage();return 0; } break;
     case WM_DESTROY: PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);

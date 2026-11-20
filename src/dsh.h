@@ -14,13 +14,15 @@ DshConnection discover(const Json& settings, const Json& input);
 
 class Dsh {
 public:
-    explicit Dsh(const fs::path& auth);
+    explicit Dsh(const fs::path& auth, int timeout_ms=15000);
     Json request(std::string_view method, const Json& args = nullptr) const;
     Json call(std::string_view method, const Json& args) const;
     const std::string& owner() const { return owner_; }
+    const std::string& origin() const { return origin_utf8_; }
 private:
     std::wstring host_, origin_, cookie_;
-    std::string owner_;
+    std::string owner_, origin_utf8_;
+    int timeout_ms_;
     unsigned short port_{};
     bool https_{};
 };

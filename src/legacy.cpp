@@ -137,10 +137,17 @@ Json projection(const Entry& entry) {
 }
 }
 
-LegacySessions read_legacy_sessions(const Json& settings) {
+LegacySessions read_legacy_sessions(const Json& settings,bool include_usage_candidates) {
     LegacySessions result;
     for (const auto& [key,entry] : load(settings,result.sources,result.unreadable)) {
         result.rows[key] = projection(entry);
+        if (!include_usage_candidates) continue;
+        const auto& row=entry.record;
+        const auto history=row.find("history");
+        const auto& first=history!=row.end() && history->is_array() && !history->empty() &&
+            history->front().is_object()?history->front():row;
+        result.usage_candidates[key]={{"origin",text(row,"serviceOrigin")},{"dshId",text(row,"sessionId")},
+            {"first",milliseconds(first,"submittedAt")}};
     }
     return result;
 }

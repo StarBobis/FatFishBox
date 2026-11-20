@@ -6,6 +6,7 @@
 #include <objbase.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -312,20 +313,42 @@ std::uint64_t day_usage(const Dsh& dsh, const Json& row, std::int64_t cursor, st
     }
     throw std::runtime_error("今日历史用量超过扫描范围");
 }
-Json telemetry_overview(const Json& sessions) {
+Json legacy_usage_cache(const fs::path& data) {
+    try {
+        auto cache=read_json(data/L"legacy-usage.json",8*1024*1024);
+        if (cache.is_object()) return cache;
+    } catch (const std::exception&) {}
+    return Json::object();
+}
+Json telemetry_overview(const Json& sessions,const Json& legacy_cache) {
     const auto today=midnight();
     std::uint64_t total=0;
-    int missing=0;
+    int missing=0,sampled=0,today_sampled=0;
     Json usage=Json::object();
     for (auto name:usage_keys) usage[name]=std::uint64_t(0);
     for (const auto& row:sessions) {
-        auto tokens=row.value("usage",Json::object());
+        const Json* sample=&row;
+        if (row.value("readOnly",false)) {
+            const auto found=legacy_cache.find(row.at("id").get<std::string>());
+            if (found==legacy_cache.end()) {++missing;continue;}
+            sample=&*found;
+            if (sample->value("stale",false) || sample->value("updated",std::int64_t(0))!=row.at("updated") ||
+                (active(row) && now()-sample->value("observed",std::int64_t(0))>120000)) ++missing;
+            else if (sample->value("tokenDay",std::int64_t(0))!=today) ++missing;
+        } else if (row.contains("startCursor") && (!row.contains("usage") ||
+            ((active(row) || row.value("completed",std::int64_t(0))>=today) &&
+             row.value("tokenDay",std::int64_t(0))!=today))) ++missing;
+        const auto tokens=sample->value("usage",Json::object());
+        if (!tokens.empty()) ++sampled;
         for (auto name:usage_keys) usage[name]=usage.at(name).get<std::uint64_t>()+tokens.value(name,std::uint64_t(0));
-        if (row.value("tokenDay",std::int64_t(0))==today && row.contains("todayTokens")) total+=row.at("todayTokens").get<std::uint64_t>();
-        else if (row.contains("startCursor") && (active(row) || row.value("completed",std::int64_t(0))>=today)) ++missing;
+        if (sample->value("tokenDay",std::int64_t(0))==today && sample->contains("todayTokens")) {
+            total+=sample->at("todayTokens").get<std::uint64_t>();
+            ++today_sampled;
+        }
     }
     const auto hours=double(now()-today)/3600000.0;
-    return {{"total",usage},{"todayTokens",total},{"hourlyTokens",hours>0?Json(double(total)/hours):Json(nullptr)},{"missing",missing}};
+    return {{"total",usage},{"todayTokens",total},{"hourlyTokens",hours>0 && (today_sampled || !missing)?
+        Json(double(total)/hours):Json(nullptr)},{"missing",missing},{"sampled",sampled}};
 }
 Json refresh(const fs::path& data, const std::string& key) {
     Json settings, prior;
@@ -407,7 +430,7 @@ Cluster::Cluster(fs::path data) : data_(std::move(data)) {
 }
 
 namespace {
-Json session_overview(const Json& settings,const Json& sessions,const LegacySessions& legacy) {
+Json session_overview(const Json& settings,const Json& sessions,const LegacySessions& legacy,const fs::path& data) {
     int running=0, pending=0;
     for (const auto& row:sessions) {
         if (active(row)) ++running;
@@ -416,7 +439,7 @@ Json session_overview(const Json& settings,const Json& sessions,const LegacySess
     return {{"active",running},{"unprocessed",pending},{"accounts",settings.at("accounts").size()},
         {"models",settings.at("pools").size()},{"connected",!settings.at("authPath").get<std::string>().empty()},
         {"codexSessions",legacy.rows.size()},{"codexSources",legacy.sources},{"unreadableCodexSources",legacy.unreadable},
-        {"usage",telemetry_overview(sessions)}};
+        {"usage",telemetry_overview(sessions,legacy_usage_cache(data))}};
 }
 }
 
@@ -436,8 +459,91 @@ Json Cluster::desktop_snapshot() const {
     };
     std::sort(running.begin(),running.end(),[&](const Json& a,const Json& b) {return order(a,"updated")>order(b,"updated");});
     std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return order(a,"completed")<order(b,"completed");});
-    return {{"overview",session_overview(settings,sessions,legacy)},{"settings",settings},
+    return {{"overview",session_overview(settings,sessions,legacy,data_)},{"settings",settings},
         {"running",std::move(running)},{"pending",std::move(pending)}};
+}
+
+void Cluster::refresh_legacy_usage(std::stop_token stop) const {
+    const auto settings=invoke("cluster_get_settings");
+    const auto legacy=read_legacy_sessions(settings,true);
+    if (legacy.rows.empty()) return;
+    const auto connection=discover(settings,Json::object());
+    if (connection.auth.empty()) return;
+    const Dsh dsh(connection.auth,2500);
+    const auto day=midnight(), observed=now();
+    const auto cache=legacy_usage_cache(data_);
+    struct Job {
+        std::string id;
+        const Json* row;
+        const Json* candidate;
+        Json sample;
+    };
+    std::vector<Job> jobs;
+    for (const auto& [id,row]:legacy.rows.items()) {
+        const auto& candidate=legacy.usage_candidates.at(id);
+        if (candidate.at("origin")!=dsh.origin()) continue;
+        const auto old=cache.find(id);
+        if (old!=cache.end() && !active(row) && !old->value("stale",false) &&
+            old->value("observed",std::int64_t(0))>=observed-5*60*1000 &&
+            old->value("updated",std::int64_t(0))==row.at("updated") &&
+            old->value("tokenDay",std::int64_t(0))==day) continue;
+        jobs.push_back({id,&row,&candidate,old==cache.end()?Json::object():*old});
+    }
+    std::sort(jobs.begin(),jobs.end(),[](const Job& a,const Job& b){return a.row->at("updated")>b.row->at("updated");});
+    std::atomic_size_t next{};
+    std::vector<std::jthread> fetchers;
+    for (std::size_t i=0;i<std::min<std::size_t>(6,jobs.size());++i) {
+        fetchers.emplace_back([&] {
+            while (!stop.stop_requested()) {
+                const auto index=next.fetch_add(1);
+                if (index>=jobs.size()) return;
+                auto& job=jobs[index];
+                const auto& row=*job.row;
+                const auto& candidate=*job.candidate;
+                try {
+                    const auto projections=dsh.request("session/projections",{{"sessionId",candidate.at("dshId")}});
+                    const auto& usage=projections.at("/values/tokenUsage"_json_pointer);
+                    Json totals=Json::object();
+                    std::uint64_t session_tokens=0;
+                    for (auto key:usage_keys) {
+                        const auto& count=usage.at(key);
+                        require(count.is_number_unsigned(),"DSH 用量格式无效");
+                        totals[key]=count;
+                        session_tokens+=count.get<std::uint64_t>();
+                    }
+                    job.sample["usage"]=std::move(totals);
+                    job.sample["observed"]=observed;
+                    job.sample["updated"]=row.at("updated");
+                    std::uint64_t today_tokens=0;
+                    if (candidate.value("first",std::int64_t(0))>=day) today_tokens=session_tokens;
+                    else {
+                        // The live cursor covers turns that resumed after a registry snapshot.
+                        const auto state=dsh.request("session/state",{{"sessionId",candidate.at("dshId")}});
+                        const auto cursor=state.at("cursor").get<std::int64_t>();
+                        if (cursor>=0) today_tokens=day_usage(dsh,row,cursor,day);
+                    }
+                    job.sample["tokenDay"]=day;
+                    job.sample["todayTokens"]=today_tokens;
+                    job.sample["stale"]=false;
+                } catch (const std::exception&) {
+                    job.sample["stale"]=true;
+                }
+            }
+        });
+    }
+    for (auto& thread:fetchers) thread.join();
+    if (stop.stop_requested() || jobs.empty()) return;
+    const ExclusiveStateLock lock(data_/L"legacy-usage.lock");
+    auto updated=legacy_usage_cache(data_);
+    for (auto& job:jobs) {
+        if (updated.contains(job.id) && updated.at(job.id).value("observed",std::int64_t(0))>observed) continue;
+        updated[job.id]=std::move(job.sample);
+    }
+    for (auto it=updated.begin();it!=updated.end();) {
+        if (!legacy.rows.contains(it.key())) it=updated.erase(it);
+        else ++it;
+    }
+    write_state_file(data_/L"legacy-usage.json",updated);
 }
 
 Json Cluster::invoke(std::string_view tool, const Json& input) const {
@@ -449,7 +555,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         auto sessions = db.state.at("sessions");
         const auto legacy = read_legacy_sessions(settings);
         sessions.update(legacy.rows);
-        return session_overview(settings,sessions,legacy);
+        return session_overview(settings,sessions,legacy,data_);
     }
     if (tool == "cluster_next_handoff") {
         require(std::ranges::all_of(input.items(),[](const auto& entry) {

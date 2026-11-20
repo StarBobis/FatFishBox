@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <nlohmann/json.hpp>
 
 namespace fatfish {
@@ -21,6 +22,7 @@ public:
     explicit Cluster(fs::path data = {});
     Json invoke(std::string_view tool, const Json& input = Json::object()) const;
     Json desktop_snapshot() const;
+    void refresh_legacy_usage(std::stop_token stop) const;
     const fs::path& data_directory() const { return data_; }
     static Json tools();
 private:

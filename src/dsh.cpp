@@ -56,7 +56,7 @@ DshConnection discover(const Json& settings, const Json& input) {
     return result;
 }
 
-Dsh::Dsh(const fs::path& auth_path) {
+Dsh::Dsh(const fs::path& auth_path,int timeout_ms):timeout_ms_(timeout_ms) {
     const auto auth = read_json(auth_path);
     const auto address = widen(auth.at("origin").get<std::string>());
     URL_COMPONENTS url{};
@@ -77,7 +77,8 @@ Dsh::Dsh(const fs::path& auth_path) {
     cookie_ = widen(auth.at("cookie").get<std::string>());
     if (cookie_.empty() || cookie_.find_first_of(L"\r\n") != std::wstring::npos || cookie_.find(L'\0') != std::wstring::npos)
         throw std::runtime_error("DSH 授权文件缺少有效的连接凭据");
-    owner_ = narrow(origin_) + "#" + auth.value("connectionId", "");
+    origin_utf8_=narrow(origin_);
+    owner_ = origin_utf8_ + "#" + auth.value("connectionId", "");
 }
 
 Json Dsh::request(std::string_view method, const Json& request) const {
@@ -86,7 +87,8 @@ Json Dsh::request(std::string_view method, const Json& request) const {
 
 Json Dsh::call(std::string_view method, const Json& args) const {
     Internet session(WinHttpOpen(L"FatFishBox/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0));
-    verify(WinHttpSetTimeouts(session.handle, 4000, 4000, 15000, 15000), "无法设置 DSH 超时");
+    const auto connect_timeout=std::min(4000,timeout_ms_);
+    verify(WinHttpSetTimeouts(session.handle,connect_timeout,connect_timeout,timeout_ms_,timeout_ms_), "无法设置 DSH 超时");
     Internet connection(WinHttpConnect(session.handle, host_.c_str(), port_, 0));
     const std::wstring path = L"/api/" + widen(method);
     Internet request(WinHttpOpenRequest(connection.handle, L"POST", path.c_str(), nullptr,
