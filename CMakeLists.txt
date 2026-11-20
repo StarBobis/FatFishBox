@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.26)
+project(FatFishBox VERSION 0.1.0 LANGUAGES CXX RC)
+
+set(NATIVE_WIN_UI_SOURCE "C:/Dev/NativeWinUI" CACHE PATH "NativeWinUI source checkout")
+include(CTest)
+include(FetchContent)
+FetchContent_Declare(nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+    URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
+function(fatfish_target target)
+    target_compile_features(${target} PUBLIC cxx_std_20)
+    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+    target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHsc)
+endfunction()
+
+add_library(fatfish_core STATIC src/cluster.cpp src/dsh.cpp src/legacy.cpp)
+fatfish_target(fatfish_core)
+target_include_directories(fatfish_core PUBLIC src)
+target_link_libraries(fatfish_core PUBLIC nlohmann_json::nlohmann_json PRIVATE winhttp ole32)
+
+if(NOT EXISTS "${NATIVE_WIN_UI_SOURCE}/ui/cmake/NativeTargets.cmake")
+    message(FATAL_ERROR "Set NATIVE_WIN_UI_SOURCE to the NativeWinUI source directory")
+endif()
+include("${NATIVE_WIN_UI_SOURCE}/ui/cmake/NativeTargets.cmake")
+block()
+    set(BUILD_TESTING OFF)
+    set(NATIVE_UI_BUILD_GALLERY OFF)
+    add_subdirectory("${NATIVE_WIN_UI_SOURCE}/ui" native_ui EXCLUDE_FROM_ALL)
+endblock()
+add_executable(FatFishBox WIN32 src/app.cpp src/app.rc src/mcp.cpp)
+fatfish_target(FatFishBox)
+target_link_options(FatFishBox PRIVATE /MANIFEST:NO)
+target_link_libraries(FatFishBox PRIVATE fatfish_core NativeUI::UI user32 ole32 shell32)
+install(TARGETS FatFishBox RUNTIME DESTINATION .)
+install(FILES README.md DESTINATION .)
+install(DIRECTORY skills DESTINATION .)
