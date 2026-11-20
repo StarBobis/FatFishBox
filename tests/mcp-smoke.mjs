@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -12,6 +13,7 @@ let running = false;
 let selected;
 let prompts = 0;
 let terminal = false;
+let offerMax = true;
 const server = createServer(async (req,res) => {
     let raw = '';
     for await (const buffer of req) raw += buffer;
@@ -28,7 +30,7 @@ const server = createServer(async (req,res) => {
     case 'session/modelCatalog':
         value = {groups:[
             {id:'account-a', name:'Account A', models:[
-                {id:'fast',name:'Fast',reasoning:{defaultEffort:'high',efforts:[{id:'high'},{id:'max'}]}},
+                {id:'fast',name:'Fast',reasoning:{defaultEffort:'high',efforts:[{id:'high'},...(offerMax?[{id:'max'}]:[])]}},
                 {id:'light',name:'Light'},
             ]},
             {id:'account-b', name:'Account B', models:[{id:'fast',name:'Fast'}]},
@@ -79,6 +81,11 @@ async function connect(directory) {
     child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
     return {
         rpc,
+        async close() {
+            const exited=once(child,'exit');
+            child.stdin.end();
+            await exited;
+        },
         async tool(name,arguments_={},shouldFail=false) {
             const response = await rpc('tools/call',{name,arguments:arguments_});
             assert.equal(response.isError===true,shouldFail,JSON.stringify(response.content));
@@ -92,7 +99,7 @@ try {
     const two = await connect(root);
     const inventory = (await one.rpc('tools/list')).tools;
     assert(inventory.some(tool => tool.name==='cluster_refresh_sessions'));
-    assert(!inventory.some(tool => ['cluster_list_sessions','cluster_get_session','cluster_read_result','cluster_mark_receipt'].includes(tool.name)));
+    assert(!inventory.some(tool => ['cluster_list_sessions','cluster_get_session','cluster_read_result','cluster_mark_receipt','cluster_update_account'].includes(tool.name)));
     const presets=await one.tool('cluster_get_presets',{authPath:auth,configPath:''});
     assert.deepEqual(presets.permissions,[{id:'prompt-on-risk',label:'Prompt on risk'}]);
     assert.deepEqual(presets.agents,[{id:'ptc',label:'PTC'}]);
@@ -101,11 +108,20 @@ try {
     assert.equal(initial.models,3);
     let settings = await two.tool('cluster_configure',{revision:initial.settings.revision,permission:'prompt-on-risk'});
     await one.tool('cluster_configure',{revision:initial.settings.revision,preset:'ptc'},true);
-    settings = await two.tool('cluster_update_account',{revision:settings.revision,id:'account-a',concurrency:2});
     const pool = Object.values(settings.pools).find(row => row.provider==='account-a' && row.model==='fast');
-    settings = await two.tool('cluster_update_pool',{revision:settings.revision,id:pool.id,enabled:true,concurrency:1});
+    await two.tool('cluster_update_pool',{revision:settings.revision,id:pool.id,concurrency:2},true);
+    const editor=await connect(root);
+    settings = await editor.tool('cluster_update_pool',{revision:settings.revision,id:pool.id,enabled:true,concurrency:1,effort:'max'});
+    await editor.close();
+    const reopened=await connect(root);
+    assert.deepEqual((await reopened.tool('cluster_get_settings')).pools[pool.id],settings.pools[pool.id]);
+    await reopened.close();
+    offerMax=false;
     const replay = await one.tool('cluster_import_models',{authPath:auth,configPath:''});
     assert.equal(replay.settings.pools[pool.id].enabled,true);
+    assert.equal(replay.settings.pools[pool.id].concurrency,1);
+    assert.equal(replay.settings.pools[pool.id].effort,'max');
+    assert.deepEqual(replay.settings.pools[pool.id].efforts,['high']);
     const args = {title:'Smoke dispatch',batch:'smoke',role:'developer',task:'Return one report',workspace:a};
     const session = await one.tool('cluster_start_session',args);
     assert.equal(session.status,'queued');
@@ -170,8 +186,6 @@ try {
     const balanced=await connect(join(root,'balanced'));
     const balancedImport=await balanced.tool('cluster_import_models',{authPath:auth,configPath:''});
     let balancedSettings=await balanced.tool('cluster_configure',{revision:balancedImport.settings.revision,permission:'prompt-on-risk'});
-    for (const id of ['account-a','account-b'])
-        balancedSettings=await balanced.tool('cluster_update_account',{revision:balancedSettings.revision,id,concurrency:4});
     let firstPool;
     for (const row of Object.values(balancedSettings.pools)) {
         if (row.provider==='account-a' && row.model==='fast') firstPool=row.id;

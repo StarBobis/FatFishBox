@@ -84,7 +84,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"resourceTemplates",Json::array()}};
         } else if (method=="resources/read" && params.value("uri","")=="fatfish://workflow") {
             value={{"contents",Json::array({{{"uri","fatfish://workflow"},{"mimeType","text/markdown"},
-                {"text","# 肥鱼重工\n读取状态后按账号和模型池并发派发。结果按版本读取和确认。项目验收由主会话负责。"}}})}};
+                {"text","# 肥鱼重工\n自动派发按账号负载均衡，遵守模型并发上限。结果按版本读取和确认。项目验收由主会话负责。"}}})}};
         } else if (method=="tools/call") {
             try {
                 const auto tool=params.at("name").get<std::string>();

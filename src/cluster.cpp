@@ -82,7 +82,11 @@ public:
                 : Json{{"settings",settings_template()},{"sessions",Json::object()}};
             auto& settings=state.at("settings");
             settings.erase("balance");
-            for (auto& row:settings.at("accounts")) row.erase("roles");
+            for (auto& row:settings.at("accounts")) {
+                row.erase("roles");
+                row.erase("enabled");
+                row.erase("concurrency");
+            }
             for (auto& row:settings.at("pools")) {
                 row.erase("roles");
                 row.erase("priority");
@@ -143,14 +147,21 @@ void validate_configuration(const Json& settings) {
         const auto cap = row.at("concurrency").get<int>();
         require(cap >= 1 && cap <= 1000, "总并发必须在 1 至 1000 之间");
     };
-    for (const auto& account : settings.at("accounts")) limits(account);
     for (const auto& pool : settings.at("pools")) {
         limits(pool);
         require(settings.at("accounts").contains(pool.at("provider").get<std::string>()), "模型池的账号无效");
-        const auto effort = pool.at("effort").get<std::string>();
-        const auto& efforts = pool.at("efforts");
-        require(effort.empty() || std::find(efforts.begin(), efforts.end(), effort) != efforts.end(), "DSH 不提供该思考强度");
+        require(pool.at("effort").is_string(), "思考强度必须为字符串");
     }
+}
+void set_model_field(Json& pool,const std::string& field,const Json& value) {
+    require(field=="enabled" || field=="concurrency" || field=="effort","未知模型设置");
+    if (field!="enabled") require(pool.at("enabled").get<bool>(),"请先启用模型");
+    if (field=="effort") {
+        const auto effort=value.get<std::string>();
+        const auto& efforts=pool.at("efforts");
+        require(effort.empty() || std::find(efforts.begin(),efforts.end(),effort)!=efforts.end(),"DSH 不提供该思考强度");
+    }
+    pool[field]=value;
 }
 Json public_row(Json row) {
     row.erase("owner");
@@ -162,8 +173,6 @@ std::string choose_pool(const Json& settings, const Json& sessions,const std::st
     for (const auto& [key, pool] : settings.at("pools").items()) {
         if (!pool.at("enabled").get<bool>() || (!pinned.empty() && key != pinned)) continue;
         const auto provider = pool.at("provider").get<std::string>();
-        const auto& account = settings.at("accounts").at(provider);
-        if (!account.at("enabled").get<bool>()) continue;
         int account_count=0,pool_count=0;
         for (const auto& row : sessions) {
             if (!active(row)) continue;
@@ -173,8 +182,7 @@ std::string choose_pool(const Json& settings, const Json& sessions,const std::st
             if (row.value("poolId","")==key || legacy_model) ++pool_count;
         }
         const auto cap = pool.at("concurrency").get<int>();
-        const auto account_cap = account.at("concurrency").get<int>();
-        if (account_count>=account_cap || pool_count>=cap) continue;
+        if (pool_count>=cap) continue;
         const auto load = 100000 * pool_count / cap;
         scores.emplace_back(account_count,load,key);
     }
@@ -188,7 +196,7 @@ Json catalog_import(Json& settings, const Json& catalog) {
     for (const auto& group : groups) {
         auto provider = field(group, "id", 512);
         auto& account = settings["accounts"][provider];
-        if (account.is_null()) account = {{"id",provider},{"enabled",true},{"concurrency",1}};
+        if (account.is_null()) account = {{"id",provider}};
         account["name"] = group.value("name", provider);
         ++group_count;
         for (const auto& model : group.at("models")) {
@@ -212,11 +220,6 @@ Json catalog_import(Json& settings, const Json& catalog) {
             pool["name"] = model.value("name", model_id);
             pool["efforts"] = efforts;
             pool["defaultEffort"] = reasoning.value("defaultEffort", Json(""));
-            if (!pool.at("effort").get<std::string>().empty() &&
-                std::find(efforts.begin(), efforts.end(), pool.at("effort")) == efforts.end()) {
-                pool["effort"] = "";
-                pool["enabled"] = false;
-            }
             ++model_count;
         }
     }
@@ -410,6 +413,20 @@ Cluster::Cluster(fs::path data) : data_(std::move(data)) {
     if (data_.empty()) data_ = fs::path(environment(L"LOCALAPPDATA")) / L"FatFishBox";
     require(data_.is_absolute(), "应用数据目录必须使用绝对路径");
     fs::create_directories(data_);
+}
+
+Json Cluster::update_model_field(const std::string& id,const std::string& field,
+                                const Json& expected,const Json& value) const {
+    Database db(data_,true);
+    auto& settings=db.state.at("settings");
+    auto& pool=settings.at("pools").at(id);
+    if (pool.at(field)==value) return settings;
+    require(pool.at(field)==expected,"这项模型配置已在别处更新");
+    set_model_field(pool,field,value);
+    validate_configuration(settings);
+    settings["revision"]=settings.at("revision").get<int>()+1;
+    db.save();
+    return settings;
 }
 
 namespace {
@@ -749,7 +766,7 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         summary["settings"] = settings;
         return summary;
     }
-    if (tool == "cluster_configure" || tool == "cluster_update_pool" || tool == "cluster_update_account") {
+    if (tool == "cluster_configure" || tool == "cluster_update_pool") {
         Database db(data_, true);
         auto& settings = db.state["settings"];
         require(settings.at("revision") == input.at("revision"), "配置已变化，请刷新后重试");
@@ -757,11 +774,9 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             for (const auto member : {"configPath","authPath","permission","preset"})
                 if (input.contains(member)) settings[member] = input.at(member);
         } else {
-            const bool pool = tool == "cluster_update_pool";
-            auto& entry = settings.at(pool ? "pools" : "accounts").at(field(input, "id", 512));
-            for (const auto member : {"enabled","concurrency"})
-                if (input.contains(member)) entry[member] = input.at(member);
-            if (pool && input.contains("effort")) entry["effort"]=input.at("effort");
+            auto& pool = settings.at("pools").at(field(input, "id", 512));
+            for (const auto member : {"enabled","concurrency","effort"})
+                if (input.contains(member)) set_model_field(pool,member,input.at(member));
         }
         validate_configuration(settings);
         settings["revision"] = settings["revision"].get<int>() + 1;
@@ -810,13 +825,15 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             require(live_model.is_object(), "账号和模型已不在 DSH 实时目录中");
             auto effort = pool.at("effort").get<std::string>();
             const auto reasoning = live_model.value("reasoning", Json::object());
-            if (effort.empty() && reasoning.is_object() && reasoning.contains("defaultEffort") && reasoning.at("defaultEffort").is_string())
-                effort = reasoning.at("defaultEffort").get<std::string>();
-            if (!effort.empty()) {
-                bool found = false;
-                if (reasoning.is_object()) for (const auto& value : reasoning.value("efforts", Json::array()))
-                    if (value.value("id","") == effort) found = true;
-                require(found, "思考强度已不在 DSH 实时目录中");
+            const auto efforts=reasoning.is_object()?reasoning.value("efforts",Json::array()):Json::array();
+            const auto has_effort=[&](const std::string& name) {
+                return !name.empty() && std::ranges::any_of(efforts,[&](const Json& item) {
+                    return item.is_object() && item.value("id","")==name;
+                });
+            };
+            if (!has_effort(effort)) {
+                effort=reasoning.is_object()?reasoning.value("defaultEffort",std::string{}):std::string{};
+                if (!has_effort(effort)) effort.clear();
             }
             Json create{{"cwd",utf8(workspace)}};
             if (settings.at("preset") != "") create["agentPreset"] = settings.at("preset");
@@ -982,8 +999,6 @@ Json Cluster::tools() {
         {{"authPath",text},{"configPath",text}});
     add("cluster_configure","更新 DSH 连接与预设。",
         {{"revision",integer},{"configPath",text},{"authPath",text},{"permission",text},{"preset",text}}, {"revision"});
-    add("cluster_update_account","设置一个账号的启用状态和总并发。",
-        {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer}}, {"revision","id"});
     add("cluster_update_pool","设置模型启用状态、总并发和思考强度。",
         {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer},{"effort",text}}, {"revision","id"});
     add("cluster_next_handoff","获取下一个需处理对话。完成实际处置后，传回 claimToken 和 outcome 自动确认并领取下一条。省略 outcome 可用领取凭据重读本条。",

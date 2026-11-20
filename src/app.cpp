@@ -47,7 +47,8 @@ constexpr UINT sessions_interval_ms = 5000;
 constexpr int minimum_width=740, minimum_height=520;
 constexpr float row_height=34;
 constexpr float pool_row_height=52;
-enum class List { running, pending, pools };
+enum class List { running, pending, enabled_pools, all_pools };
+constexpr std::array lists{List::running,List::pending,List::enabled_pools,List::all_pools};
 struct ListViewport {
     std::string key;
     Rect bounds{};
@@ -167,9 +168,11 @@ public:
     }
     void dpi(UINT value) { renderer_.set_dpi(value); redraw(); }
     void paint() { renderer_.paint(window, model_, layout_, Theme::dark); }
+    void closing() { commit_concurrency(); }
     void activate(bool active) {
         model_.active = active;
         if (!active) {
+            commit_concurrency();
             ComboBox::dismiss(model_);
             refresh_combo_layout();
             TextBox::cancel_editing(model_,model_.focused);
@@ -213,6 +216,10 @@ public:
             ComboBox::dismiss(model_);
             refresh_combo_layout();
             return;
+        }
+        if (which!=model_.focused) {
+            commit_concurrency();
+            which=hit(x,y);
         }
         auto* w = widget(model_,which);
         if (which < choice_base && !interactive(w)) return;
@@ -264,7 +271,7 @@ public:
             model_.ui.choice_scroll=std::clamp(model_.ui.choice_scroll-36.f*delta/WHEEL_DELTA,0.f,std::max(0.f,maximum));
             refresh_combo_layout();
         } else {
-            for (const auto list:{List::running,List::pending,List::pools}) {
+            for (const auto list:lists) {
                 const auto& view=viewport(list);
                 if (WidgetLayout::contains(view.bounds,point.x,point.y)) {
                     UINT lines=3;
@@ -281,6 +288,7 @@ public:
     }
     bool key(WPARAM pressed) {
         if (pressed == VK_TAB) {
+            commit_concurrency();
             if (ComboBox::dismiss(model_)) refresh_combo_layout();
             std::vector<int> controls;
             for (std::size_t i = 0; i < model_.ui.widgets.size(); ++i) {
@@ -328,12 +336,8 @@ public:
             return true;
         }
         if (box->kind != WidgetKind::textbox) return false;
-        if (pressed==VK_RETURN && box->binding.starts_with("schedule.")) {
-            try { save_schedule(box->binding,number(box->binding)); }
-            catch (const std::exception&) {
-                notice_=L"请输入有效整数后按回车保存";
-                redraw();
-            }
+        if (pressed==VK_RETURN && box->binding.starts_with("schedule.concurrency.")) {
+            commit_concurrency();
             return true;
         }
         const bool control=GetKeyState(VK_CONTROL)<0, extend=GetKeyState(VK_SHIFT)<0;
@@ -486,8 +490,7 @@ private:
     std::shared_ptr<ImageSource> logo_;
     std::map<std::string,std::wstring> fields_;
     Json running_=Json::array(), pending_=Json::array(), settings_=Json::object(), overview_=Json::object(), selected_;
-    std::vector<std::pair<bool,Json>> pools_;
-    std::map<std::string,std::vector<int>> account_models_;
+    std::map<std::string,std::vector<std::string>> account_models_;
     std::set<std::string> expanded_accounts_;
     std::vector<Json> visible_sessions_;
     std::jthread worker_;
@@ -507,7 +510,7 @@ private:
     wchar_t surrogate_{};
     bool result_loaded_=false;
     std::string page_ = "sessions";
-    std::array<ListViewport,3> viewports_{{{"scroll.running"},{"scroll.pending"},{"scroll.pools"}}};
+    std::array<ListViewport,4> viewports_{{{"scroll.running"},{"scroll.pending"},{"scroll.enabled_pools"},{"scroll.all_pools"}}};
     ScrollBar scroll_bar_;
     std::optional<List> drag_list_;
     bool busy_ = false;
@@ -521,7 +524,7 @@ private:
     ListViewport& viewport(List list) { return viewports_.at(static_cast<std::size_t>(list)); }
     const ListViewport& viewport(List list) const { return viewports_.at(static_cast<std::size_t>(list)); }
     std::optional<List> list_for(std::string_view key) const {
-        for (const auto list:{List::running,List::pending,List::pools})
+        for (const auto list:lists)
             if (viewport(list).key==key) return list;
         return {};
     }
@@ -545,6 +548,7 @@ private:
             InvalidateRect(window,nullptr,FALSE);
             return;
         }
+        if (list==List::enabled_pools) commit_concurrency();
         view.offset=offset;
         redraw();
     }
@@ -695,17 +699,11 @@ private:
         }
     }
     void update_pools() {
-        pools_.clear();
         account_models_.clear();
-        for (const auto& [id,account]:settings_.at("accounts").items()) {
-            pools_.emplace_back(false,account);
+        for (const auto& [id,account]:settings_.at("accounts").items())
             account_models_.try_emplace(id);
-        }
-        for (const auto& pool:settings_.at("pools")) {
-            auto& models=account_models_.at(pool.at("provider").get<std::string>());
-            models.push_back(static_cast<int>(pools_.size()));
-            pools_.emplace_back(true,pool);
-        }
+        for (const auto& [id,pool]:settings_.at("pools").items())
+            account_models_.at(pool.at("provider").get<std::string>()).push_back(id);
         std::erase_if(expanded_accounts_,[&](const auto& id){return !account_models_.contains(id);});
     }
     void reload() { local_snapshot(); redraw(); }
@@ -927,74 +925,96 @@ private:
         if (side) label(L"stdio  ·  FatFishBox.exe --mcp",mcp_x+16,mcp_y+118,right-mcp_x-32,13,"mcp",ColorToken::text_secondary);
         else label(L"stdio  ·  FatFishBox.exe --mcp",mcp_x+16,mcp_y+83,right-mcp_x-32,12,"mcp",ColorToken::text_secondary);
     }
-    void pools_page(float x,float right,float h) {
-        button("import",L"从 DSH 导入模型",right-154,20,154,true);
-        const float left=x+16, width=right-x;
-        const int accounts=int(settings_.value("accounts",Json::object()).size());
-        const int models=int(settings_.value("pools",Json::object()).size());
-        auto description=std::to_wstring(accounts)+L" 个账号  ·  "+std::to_wstring(models)+L" 个模型池";
-        description+=L"  ·  并发可用 + / − 调整，也可输入后按回车保存";
-        label(std::move(description),x,56,width,13,"root",ColorToken::text_secondary);
-        const float top=85, bottom=h-30;
-        panel("poolrows",{x,top,right,bottom});
-        std::vector<int> rows;
-        for (int i=0;i<accounts;++i) {
-            rows.push_back(i);
-            const auto id=pools_[i].second.at("id").get<std::string>();
-            if (expanded_accounts_.contains(id)) {
-                const auto& children=account_models_.at(id);
-                rows.insert(rows.end(),children.begin(),children.end());
-            }
+    void pools_section(List list,float x,float top,float right,float bottom) {
+        const bool enabled_only=list==List::enabled_pools;
+        const std::string surface=enabled_only?"enabled_pools":"all_pools";
+        const auto& accounts=settings_.at("accounts");
+        const auto& pools=settings_.at("pools");
+        const float left=x+16;
+        const float effort_width=std::clamp((right-x)*.23f,134.f,200.f), effort=right-32-effort_width;
+        const float limit=effort-128, state=right-100;
+        const float name_end=enabled_only?limit:state;
+        const auto heading=enabled_only?L"已启用":L"完整列表";
+        std::vector<std::pair<bool,std::string>> rows;
+        int model_count=0;
+        for (const auto& [account,models]:account_models_) {
+            const auto enabled=[&](const std::string& id){return pools.at(id).at("enabled").get<bool>();};
+            const auto active=std::ranges::count_if(models,enabled);
+            if (enabled_only && !active) continue;
+            model_count+=enabled_only?int(active):int(models.size());
+            rows.emplace_back(false,account);
+            for (const auto& id:models)
+                if (enabled(id) || (!enabled_only && expanded_accounts_.contains(account)))
+                    rows.emplace_back(true,id);
         }
-        const int total=int(rows.size()), capacity=std::max(1,int((bottom-top-50)/pool_row_height));
-        const int start=list_start(List::pools,"poolrows",{x+8,top+41,right-7,bottom-8},total,capacity,L"滚动账号与模型池");
-        const float effort_width=std::clamp(width*.20f,100.f,175.f), effort=right-32-effort_width;
-        const float limit=effort-128, state=limit-72;
-        label(L"账号 / 模型",left,top+12,state-left-12,12,"poolrows",ColorToken::text_tertiary);
-        label(L"启用",state,top+12,64,12,"poolrows",ColorToken::text_tertiary);
-        label(L"并发",limit,top+12,112,12,"poolrows",ColorToken::text_tertiary);
-        label(L"思考强度",effort,top+12,effort_width,12,"poolrows",ColorToken::text_tertiary);
+        panel(surface,{x,top,right,bottom});
+        label(heading,left,top+8,right-left-32,16,surface,ColorToken::text_primary,true);
+        label(std::to_wstring(model_count)+L" 个模型",right-115,top+10,83,12,surface,ColorToken::text_secondary);
+        const float first=top+57;
+        const int total=int(rows.size()), capacity=std::max(1,int((bottom-first-7)/pool_row_height));
+        const int start=list_start(list,surface,{x+8,first,right-7,bottom-8},total,capacity,L"滚动"+std::wstring(heading));
+        label(L"账号 / 模型",left,top+33,name_end-left-12,12,surface,ColorToken::text_tertiary);
+        if (enabled_only) {
+            label(L"并发",limit,top+33,112,12,surface,ColorToken::text_tertiary);
+            label(L"思考强度",effort,top+33,effort_width,12,surface,ColorToken::text_tertiary);
+        } else label(L"启用",state,top+33,64,12,surface,ColorToken::text_tertiary);
         for (int position=start;position<std::min(start+capacity,total);++position) {
-            const int i=rows[position];
-            const auto& [pool,row]=pools_[i];
-            const float row_top=top+37+float(position-start)*pool_row_height;
-            const float y=row_top+12;
-            auto name=title(row,"name");
-            if (pool) {
-                constexpr float indent=44;
-                label(std::move(name),left+indent,y+7,state-left-indent-12,14,"poolrows",ColorToken::text_secondary);
-            } else {
-                const auto id=row.at("id").get<std::string>();
-                const auto count=account_models_.at(id).size();
-                name+=L"  ·  "+std::to_wstring(count)+L" 个模型";
-                auto& header=add("expand."+id,WidgetKind::button,std::move(name),left,y,state-left-12,32,"poolrows");
-                header.visual=WidgetVisual::tree_item;
-                header.hierarchy=HierarchyInfo{0,expanded_accounts_.contains(id),count!=0,false};
-                header.enabled=count!=0 && !busy_;
+            const auto& [is_model,id]=rows[position];
+            const float row_top=first+float(position-start)*pool_row_height;
+            const float y=row_top+10;
+            if (!is_model) {
+                auto name=title(accounts.at(id),"name");
+                const auto& children=account_models_.at(id);
+                const auto active=std::ranges::count_if(children,[&](const auto& model){return pools.at(model).at("enabled").get<bool>();});
+                if (enabled_only || static_cast<std::size_t>(active)==children.size()) {
+                    label(std::move(name),left+26,y+7,name_end-left-38,14,surface,ColorToken::text_primary,true);
+                } else {
+                    name+=L"  ·  "+std::to_wstring(active)+L" / "+std::to_wstring(children.size())+L" 已启用";
+                    auto& header=add("expand."+id,WidgetKind::button,std::move(name),left,y,name_end-left-12,32,surface);
+                    header.visual=WidgetVisual::tree_item;
+                    header.hierarchy=HierarchyInfo{0,expanded_accounts_.contains(id),true,false};
+                    header.enabled=!busy_;
+                }
+                continue;
             }
-            const auto suffix="."+std::to_string(i);
-            const bool enabled=row.value("enabled",false);
-            auto& toggle=ToggleSwitch({.on=enabled,.enabled=!busy_}).append(model_,"poolrows","schedule.enabled"+suffix);
-            toggle.action=toggle.key;
-            toggle.area=WidgetArea::absolute;
-            const float toggle_top=row_top-12+title_bar_.height();
-            toggle.bounds={state,toggle_top,state+52,toggle_top+pool_row_height};
-            const auto concurrency=row.value("concurrency",1);
-            const auto binding="schedule.concurrency"+suffix;
-            const auto& value=fields_.try_emplace(binding,std::to_wstring(concurrency)).first->second;
-            button("lower"+suffix,L"−",limit,y,26,false,concurrency>1,"poolrows");
-            auto& number_box=add(binding,WidgetKind::textbox,L"",limit+30,y,52,32,"poolrows");
+            const auto& row=pools.at(id);
+            label(title(row,"name"),left+44,y+7,name_end-left-56,14,surface,ColorToken::text_secondary);
+            if (!enabled_only) {
+                auto& toggle=ToggleSwitch({.on=row.at("enabled").get<bool>(),.enabled=!busy_})
+                    .append(model_,surface,"schedule.enabled."+id);
+                toggle.action=toggle.key;
+                toggle.area=WidgetArea::absolute;
+                const float toggle_top=row_top-14+title_bar_.height();
+                toggle.bounds={state,toggle_top,state+52,toggle_top+pool_row_height};
+                continue;
+            }
+            const auto concurrency=row.at("concurrency").get<int>();
+            const auto binding="schedule.concurrency."+id;
+            const auto draft=fields_.find(binding);
+            const auto value=draft==fields_.end()?std::to_wstring(concurrency):draft->second;
+            button("lower."+id,L"−",limit,y,26,false,concurrency>1,surface);
+            auto& number_box=add(binding,WidgetKind::textbox,L"",limit+30,y,52,32,surface);
             TextBox({.text=value,.enabled=!busy_,.max_length=4}).apply(number_box);
             number_box.binding=binding;
-            button("raise"+suffix,L"+",limit+86,y,26,false,concurrency<1000,"poolrows");
-            if (pool) {
-                std::vector<Choice> options{{"",L"DSH 默认"}};
-                for (const auto& option:row.at("efforts")) options.push_back({option.get<std::string>(),widen(option.get<std::string>())});
-                auto& choice=add("schedule.effort"+suffix,WidgetKind::select,L"",effort,y,effort_width,32,"poolrows");
-                ComboBox({L"思考强度",std::move(options),title(row,"effort"),!busy_,effort_width}).apply(choice);
-            } else label(L"—",effort,y+7,effort_width,12,"poolrows",ColorToken::text_tertiary);
+            button("raise."+id,L"+",limit+86,y,26,false,concurrency<1000,surface);
+            std::vector<Choice> options{{"",L"DSH 默认"}};
+            const auto saved=row.at("effort").get<std::string>();
+            for (const auto& option:row.at("efforts")) options.push_back({option.get<std::string>(),widen(option.get<std::string>())});
+            if (std::ranges::find(options,saved,&Choice::key)==options.end())
+                options.push_back({saved,widen(saved)+L"（已下架）",false});
+            auto& choice=add("schedule.effort."+id,WidgetKind::select,L"",effort,y,effort_width,32,surface);
+            ComboBox({L"思考强度",std::move(options),widen(saved),!busy_,effort_width}).apply(choice);
         }
-        if (!total) label(L"从 DSH 导入模型后可在这里编辑调度配置。",left,top+55,width-32,14,"poolrows",ColorToken::text_secondary);
+        if (!total) label(enabled_only?L"在下方完整列表启用模型后，可在这里编辑配置。":L"从 DSH 导入模型后可在这里启用。",
+            left,first+8,right-left-32,13,surface,ColorToken::text_secondary);
+    }
+    void pools_page(float x,float right,float h) {
+        button("import",L"从 DSH 导入模型",right-154,20,154,true);
+        constexpr float top=65,gap=12;
+        const float bottom=h-30;
+        const float split=top+std::floor((bottom-top-gap)*.49f);
+        pools_section(List::enabled_pools,x,top,right,split);
+        pools_section(List::all_pools,x,split+gap,right,bottom);
     }
     void redraw() {
         if (!window) return;
@@ -1096,42 +1116,42 @@ private:
     Json paths() const {
         return {{"configPath",narrow(fields_.at("configPath"))},{"authPath",narrow(fields_.at("authPath"))}};
     }
-    int number(const std::string& name) const {
-        const auto& text=fields_.at(name);
+    void commit_concurrency() {
+        const auto* box=widget(model_,model_.focused);
+        if (!box || !box->binding.starts_with("schedule.concurrency.")) return;
+        const auto action=box->binding;
+        const auto draft=fields_.find(action);
+        if (draft==fields_.end()) return;
         std::size_t length=0;
-        const auto value=std::stoi(text,&length);
-        if (length!=text.size()) throw std::runtime_error("请输入整数");
-        return value;
+        int value=0;
+        try {value=std::stoi(draft->second,&length);}
+        catch (const std::exception&) {}
+        if (value<1 || value>1000 || length!=draft->second.size()) {
+            fields_.erase(draft);
+            notice_=L"并发必须是 1 至 1000 的整数，已恢复上次保存的值";
+            redraw();
+            return;
+        }
+        save_schedule(action,value);
     }
-    void save_schedule(const std::string& action,Json value) {
+    void save_schedule(std::string action,Json value) {
         if (busy_) return;
+        fields_.erase(action);
         try {
-            const auto split=action.rfind('.');
-            const auto index=std::stoul(action.substr(split+1));
-            const auto field=action.substr(std::string_view("schedule.").size(),split-std::string_view("schedule.").size());
-            const auto& [pool,row]=pools_.at(index);
-            if (field=="concurrency" && (value.get<int>()<1 || value.get<int>()>1000)) {
-                notice_=L"并发必须在 1 至 1000 之间";
-                redraw();
-                return;
-            }
-            if (row.at(field)==value) return;
-            const auto id=row.at("id").get<std::string>();
-            const auto expected=row.at(field);
-            job([this,pool,id,field,expected,value=std::move(value)] {
-                    const auto settings=cluster_.invoke("cluster_get_settings");
-                    if (settings.at(pool?"pools":"accounts").at(id).at(field)!=expected)
-                        throw std::runtime_error("这一项已在别处修改，请核对后重试");
-                    return cluster_.invoke(pool?"cluster_update_pool":"cluster_update_account",
-                        {{"revision",settings.at("revision")},{"id",id},{field,value}});
-                },
-                [this, action](Json result) {
-                    fields_.erase(action);
-                    settings_=std::move(result);
-                    update_pools();
-                    notice_=L"调度配置已保存";
-                });
-        } catch (const std::exception& error) {notice_=widen(error.what());redraw();}
+            constexpr auto prefix=std::string_view("schedule.").size();
+            const auto split=action.find('.',prefix);
+            const auto field=action.substr(prefix,split-prefix);
+            const auto id=action.substr(split+1);
+            const auto expected=settings_.at("pools").at(id).at(field);
+            settings_=cluster_.update_model_field(id,field,expected,value);
+            update_pools();
+            notice_=L"模型配置已保存";
+        } catch (const std::exception& error) {
+            notice_=L"保存失败 · "+widen(error.what());
+            try {settings_=cluster_.invoke("cluster_get_settings");update_pools();}
+            catch (const std::exception&) {}
+        }
+        redraw();
     }
     void click(int control) {
         if (control>=choice_base) {
@@ -1174,9 +1194,9 @@ private:
                 redraw();return;
             }
             if (name.starts_with("raise.") || name.starts_with("lower.")) {
-                const auto index=std::stoul(name.substr(6));
-                save_schedule("schedule.concurrency."+std::to_string(index),
-                    pools_.at(index).second.value("concurrency",1)+(name.starts_with("raise.")?1:-1));
+                const auto id=name.substr(6);
+                save_schedule("schedule.concurrency."+id,
+                    settings_.at("pools").at(id).at("concurrency").get<int>()+(name.starts_with("raise.")?1:-1));
                 return;
             }
             if (name.starts_with("row.")) {selected_=visible_sessions_.at(std::stoul(name.substr(4)));clear_result();nav("detail");return;}
@@ -1306,6 +1326,7 @@ LRESULT CALLBACK dispatch_window(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp==usage_timer) { app->sync_usage();return 0; }
         if (wp==sessions_timer) { app->refresh_sessions_automatically();return 0; }
         break;
+    case WM_CLOSE: app->closing();break;
     case WM_DESTROY: PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);

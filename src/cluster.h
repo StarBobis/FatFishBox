@@ -22,6 +22,8 @@ class Cluster {
 public:
     explicit Cluster(fs::path data = {});
     Json invoke(std::string_view tool, const Json& input = Json::object()) const;
+    Json update_model_field(const std::string& id,const std::string& field,
+                            const Json& expected,const Json& value) const;
     Json desktop_snapshot(DesktopMonitor* monitor=nullptr,std::stop_token stop={}) const;
     void refresh_legacy_usage(std::stop_token stop) const;
     const fs::path& data_directory() const { return data_; }
