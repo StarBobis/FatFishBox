@@ -406,43 +406,50 @@ Cluster::Cluster(fs::path data) : data_(std::move(data)) {
     fs::create_directories(data_);
 }
 
+namespace {
+Json session_overview(const Json& settings,const Json& sessions,const LegacySessions& legacy) {
+    int running=0, pending=0;
+    for (const auto& row:sessions) {
+        if (active(row)) ++running;
+        else if (!row.value("processed",false)) ++pending;
+    }
+    return {{"active",running},{"unprocessed",pending},{"accounts",settings.at("accounts").size()},
+        {"models",settings.at("pools").size()},{"connected",!settings.at("authPath").get<std::string>().empty()},
+        {"codexSessions",legacy.rows.size()},{"codexSources",legacy.sources},{"unreadableCodexSources",legacy.unreadable},
+        {"usage",telemetry_overview(sessions)}};
+}
+}
+
+Json Cluster::desktop_snapshot() const {
+    Database db(data_,false);
+    const auto& settings=db.state.at("settings");
+    auto sessions=db.state.at("sessions");
+    const auto legacy=read_legacy_sessions(settings);
+    sessions.update(legacy.rows);
+    std::vector<Json> running,pending;
+    for (const auto& row:sessions) {
+        if (active(row)) running.push_back(public_row(row));
+        else if (!row.value("processed",false)) pending.push_back(public_row(row));
+    }
+    const auto order=[](const Json& row,const char* stamp) {
+        return std::pair(row.value(stamp,std::int64_t(0)),row.at("id").get<std::string>());
+    };
+    std::sort(running.begin(),running.end(),[&](const Json& a,const Json& b) {return order(a,"updated")>order(b,"updated");});
+    std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return order(a,"completed")<order(b,"completed");});
+    return {{"overview",session_overview(settings,sessions,legacy)},{"settings",settings},
+        {"running",std::move(running)},{"pending",std::move(pending)}};
+}
+
 Json Cluster::invoke(std::string_view tool, const Json& input) const {
     require(input.is_object(), "工具参数必须为 JSON 对象");
-    if (tool == "cluster_overview" || tool == "cluster_get_settings" || tool == "cluster_list_sessions") {
+    if (tool == "cluster_overview" || tool == "cluster_get_settings") {
         Database db(data_, false);
         const auto& settings = db.state.at("settings");
         if (tool == "cluster_get_settings") return settings;
         auto sessions = db.state.at("sessions");
         const auto legacy = read_legacy_sessions(settings);
         sessions.update(legacy.rows);
-        if (tool == "cluster_overview") {
-            int running = 0, pending = 0;
-            for (const auto& row : sessions) {
-                if (active(row)) ++running;
-                else if (!row.value("processed", false)) ++pending;
-            }
-            return {{"active",running},{"unprocessed",pending},{"accounts",settings.at("accounts").size()},
-                {"models",settings.at("pools").size()},{"connected",!settings.at("authPath").get<std::string>().empty()},
-                {"codexSessions",legacy.rows.size()},{"codexSources",legacy.sources},{"unreadableCodexSources",legacy.unreadable},
-                {"usage",telemetry_overview(sessions)}};
-        }
-        const auto limit = input.value("limit", 20);
-        const auto offset = input.value("offset", 0);
-        require(limit >= 1 && limit <= 100 && offset >= 0, "分页参数无效");
-        const auto batch = input.value("batch", "");
-        const auto handoff = input.value("handoffOnly", false);
-        std::vector<Json> sorted;
-        for (const auto& row : sessions)
-            if (!row.value("processed", false) && (!handoff || !active(row)) &&
-                (batch.empty() || row.at("batch") == batch)) sorted.push_back(public_row(row));
-        std::sort(sorted.begin(), sorted.end(), [&](const Json& a, const Json& b) {
-            return handoff ? a.value("completed",std::int64_t(0)) < b.value("completed",std::int64_t(0)) : a.at("updated") > b.at("updated");
-        });
-        Json answer = Json::array();
-        for (std::size_t i = offset; i < sorted.size() && answer.size() < std::size_t(limit); ++i)
-            answer.push_back(std::move(sorted[i]));
-        const auto next = std::int64_t(offset) + limit;
-        return {{"sessions",answer},{"total",sorted.size()},{"nextOffset",next < std::int64_t(sorted.size()) ? Json(next) : Json(nullptr)}};
+        return session_overview(settings,sessions,legacy);
     }
     if (tool == "cluster_next_handoff") {
         require(std::ranges::all_of(input.items(),[](const auto& entry) {

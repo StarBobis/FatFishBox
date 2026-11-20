@@ -20,6 +20,7 @@ class Cluster {
 public:
     explicit Cluster(fs::path data = {});
     Json invoke(std::string_view tool, const Json& input = Json::object()) const;
+    Json desktop_snapshot() const;
     const fs::path& data_directory() const { return data_; }
     static Json tools();
 private:
