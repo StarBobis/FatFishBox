@@ -25,6 +25,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -472,6 +473,8 @@ private:
     std::map<std::string,std::wstring> fields_;
     Json running_=Json::array(), pending_=Json::array(), settings_=Json::object(), overview_=Json::object(), selected_;
     std::vector<std::pair<bool,Json>> pools_;
+    std::map<std::string,std::vector<int>> account_models_;
+    std::set<std::string> expanded_accounts_;
     std::vector<Json> visible_sessions_;
     std::jthread worker_;
     std::jthread usage_worker_;
@@ -666,8 +669,17 @@ private:
     }
     void update_pools() {
         pools_.clear();
-        for (const auto& account:settings_.at("accounts")) pools_.emplace_back(false,account);
-        for (const auto& pool:settings_.at("pools")) pools_.emplace_back(true,pool);
+        account_models_.clear();
+        for (const auto& [id,account]:settings_.at("accounts").items()) {
+            pools_.emplace_back(false,account);
+            account_models_.try_emplace(id);
+        }
+        for (const auto& pool:settings_.at("pools")) {
+            auto& models=account_models_.at(pool.at("provider").get<std::string>());
+            models.push_back(static_cast<int>(pools_.size()));
+            pools_.emplace_back(true,pool);
+        }
+        std::erase_if(expanded_accounts_,[&](const auto& id){return !account_models_.contains(id);});
     }
     void reload() { local_snapshot(); redraw(); }
     void nav(std::string to) {
@@ -886,22 +898,41 @@ private:
         label(std::move(description),x,56,width,13,"root",ColorToken::text_secondary);
         const float top=85, bottom=h-30;
         panel("poolrows",{x,top,right,bottom});
-        const int total=int(pools_.size()), capacity=std::max(1,int((bottom-top-50)/pool_row_height));
+        std::vector<int> rows;
+        for (int i=0;i<accounts;++i) {
+            rows.push_back(i);
+            const auto id=pools_[i].second.at("id").get<std::string>();
+            if (expanded_accounts_.contains(id)) {
+                const auto& children=account_models_.at(id);
+                rows.insert(rows.end(),children.begin(),children.end());
+            }
+        }
+        const int total=int(rows.size()), capacity=std::max(1,int((bottom-top-50)/pool_row_height));
         const int start=list_start(List::pools,"poolrows",{x+8,top+41,right-7,bottom-8},total,capacity,L"滚动账号与模型池");
         const float effort_width=std::clamp(width*.20f,100.f,175.f), effort=right-32-effort_width;
         const float limit=effort-128, state=limit-72;
-        label(L"账号或模型",left,top+12,state-left-12,12,"poolrows",ColorToken::text_tertiary);
+        label(L"账号 / 模型",left,top+12,state-left-12,12,"poolrows",ColorToken::text_tertiary);
         label(L"启用",state,top+12,64,12,"poolrows",ColorToken::text_tertiary);
         label(L"并发",limit,top+12,112,12,"poolrows",ColorToken::text_tertiary);
         label(L"思考强度",effort,top+12,effort_width,12,"poolrows",ColorToken::text_tertiary);
-        for (int i=start;i<std::min(start+capacity,total);++i) {
+        for (int position=start;position<std::min(start+capacity,total);++position) {
+            const int i=rows[position];
             const auto& [pool,row]=pools_[i];
-            const float row_top=top+37+float(i-start)*pool_row_height;
+            const float row_top=top+37+float(position-start)*pool_row_height;
             const float y=row_top+12;
             auto name=title(row,"name");
-            if (pool) name+=L"  ·  "+title(row,"provider");
-            else name=L"账号  ·  "+name;
-            label(std::move(name),left,y+7,state-left-12,14,"poolrows",ColorToken::text_primary,!pool);
+            if (pool) {
+                constexpr float indent=44;
+                label(std::move(name),left+indent,y+7,state-left-indent-12,14,"poolrows",ColorToken::text_secondary);
+            } else {
+                const auto id=row.at("id").get<std::string>();
+                const auto count=account_models_.at(id).size();
+                name+=L"  ·  "+std::to_wstring(count)+L" 个模型";
+                auto& header=add("expand."+id,WidgetKind::button,std::move(name),left,y,state-left-12,32,"poolrows");
+                header.visual=WidgetVisual::tree_item;
+                header.hierarchy=HierarchyInfo{0,expanded_accounts_.contains(id),count!=0,false};
+                header.enabled=count!=0 && !busy_;
+            }
             const auto suffix="."+std::to_string(i);
             const bool enabled=row.value("enabled",false);
             auto& toggle=ToggleSwitch({.on=enabled,.enabled=!busy_}).append(model_,"poolrows","schedule.enabled"+suffix);
@@ -1089,6 +1120,12 @@ private:
         const auto name=w->action;
         try {
             if (name.starts_with("nav.")) {nav(name.substr(4));return;}
+            if (name.starts_with("expand.")) {
+                const auto id=name.substr(7);
+                if (!expanded_accounts_.erase(id)) expanded_accounts_.insert(id);
+                redraw();
+                return;
+            }
             if (name=="refresh_presets") {refresh_presets();return;}
             if (name=="copy_agent_setup") {copy_agent_setup();return;}
             if (name=="copy_token") {copy_http_token();return;}
