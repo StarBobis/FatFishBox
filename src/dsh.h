@@ -1,5 +1,6 @@
 #pragma once
 #include "cluster.h"
+#include <optional>
 
 namespace fatfish {
 struct DshConnection {
@@ -11,6 +12,7 @@ struct DshConnection {
 
 Json read_json(const fs::path& path, std::size_t limit = 1024 * 1024);
 DshConnection discover(const Json& settings, const Json& input);
+fs::path config_relative_path(const fs::path& config, std::string_view value);
 
 class Dsh {
 public:
@@ -26,4 +28,12 @@ private:
     unsigned short port_{};
     bool https_{};
 };
+
+struct TurnEnd {
+    std::string status;
+    std::int64_t seq;
+    std::int64_t time;
+};
+std::optional<TurnEnd> latest_turn_end(const Dsh& dsh, const Json& session_id,
+                                      std::int64_t start, std::int64_t cursor);
 }

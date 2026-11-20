@@ -152,6 +152,21 @@ try {
     assert.equal(updated.outcome,ack.outcome);
     assert.equal((await two.tool('cluster_next_handoff',{claimToken:next.claimToken,outcome:'Verified report.'})).empty,true);
     assert.equal((await one.tool('cluster_overview')).unprocessed,0);
+    const latest={sessionId:'last-codex-session',serviceId:'attached',serviceOrigin:`http://127.0.0.1:${server.address().port}`,
+        status:'running',startSeq:1,cursor:4,updatedAt:20,assistantText:'旧登记内容'};
+    await writeFile(join(registry,'workers.json'),JSON.stringify({sessions:{[old.sessionId]:old,[latest.sessionId]:latest}}));
+    assert.equal((await two.tool('cluster_overview')).unprocessed,1);
+    const liveClaim=await two.tool('cluster_next_handoff');
+    assert.equal(liveClaim.session.id,'codex:last-codex-session');
+    assert.equal(liveClaim.session.resultVersion,'1:7');
+    assert.equal(liveClaim.result[0].text,'交接证据');
+    running=true;
+    assert.equal((await two.tool('cluster_next_handoff',{claimToken:liveClaim.claimToken,outcome:'Previous result verified.'})).changed,true);
+    assert.equal(JSON.parse(await readFile(receipts,'utf8'))[JSON.stringify([latest.serviceOrigin,latest.sessionId]).replace(',',', ')],undefined);
+    running=false;
+    const confirmed=await two.tool('cluster_next_handoff');
+    assert.equal((await two.tool('cluster_next_handoff',{claimToken:confirmed.claimToken,outcome:'Latest result verified.'})).empty,true);
+    assert.equal(JSON.parse(await readFile(receipts,'utf8'))[JSON.stringify([latest.serviceOrigin,latest.sessionId]).replace(',',', ')].version,'1:7');
     const balanced=await connect(join(root,'balanced'));
     const balancedImport=await balanced.tool('cluster_import_models',{authPath:auth,configPath:''});
     let balancedSettings=await balanced.tool('cluster_configure',{revision:balancedImport.settings.revision,permission:'prompt-on-risk'});

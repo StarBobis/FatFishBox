@@ -16,13 +16,13 @@ std::string utf8(const fs::path& path);
 inline fs::path path_from_utf8(std::string_view value) { return fs::path(widen(value)); }
 std::string id();
 std::int64_t now();
+struct DesktopMonitor;
 
 class Cluster {
 public:
     explicit Cluster(fs::path data = {});
     Json invoke(std::string_view tool, const Json& input = Json::object()) const;
-    Json desktop_snapshot() const;
-    void poll_desktop_session() const;
+    Json desktop_snapshot(DesktopMonitor* monitor=nullptr,std::stop_token stop={}) const;
     void refresh_legacy_usage(std::stop_token stop) const;
     const fs::path& data_directory() const { return data_; }
     static Json tools();

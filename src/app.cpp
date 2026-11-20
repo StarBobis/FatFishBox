@@ -1,4 +1,5 @@
 #include "cluster.h"
+#include "legacy.h"
 #include "mcp.h"
 #include "resource.h"
 #include <native_ui/button.h>
@@ -43,7 +44,6 @@ constexpr UINT sessions_finished = WM_APP + 3;
 constexpr UINT_PTR usage_timer = 1;
 constexpr UINT_PTR sessions_timer = 2;
 constexpr UINT sessions_interval_ms = 5000;
-constexpr ULONGLONG live_interval_ms = 30000;
 constexpr int minimum_width=740, minimum_height=520;
 constexpr float row_height=34;
 constexpr float pool_row_height=52;
@@ -68,24 +68,26 @@ std::wstring title(const Json& object, const char* member) {
 std::wstring status(const Json& row) {
     static const std::map<std::string,std::wstring> labels{
         {"starting",L"启动中"},{"queued",L"排队"},{"running",L"运行中"},{"waiting_input",L"等待输入"},
+        {"cancelling_policy_violation",L"正在停止"},
         {"succeeded",L"完成"},{"cancelled",L"取消"},{"failed",L"失败"},{"unknown",L"待同步"},{"interrupted",L"中断"}};
     auto found = labels.find(row.value("status",""));
     return found == labels.end() ? L"—" : found->second;
 }
 ColorToken status_color(const Json& row) {
     const auto state=row.value("status","");
+    if (row.value("stale",false)) return ColorToken::status_warning;
     if (state=="succeeded") return ColorToken::status_success;
     if (state=="failed" || state=="interrupted") return ColorToken::status_error;
     if (state=="waiting_input" || state=="unknown") return ColorToken::status_warning;
     if (state=="running") return ColorToken::accent_primary;
     return ColorToken::text_secondary;
 }
-std::wstring local_stamp(std::int64_t milliseconds) {
+std::wstring local_stamp(std::int64_t milliseconds,const wchar_t* format=L"%m-%d %H:%M") {
     if (milliseconds <= 0) return L"—";
     const auto seconds=static_cast<std::time_t>(milliseconds/1000);
     std::tm local{};
     wchar_t result[18]{};
-    if (localtime_s(&local,&seconds)!=0 || !std::wcsftime(result,std::size(result),L"%m-%d %H:%M",&local)) return L"—";
+    if (localtime_s(&local,&seconds)!=0 || !std::wcsftime(result,std::size(result),format,&local)) return L"—";
     return result;
 }
 std::shared_ptr<const ThemeResources> desktop_theme() {
@@ -155,7 +157,8 @@ public:
         sync_usage();
         reload();
         SetTimer(window,usage_timer,60000,nullptr);
-        SetTimer(window,sessions_timer,sessions_interval_ms,nullptr);
+        sessions_timer_ready_=SetTimer(window,sessions_timer,sessions_interval_ms,nullptr)!=0;
+        refresh_sessions_automatically();
     }
     void size(int width, int height) {
         if (!width || !height) return;
@@ -433,32 +436,43 @@ public:
     void receive_usage() {
         if (usage_worker_.joinable()) usage_worker_.join();
         usage_busy_=false;
-        try { overview_["usage"]=cluster_.invoke("cluster_overview").at("usage"); }
-        catch (const std::exception&) {}
-        if (page_=="sessions" && GetCapture()!=window) redraw();
+        if (page_=="sessions" && GetCapture()!=window && !sessions_worker_.joinable())
+            refresh_sessions_automatically();
     }
-    void refresh_sessions_automatically() {
-        if (page_!="sessions" || IsIconic(window) || busy_ || sessions_worker_.joinable() ||
-            GetCapture()==window || !model_.ui.choice.empty()) return;
-        const auto tick=GetTickCount64();
-        const bool poll_live=tick>=next_live_poll_;
-        if (poll_live) next_live_poll_=tick+live_interval_ms;
+    void refresh_sessions_automatically(bool manual=false) {
+        if (page_!="sessions" && page_!="detail") return;
+        if (manual) {
+            sync_usage();
+            refresh_requested_=sessions_worker_.joinable();
+        }
+        if (IsIconic(window) || sessions_worker_.joinable()) return;
+        if (sessions_snapshot_) apply_session_refresh();
         sessions_generation_=snapshot_generation_;
-        sessions_worker_=std::jthread([this,poll_live](std::stop_token stop) {
+        sessions_worker_=std::jthread([this](std::stop_token stop) {
             try {
-                if (poll_live) cluster_.poll_desktop_session();
-                if (!stop.stop_requested()) sessions_snapshot_=cluster_.desktop_snapshot();
-            } catch (const std::exception&) {}
+                sessions_snapshot_=cluster_.desktop_snapshot(&desktop_monitor_,stop);
+                sessions_error_.clear();
+            } catch (const std::exception& error) { sessions_error_=widen(error.what()); }
             if (!stop.stop_requested()) PostMessageW(window,sessions_finished,0,0);
         });
+        if (GetCapture()!=window) redraw();
     }
     void receive_sessions() {
         if (sessions_worker_.joinable()) sessions_worker_.join();
+        apply_session_refresh();
+        if (std::exchange(refresh_requested_,false)) refresh_sessions_automatically();
+    }
+    void apply_session_refresh() {
+        if (sessions_worker_.joinable() || GetCapture()==window || !model_.ui.choice.empty()) return;
         auto snapshot=std::exchange(sessions_snapshot_,std::nullopt);
-        if (!snapshot || page_!="sessions" || IsIconic(window) || busy_ ||
-            sessions_generation_!=snapshot_generation_ || GetCapture()==window || !model_.ui.choice.empty()) return;
-        apply_sessions(*snapshot);
-        redraw();
+        if (sessions_generation_!=snapshot_generation_) return;
+        if (snapshot) {
+            apply_sessions(*snapshot);
+            session_sync_at_=fatfish::now();
+            session_live_checked_=snapshot->at("liveChecked").get<int>();
+            session_live_stale_=snapshot->at("liveStale").get<int>();
+        }
+        if (page_=="sessions" || page_=="detail") redraw();
     }
 private:
     Cluster cluster_;
@@ -480,8 +494,12 @@ private:
     std::jthread usage_worker_;
     std::jthread sessions_worker_;
     std::optional<Json> sessions_snapshot_;
+    fatfish::DesktopMonitor desktop_monitor_;
+    std::wstring sessions_error_;
     std::uint64_t snapshot_generation_=0,sessions_generation_=0;
-    ULONGLONG next_live_poll_=0;
+    std::int64_t session_sync_at_=0;
+    int session_live_checked_=0,session_live_stale_=0;
+    bool refresh_requested_=false,sessions_timer_ready_=false;
     bool usage_busy_=false;
     std::optional<Json> result_;
     std::function<void(Json)> callback_;
@@ -646,7 +664,7 @@ private:
         ++snapshot_generation_;
         try {
             auto snapshot=cluster_.desktop_snapshot();
-            apply_sessions(snapshot);
+            if (!session_sync_at_) apply_sessions(snapshot);
             settings_=std::move(snapshot.at("settings"));
             update_pools();
         } catch (const std::exception& e) { notice_ = widen(e.what()); }
@@ -666,6 +684,15 @@ private:
         replace(List::running,running_,"running");
         replace(List::pending,pending_,"pending");
         overview_=std::move(snapshot.at("overview"));
+        if (page_=="detail" && selected_.is_object()) {
+            for (const auto* list:{&running_,&pending_}) {
+                const auto current=std::ranges::find_if(*list,[&](const Json& row){return row.at("id")==selected_.at("id");});
+                if (current==list->end()) continue;
+                if (selected_.at("resultVersion")!=current->at("resultVersion")) clear_result();
+                selected_=*current;
+                break;
+            }
+        }
     }
     void update_pools() {
         pools_.clear();
@@ -694,6 +721,7 @@ private:
         notice_.clear();
         if (page_ == "connection") load_connection();
         redraw();
+        if (page_=="sessions") refresh_sessions_automatically();
     }
     void clear_result() {
         output_.clear();
@@ -811,13 +839,24 @@ private:
             auto model_name=title(row,"model");
             if (model_name.empty()) model_name=L"—";
             label(std::move(model_name),model,line+7,state-model-8,13,surface,ColorToken::text_secondary);
-            label(L"● "+status(row),state,line+7,time_column?76.f:78.f,12,surface,status_color(row));
+            label((row.value("stale",false)?L"◌ ":L"● ")+status(row),state,line+7,time_column?76.f:78.f,12,surface,status_color(row));
             if (time_column) label(local_stamp(row.value(running?"updated":"completed",std::int64_t(0))),
                 time,line+7,92,12,surface,ColorToken::text_secondary);
         }
     }
     void session_page(float x,float right,float h) {
-        label(L"每 5 秒自动刷新",right-224,27,108,12,"root",ColorToken::text_secondary);
+        std::wstring sync_state;
+        auto color=ColorToken::text_secondary;
+        if (sessions_worker_.joinable()) sync_state=L"正在同步会话…";
+        else if (!sessions_error_.empty()) {sync_state=L"同步失败 · "+sessions_error_;color=ColorToken::status_warning;}
+        else if (!sessions_timer_ready_) {sync_state=L"自动同步不可用";color=ColorToken::status_warning;}
+        else if (!session_sync_at_) sync_state=L"等待首次同步";
+        else {
+            sync_state=L"最近同步 "+local_stamp(session_sync_at_,L"%H:%M:%S");
+            if (session_live_stale_) {sync_state+=L" · "+std::to_wstring(session_live_stale_)+L" 条实时状态未确认";color=ColorToken::status_warning;}
+            else if (session_live_checked_) sync_state+=L" · 已校验实时状态";
+        }
+        label(std::move(sync_state),right-418,27,302,12,"root",color);
         button("sync",L"同步会话",right-104,20,104);
         const auto usage=overview_.value("usage",Json::object());
         const auto total=usage.value("total",Json::object());
@@ -1023,7 +1062,8 @@ private:
             panel("session_detail",{x,64,right,219});
             label(title(selected_,"title"),left,76,inner,19,"session_detail",ColorToken::text_primary,true);
             const auto batch=title(selected_,"batch"), version=title(selected_,"resultVersion");
-            label(status(selected_)+(batch.empty()?L"":L"  ·  批次 "+batch)+(version.empty()?L"":L"  ·  结果版本 "+version),
+            label(status(selected_)+(selected_.value("stale",false)?L"（登记或上次状态）":L"")+
+                (batch.empty()?L"":L"  ·  批次 "+batch)+(version.empty()?L"":L"  ·  结果版本 "+version),
                 left,107,inner,13,"session_detail",status_color(selected_));
             label(L"工作区  "+title(selected_,"workspace"),left,132,inner,13,"session_detail",ColorToken::text_secondary);
             const bool linked=selected_.contains("dshId");
@@ -1141,12 +1181,7 @@ private:
             }
             if (name.starts_with("row.")) {selected_=visible_sessions_.at(std::stoul(name.substr(4)));clear_result();nav("detail");return;}
             if (name=="sync") {
-                sync_usage();
-                call("cluster_refresh_sessions",Json::object(),[this](Json value) {
-                    local_snapshot();
-                    notice_=L"已读取 Codex 登记并同步 "+std::to_wstring(value.at("sessions").size())+L" 个本地会话";
-                    if (!value.at("errors").empty()) notice_+=L" · 有会话待同步";
-                });
+                refresh_sessions_automatically(true);
             } else if (name=="import") {
                 call("cluster_import_models",page_=="connection"?paths():Json::object(),[this](Json value) {
                     std::erase_if(fields_,[](const auto& entry){return entry.first.starts_with("schedule.");});

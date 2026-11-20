@@ -44,3 +44,14 @@ target_link_libraries(FatFishBox PRIVATE fatfish_core NativeUI::UI user32 ole32 
 install(TARGETS FatFishBox RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(DIRECTORY skills DESTINATION .)
+
+if(BUILD_TESTING)
+    find_program(NODE_EXECUTABLE node)
+    if(NODE_EXECUTABLE)
+        add_executable(fatfish_monitor_test tests/monitor-test.cpp)
+        fatfish_target(fatfish_monitor_test)
+        target_link_libraries(fatfish_monitor_test PRIVATE fatfish_core)
+        add_test(NAME session_monitor
+            COMMAND "${NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/session-monitor.mjs" $<TARGET_FILE:fatfish_monitor_test>)
+    endif()
+endif()

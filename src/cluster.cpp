@@ -321,7 +321,8 @@ Json telemetry_overview(const Json& sessions,const Json& legacy_cache) {
             const auto found=legacy_cache.find(row.at("id").get<std::string>());
             if (found==legacy_cache.end()) {++missing;continue;}
             sample=&*found;
-            if (sample->value("stale",false) || sample->value("updated",std::int64_t(0))!=row.at("updated") ||
+            if (sample->value("stale",false) || sample->value("updated",std::int64_t(0))!=
+                row.value("registryUpdated",row.at("updated").get<std::int64_t>()) ||
                 (active(row) && now()-sample->value("observed",std::int64_t(0))>120000)) ++missing;
             else if (sample->value("tokenDay",std::int64_t(0))!=today) ++missing;
         } else if (row.contains("startCursor") && (!row.contains("usage") ||
@@ -339,7 +340,7 @@ Json telemetry_overview(const Json& sessions,const Json& legacy_cache) {
     return {{"total",usage},{"todayTokens",total},{"hourlyTokens",hours>0 && (today_sampled || !missing)?
         Json(double(total)/hours):Json(nullptr)},{"missing",missing},{"sampled",sampled}};
 }
-Json refresh(const fs::path& data, const std::string& key,int timeout_ms=15000) {
+Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bool include_history_usage=true) {
     Json settings, prior;
     {
         Database db(data, false);
@@ -361,21 +362,10 @@ Json refresh(const fs::path& data, const std::string& key,int timeout_ms=15000) 
     else if (cursor <= start) status = "queued";
     else {
         status = "unknown";
-        const auto page = dsh.request("session/page", {{"address",{{"kind","session"},{"sessionId",prior.at("dshId")}}},
-            {"throughSeq",cursor},{"maxMessages",4}});
-        const auto& records = page.at("records");
-        for (auto it = records.rbegin(); it != records.rend(); ++it) {
-            if (!it->contains("event")) continue;
-            const auto& event = it->at("event");
-            auto seq = event.value("seq", std::int64_t(-1));
-            if (seq <= start || event.value("type", "") == "turn/start") break;
-            if (event.value("type", "") != "turn/end") continue;
-            const auto reason = event.at("data").at("reason").value("kind","");
-            status = reason == "completed" ? "succeeded"
-                : reason == "aborted" || reason == "cancelled" ? "cancelled" : "failed";
-            version = std::to_string(start) + ":" + std::to_string(seq);
-            completed = event.value("time", completed);
-            break;
+        if (const auto ending=latest_turn_end(dsh,prior.at("dshId"),start,cursor)) {
+            status=ending->status;
+            version=std::to_string(start)+":"+std::to_string(ending->seq);
+            if (ending->time>0) completed=ending->time;
         }
     }
     const auto today=midnight();
@@ -389,11 +379,13 @@ Json refresh(const fs::path& data, const std::string& key,int timeout_ms=15000) 
         if (prior.value("created",std::int64_t(0))>=today) tokens=sum;
         else if (prior.value("tokenDay",std::int64_t(0))==today && prior.value("cursor",start)==cursor &&
                  prior.contains("todayTokens")) tokens=prior.at("todayTokens").get<std::uint64_t>();
-        else tokens=day_usage(dsh,prior,cursor,today);
+        else if (include_history_usage) tokens=day_usage(dsh,prior,cursor,today);
     } catch (const std::exception&) {}
     Database db(data, true);
     auto& row = db.state["sessions"].at(key);
-    if (row.value("cursor", start) <= cursor && row.at("startCursor") == start) {
+    if (row.value("cursor",start)<=cursor && row.at("startCursor")==start &&
+        (row.value("cursor",start)<cursor || row.at("status")==prior.at("status"))) {
+        const auto before=row;
         row["status"] = status;
         row["cursor"] = cursor;
         if (usage.is_object()) row["usage"]=usage;
@@ -404,8 +396,10 @@ Json refresh(const fs::path& data, const std::string& key,int timeout_ms=15000) 
             row["processed"] = false;
             row["completed"] = version.empty() ? 0 : completed;
         }
-        row["updated"] = now();
-        db.save();
+        if (row!=before) {
+            if (row.at("status")!=before.at("status") || row.at("cursor")!=before.value("cursor",Json())) row["updated"]=now();
+            db.save();
+        }
     }
     return public_row(row);
 }
@@ -430,13 +424,63 @@ Json session_overview(const Json& settings,const Json& sessions,const LegacySess
         {"codexSessions",legacy.rows.size()},{"codexSources",legacy.sources},{"unreadableCodexSources",legacy.unreadable},
         {"usage",telemetry_overview(sessions,legacy_usage_cache(data))}};
 }
+std::pair<int,int> refresh_desktop_native(const fs::path& data,DesktopMonitor& monitor,std::stop_token stop) {
+    std::vector<std::pair<std::int64_t,std::string>> candidates;
+    {
+        Database db(data,false);
+        const auto& rows=db.state.at("sessions");
+        std::erase_if(monitor.native_attempts,[&](const auto& item) {return !rows.contains(item.first);});
+        for (const auto& row:rows) {
+            if (!active(row) || !row.contains("startCursor")) continue;
+            const auto key=row.at("id").get<std::string>();
+            candidates.emplace_back(monitor.native_attempts[key],key);
+        }
+    }
+    std::sort(candidates.begin(),candidates.end());
+    if (candidates.size()>24) candidates.resize(24);
+    std::atomic_size_t next{};
+    std::atomic_int checked{},failed{};
+    const auto deadline=GetTickCount64()+3000;
+    std::vector<std::jthread> workers;
+    for (std::size_t i=0;i<std::min<std::size_t>(8,candidates.size());++i) {
+        workers.emplace_back([&] {
+            while (!stop.stop_requested() && GetTickCount64()<deadline) {
+                const auto index=next.fetch_add(1);
+                if (index>=candidates.size()) return;
+                try {refresh(data,candidates[index].second,1100,false); ++checked;}
+                catch (const std::exception&) {++failed;}
+            }
+        });
+    }
+    for (auto& worker:workers) worker.join();
+    for (std::size_t i=0;i<std::min(next.load(),candidates.size());++i)
+        monitor.native_attempts.at(candidates[i].second)=now();
+    return {checked.load(),failed.load()};
+}
 }
 
-Json Cluster::desktop_snapshot() const {
-    Database db(data_,false);
-    const auto& settings=db.state.at("settings");
-    auto sessions=db.state.at("sessions");
-    const auto legacy=read_legacy_sessions(settings);
+Json Cluster::desktop_snapshot(DesktopMonitor* monitor,std::stop_token stop) const {
+    Json settings,sessions;
+    std::pair<int,int> native{};
+    std::jthread native_worker;
+    std::exception_ptr native_error;
+    if (monitor) native_worker=std::jthread([&] {
+        try { native=refresh_desktop_native(data_,*monitor,stop); }
+        catch (...) { native_error=std::current_exception(); }
+    });
+    {
+        Database db(data_,false);
+        settings=db.state.at("settings");
+        if (!monitor) sessions=db.state.at("sessions");
+    }
+    const auto legacy=read_legacy_sessions(settings,false,monitor?&monitor->legacy:nullptr,stop);
+    if (monitor) {
+        native_worker.join();
+        if (native_error) std::rethrow_exception(native_error);
+        Database db(data_,false);
+        settings=db.state.at("settings");
+        sessions=db.state.at("sessions");
+    }
     sessions.update(legacy.rows);
     std::vector<Json> running,pending;
     for (const auto& row:sessions) {
@@ -449,23 +493,8 @@ Json Cluster::desktop_snapshot() const {
     std::sort(running.begin(),running.end(),[&](const Json& a,const Json& b) {return order(a,"updated")>order(b,"updated");});
     std::sort(pending.begin(),pending.end(),[&](const Json& a,const Json& b) {return order(a,"completed")<order(b,"completed");});
     return {{"overview",session_overview(settings,sessions,legacy,data_)},{"settings",settings},
-        {"running",std::move(running)},{"pending",std::move(pending)}};
-}
-
-void Cluster::poll_desktop_session() const {
-    std::optional<std::pair<std::int64_t,std::string>> oldest;
-    {
-        Database db(data_,false);
-        for (const auto& row:db.state.at("sessions")) {
-            if (!active(row) || !row.contains("startCursor")) continue;
-            const auto candidate=std::pair(row.at("updated").get<std::int64_t>(),row.at("id").get<std::string>());
-            if (!oldest || candidate<*oldest) oldest=candidate;
-        }
-    }
-    if (oldest) {
-        try { refresh(data_,oldest->second,2500); }
-        catch (const std::exception&) {}
-    }
+        {"running",std::move(running)},{"pending",std::move(pending)},
+        {"liveChecked",legacy.live_checked+native.first},{"liveStale",legacy.live_stale+native.second}};
 }
 
 void Cluster::refresh_legacy_usage(std::stop_token stop) const {
@@ -554,11 +583,15 @@ void Cluster::refresh_legacy_usage(std::stop_token stop) const {
 Json Cluster::invoke(std::string_view tool, const Json& input) const {
     require(input.is_object(), "工具参数必须为 JSON 对象");
     if (tool == "cluster_overview" || tool == "cluster_get_settings") {
-        Database db(data_, false);
-        const auto& settings = db.state.at("settings");
-        if (tool == "cluster_get_settings") return settings;
-        auto sessions = db.state.at("sessions");
-        const auto legacy = read_legacy_sessions(settings);
+        Json settings,sessions;
+        {
+            Database db(data_,false);
+            settings=db.state.at("settings");
+            if (tool=="cluster_get_settings") return settings;
+            sessions=db.state.at("sessions");
+        }
+        LegacyObservations observations;
+        const auto legacy=read_legacy_sessions(settings,false,&observations);
         sessions.update(legacy.rows);
         return session_overview(settings,sessions,legacy,data_);
     }
@@ -580,15 +613,21 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
         auto queue=fs::exists(queue_file)?read_json(queue_file):Json::object();
         auto claim=queue.value("claim",Json::object());
         auto snapshot=[&] {
-            Database db(data_,false);
-            auto rows=db.state.at("sessions");
-            rows.update(read_legacy_sessions(db.state.at("settings")).rows);
+            Json rows,settings;
+            {
+                Database db(data_,false);
+                settings=db.state.at("settings");
+                rows=db.state.at("sessions");
+            }
+            LegacyObservations observations;
+            rows.update(read_legacy_sessions(settings,false,&observations).rows);
             return rows;
         };
         auto present=[&](const Json& current) {
             const auto key=current.at("sessionId").get<std::string>();
             const auto row=invoke("cluster_refresh_session",{{"sessionId",key}});
-            require(row.at("resultVersion")==current.at("resultVersion") && !active(row),"领取的结果版本已变化");
+            require(row.at("resultVersion")==current.at("resultVersion") && !active(row) && !row.value("stale",false),
+                "领取的结果版本已变化或无法确认");
             const auto report=invoke("cluster_read_result",{{"sessionId",key}});
             require(report.at("resultVersion")==current.at("resultVersion"),"领取的结果版本已变化");
             return Json{{"claimToken",current.at("claimToken")},{"expiresAt",current.at("expiresAt")},
@@ -612,9 +651,9 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             if (claim.at("claimToken")!=token) return {{"busy",true},{"expiresAt",claim.at("expiresAt")}};
             const auto key=claim.at("sessionId").get<std::string>();
             const auto version=claim.at("resultVersion").get<std::string>();
-            if (!key.starts_with("codex:")) refresh(data_,key);
-            const auto rows=snapshot();
-            if (!rows.contains(key) || rows.at(key).at("resultVersion")!=version || active(rows.at(key))) {
+            const auto current=invoke("cluster_refresh_session",{{"sessionId",key}});
+            require(!current.value("stale",false),"暂时无法确认已领取的结果，请重试");
+            if (current.at("resultVersion")!=version || active(current)) {
                 queue.erase("claim");
                 write_state_file(queue_file,queue);
                 return {{"changed",true}};
@@ -637,25 +676,34 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
             write_state_file(queue_file,queue);
         } else require(token.empty(),"领取凭据过期，请重新领取");
 
-        const auto rows=snapshot();
-        const Json* oldest=nullptr;
+        auto rows=snapshot();
+        std::vector<Json> pending;
         const auto sort_key=[](const Json& row) {
             return std::pair(row.value("completed",std::int64_t(0)),row.at("id").get<std::string>());
         };
-        for (const auto& row:rows) {
+        for (auto& row:rows) {
             if (active(row) || row.value("processed",false) || row.value("resultVersion","").empty()) continue;
-            if (!oldest || sort_key(row)<sort_key(*oldest)) oldest=&row;
+            pending.push_back(std::move(row));
         }
-        if (!oldest) return {{"empty",true},{"completed",!token.empty()}};
-        claim={{"source",oldest->value("source","fatfishbox")},{"sessionId",oldest->at("id")},
-            {"resultVersion",oldest->at("resultVersion")},{"claimToken",id()},
-            {"expiresAt",now()+30*60*1000}};
-        auto result=present(claim);
-        queue["claim"]=claim;
-        if (!token.empty()) queue["nextToken"]=claim.at("claimToken");
-        write_state_file(queue_file,queue);
-        result["completed"]=!token.empty();
-        return result;
+        std::ranges::sort(pending,[&](const Json& a,const Json& b){return sort_key(a)<sort_key(b);});
+        for (const auto& candidate:pending) {
+            auto row=candidate;
+            if (row.value("source","")=="codex") {
+                row=invoke("cluster_refresh_session",{{"sessionId",candidate.at("id")}});
+                if (row.value("stale",false) || active(row) || row.value("processed",false) ||
+                    row.at("resultVersion")!=candidate.at("resultVersion")) continue;
+            }
+            claim={{"source",row.value("source","fatfishbox")},{"sessionId",row.at("id")},
+                {"resultVersion",row.at("resultVersion")},{"claimToken",id()},
+                {"expiresAt",now()+30*60*1000}};
+            auto result=present(claim);
+            queue["claim"]=claim;
+            if (!token.empty()) queue["nextToken"]=claim.at("claimToken");
+            write_state_file(queue_file,queue);
+            result["completed"]=!token.empty();
+            return result;
+        }
+        return {{"empty",true},{"completed",!token.empty()}};
     }
     if (tool == "cluster_get_presets" || tool == "cluster_import_models") {
         Json settings;
@@ -852,10 +900,10 @@ Json Cluster::invoke(std::string_view tool, const Json& input) const {
     }
     const auto key = field(input,"sessionId",100);
     if (key.starts_with("codex:")) {
-        Database db(data_, false);
-        const auto& settings = db.state.at("settings");
+        const auto settings=invoke("cluster_get_settings");
         if (tool == "cluster_read_result") return legacy_result(settings,key);
-        if (tool == "cluster_get_session" || tool == "cluster_refresh_session")
+        if (tool == "cluster_refresh_session") return live_legacy_session(settings,key);
+        if (tool == "cluster_get_session")
             return read_legacy_sessions(settings).rows.at(key);
         throw std::runtime_error("此会话属于原 Codex 插件，请在原插件中取消或确认");
     }

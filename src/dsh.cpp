@@ -1,7 +1,8 @@
 #include "dsh.h"
 #include <windows.h>
 #include <winhttp.h>
-#include <fstream>
+#include <algorithm>
+#include <memory>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -33,11 +34,24 @@ std::string text(const Json& value, const Json::json_pointer& path) {
 }
 
 Json read_json(const fs::path& path, std::size_t limit) {
-    if (!path.is_absolute() || !fs::is_regular_file(path) || fs::file_size(path) > limit)
-        throw std::runtime_error("文件路径无效、不可读或超过大小限制");
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("无法读取配置文件");
-    return Json::parse(input);
+    if (!path.is_absolute()) throw std::runtime_error("文件路径必须是绝对路径");
+    const auto handle=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
+    if (handle==INVALID_HANDLE_VALUE) throw std::runtime_error("无法读取本地文件");
+    const std::unique_ptr<void,decltype(&CloseHandle)> file(handle,CloseHandle);
+    LARGE_INTEGER size{};
+    if (GetFileType(file.get())!=FILE_TYPE_DISK || !GetFileSizeEx(file.get(),&size) ||
+        size.QuadPart<0 || static_cast<std::uint64_t>(size.QuadPart)>limit)
+        throw std::runtime_error("本地文件无效或超过大小限制");
+    std::string bytes(static_cast<std::size_t>(size.QuadPart),'\0');
+    for (std::size_t offset=0;offset<bytes.size();) {
+        DWORD read=0;
+        const auto count=static_cast<DWORD>(std::min<std::size_t>(bytes.size()-offset,1024*1024));
+        if (!ReadFile(file.get(),bytes.data()+offset,count,&read,nullptr) || !read)
+            throw std::runtime_error("读取期间本地文件发生变化");
+        offset+=read;
+    }
+    return Json::parse(bytes);
 }
 
 DshConnection discover(const Json& settings, const Json& input) {
@@ -47,13 +61,20 @@ DshConnection discover(const Json& settings, const Json& input) {
     if (!result.config.empty()) {
         auto config = read_json(result.config);
         auto auth = text(config, "/service/attachAuthFile"_json_pointer);
-        if (!auth.empty()) result.auth = result.config.parent_path() / path_from_utf8(auth);
+        if (!auth.empty()) result.auth = config_relative_path(result.config,auth);
         result.permission = text(config, "/permissions/preset"_json_pointer);
         result.preset = text(config, "/profile/agentPreset"_json_pointer);
     }
     auto auth = input.value("authPath", input.contains("configPath") ? "" : settings.value("authPath", ""));
     if (!auth.empty()) result.auth = path_from_utf8(auth);
     return result;
+}
+
+fs::path config_relative_path(const fs::path& config,std::string_view value) {
+    if (value.empty()) return {};
+    if (value.starts_with("~/") || value.starts_with("~\\"))
+        return (fs::path(env(L"USERPROFILE")) / path_from_utf8(value.substr(2))).lexically_normal();
+    return (config.parent_path() / path_from_utf8(value)).lexically_normal();
 }
 
 Dsh::Dsh(const fs::path& auth_path,int timeout_ms):timeout_ms_(timeout_ms) {
@@ -113,11 +134,61 @@ Json Dsh::call(std::string_view method, const Json& args) const {
         verify(WinHttpReadData(request.handle, buffer.data(), static_cast<DWORD>(buffer.size()), &read), "DSH 响应读取失败");
         if (!read) break;
         body.append(buffer.data(), read);
-        if (body.size() > 4 * 1024 * 1024) throw std::runtime_error("DSH 响应超过大小上限");
+        if (body.size() > 4 * 1024 * 1024) throw std::length_error("DSH 响应超过大小上限");
     }
     const auto envelope = Json::parse(body);
     const auto& result = envelope.at("result");
-    if (!result.value("ok", false)) throw std::runtime_error("DSH 拒绝了 " + std::string(method));
+    if (!result.value("ok", false)) {
+        const auto error=result.find("error");
+        if (error!=result.end() && error->is_object() && error->value("code","")=="response_too_large")
+            throw std::length_error("DSH 响应超过大小上限");
+        throw std::runtime_error("DSH 拒绝了 " + std::string(method));
+    }
     return result.value("value", Json(nullptr));
+}
+
+std::optional<TurnEnd> latest_turn_end(const Dsh& dsh,const Json& session_id,
+                                      std::int64_t start,std::int64_t cursor) {
+    if (cursor<=start) return {};
+    Json args{{"address",{{"kind","session"},{"sessionId",session_id}}},{"throughSeq",cursor},{"maxMessages",4}};
+    for (int page_number=0;page_number<3;++page_number) {
+        Json page;
+        for (;;) {
+            try { page=dsh.request("session/page",args);break; }
+            catch (const std::length_error&) {
+                auto size=args.at("maxMessages").get<int>();
+                if (size<=1) throw;
+                args["maxMessages"]=size/2;
+            }
+        }
+        const auto& records=page.at("records");
+        if (!records.is_array()) throw std::runtime_error("DSH 历史记录格式无效");
+        const auto before=args.value("beforeSeq",std::numeric_limits<std::int64_t>::max());
+        std::vector<const Json*> events;
+        for (const auto& wrapper:records) {
+            const auto event=wrapper.find("event");
+            if (event==wrapper.end() || !event->is_object()) continue;
+            const auto seq=event->value("seq",std::int64_t(-1));
+            if (seq>=0 && seq<=cursor && seq<before) events.push_back(&*event);
+        }
+        std::sort(events.begin(),events.end(),[](const Json* a,const Json* b){return a->at("seq")>b->at("seq");});
+        for (const auto* event:events) {
+            const auto seq=event->at("seq").get<std::int64_t>();
+            const auto type=event->value("type","");
+            if (seq<=start || type=="turn/start") return {};
+            if (type!="turn/end") continue;
+            const auto reason=event->at("data").at("reason").value("kind","");
+            std::string status;
+            if (reason=="completed") status="succeeded";
+            else if (reason=="aborted" || reason=="cancelled" || reason=="canceled") status="cancelled";
+            else if (reason=="interrupted" || reason=="forked") status="interrupted";
+            else if (reason=="blocked" || reason=="error" || reason=="max-tokens") status="failed";
+            else return {};
+            return TurnEnd{std::move(status),seq,event->value("time",std::int64_t(0))};
+        }
+        if (events.empty() || !page.value("hasMore",false)) break;
+        args["beforeSeq"]=events.back()->at("seq");
+    }
+    return {};
 }
 }
