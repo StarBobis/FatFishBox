@@ -1,6 +1,8 @@
 #include "cluster.h"
 #include "mcp.h"
+#include "resource.h"
 #include <native_ui/button.h>
+#include <native_ui/image.h>
 #include <native_ui/navigation_view.h>
 #include <native_ui/renderer.h>
 #include <native_ui/text_box.h>
@@ -28,6 +30,15 @@ using fatfish::widen;
 constexpr UINT finished = WM_APP + 1;
 constexpr std::array roles{"developer","reviewer","repair","support"};
 constexpr std::array role_names{L"开发",L"评审",L"返修",L"协助"};
+std::shared_ptr<ImageSource> embedded_logo() {
+    const auto module=GetModuleHandleW(nullptr);
+    const auto resource=FindResourceW(module,MAKEINTRESOURCEW(IDR_FATFISHBOX_LOGO),RT_RCDATA);
+    if (!resource) return {};
+    const auto loaded=LoadResource(module,resource);
+    const auto* bytes=static_cast<const std::uint8_t*>(loaded?LockResource(loaded):nullptr);
+    if (!bytes) return {};
+    return ImageSource::decode({bytes,SizeofResource(module,resource)});
+}
 std::wstring title(const Json& object, const char* member) {
     return widen(object.value(member, ""));
 }
@@ -56,6 +67,7 @@ public:
     ~App() { if (worker_.joinable()) worker_.join(); }
     void init() {
         model_.theme = Theme::dark;
+        logo_ = embedded_logo();
         renderer_.initialize();
         redraw();
         reload();
@@ -193,6 +205,7 @@ private:
     WidgetLayout layout_{1,1};
     TitleBar title_bar_;
     NavigationView navigation_;
+    std::shared_ptr<ImageSource> logo_;
     std::map<std::string,std::wstring> fields_;
     Json roster_ = Json::object(), settings_ = Json::object(), overview_ = Json::object(), editing_, selected_;
     std::vector<std::pair<bool,Json>> pools_;
@@ -328,6 +341,13 @@ private:
         model_.ui.surfaces.clear();
         panel("root",{0,0,w,client_height},SurfaceVisual::transparent);
         title_bar_.append(model_,w);
+        if (logo_ && logo_->status()==ImageStatus::ready) {
+            const auto icon=std::ranges::find(model_.ui.widgets,"titlebar.icon",&Widget::key);
+            if (icon!=model_.ui.widgets.end()) {
+                icon->bounds={icon->bounds.left-2,icon->bounds.top-2,icon->bounds.right+2,icon->bounds.bottom+2};
+                Image({.source=logo_,.width=20,.height=20,.description=L"肥鱼重工"}).apply(*icon);
+            }
+        }
         const auto selected_page=page_=="pools" || page_=="edit" ? "pools" :
             page_=="connection" ? "connection" : "sessions";
         NavigationViewOptions navigation;
@@ -663,7 +683,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         App app;
         WNDCLASSEXW wc{sizeof(wc)};
         wc.hInstance=instance;wc.lpfnWndProc=dispatch_window;wc.lpszClassName=L"FatFishBoxWindow";
-        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
+        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+        wc.hIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_FATFISHBOX),IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON),LR_SHARED));
+        wc.hIconSm=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_FATFISHBOX),IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_SHARED));
         if (!RegisterClassExW(&wc)) throw std::runtime_error("窗口类注册失败");
         const auto hwnd=CreateWindowExW(0,wc.lpszClassName,L"肥鱼重工",WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,CW_USEDEFAULT,1200,800,nullptr,nullptr,instance,&app);

@@ -1,1 +1,5 @@
+#include "resource.h"
+
 1 24 "app.manifest"
+IDI_FATFISHBOX ICON "app.ico"
+IDR_FATFISHBOX_LOGO RCDATA "icon.png"
