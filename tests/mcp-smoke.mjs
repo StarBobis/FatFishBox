@@ -18,6 +18,7 @@ let rejectProvider = '';
 let hiddenProvider = '';
 let deliveryReport = false;
 let submittedPrompt = '';
+let forcedState;
 const sha='0123456789abcdef0123456789abcdef01234567';
 const delivery=(path)=>'\n```fatfish-delivery\n'+JSON.stringify({candidateSha:sha,worktreeClean:true,
     tests:[{command:'ctest -R mask',exitCode:0}],evidencePaths:[path]})+'\n```';
@@ -55,7 +56,7 @@ const server = createServer(async (req,res) => {
         selected = args.request; value = {selected}; break;
     case 'session/state':
         value=args.request.sessionId==='stale-slot' ? {cursor:7,running:false,queue:[],pendingInput:[]} :
-            {cursor:terminal?7:running?2:1,running,queue:[],pendingInput:[]};
+            forcedState ?? {cursor:terminal?7:running?2:1,running,queue:[],pendingInput:[]};
         break;
     case 'session/prompt': running = true; prompts++; submittedPrompt=args.request.content[0].text; value = {accepted:true}; break;
     case 'session/page': value = {records:[
@@ -302,7 +303,35 @@ try {
     assert.deepEqual(acceptance.repair.delivery.evidencePaths,[join(root,'repair.png')]);
     const followingClaim=await repair.tool('cluster_next_handoff',{claimToken:reclaimed.claimToken,outcome:'Verified cumulative build and real window.'});
     assert.equal(followingClaim.session.id,'codex:follows-repair');
+    running=false;terminal=false;
+    const existing=await repair.tool('cluster_start_session',{...args,workspace:d,batch:following.batchId});
+    const attach={claimToken:followingClaim.claimToken,originalVersion:followingClaim.session.resultVersion,sessionId:existing.id};
+    const previousPromptCount=prompts;
+    await repair.tool('cluster_attach_handoff_repair',{...attach,claimToken:'wrong'},true);
+    await repair.tool('cluster_attach_handoff_repair',{...attach,originalVersion:'wrong'},true);
+    await repair.tool('cluster_attach_handoff_repair',{...attach,sessionId:launched.session.id},true);
+    const attachedRepair=await repair.tool('cluster_attach_handoff_repair',attach);
+    assert.equal(attachedRepair.handoffState,'repairing');
+    assert.equal(attachedRepair.replayed,false);
+    assert.equal((await repair.tool('cluster_attach_handoff_repair',attach)).replayed,true);
+    assert.equal(prompts,previousPromptCount,'binding must not dispatch another prompt');
+    await repair.tool('cluster_get_session_status',{sessionId:'unknown'},true);
+    for (const [status,flags] of [
+        ['queued',{cursor:1,queue:[{}]}],['running',{cursor:2,running:true}],['waiting_input',{cursor:3,pendingInput:[{}]}],
+        ['succeeded',{cursor:7}],
+    ]) {
+        forcedState={running:false,queue:[],pendingInput:[],...flags};
+        const observed=await repair.tool('cluster_get_session_status',{sessionId:existing.id});
+        assert.deepEqual(Object.keys(observed).sort(),['sessionId','stale','status','terminal','updated']);
+        assert.equal(observed.status,status);
+        assert.equal(observed.stale,false);
+        assert.equal(observed.terminal,status==='succeeded');
+    }
+    const linked=(await repair.tool('cluster_next_handoff',{claimToken:attach.claimToken}));
+    assert.equal(linked.handoffState,'awaiting_acceptance');
+    assert.equal(linked.repair.session.id,existing.id);
     assert.equal((await repair.tool('cluster_next_handoff',{claimToken:followingClaim.claimToken,outcome:'Verified.'})).empty,true);
+    forcedState=undefined;
     const workflow=await repair.rpc('resources/read',{uri:'fatfish://workflow'});
     for (const marker of ['git worktree add','allowedPoolIds','cluster_repair_handoff','实窗验收'])
         assert.ok(workflow.contents[0].text.includes(marker));
