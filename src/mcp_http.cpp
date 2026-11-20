@@ -1,10 +1,7 @@
 #include <httplib.h>
 #include <windows.h>
-#include <bcrypt.h>
 #include "mcp.h"
-#include <array>
 #include <charconv>
-#include <fstream>
 #include <stdexcept>
 #include <thread>
 
@@ -22,60 +19,17 @@ int port_number() {
     return port;
 }
 
-std::string read_token(const fs::path& file) {
-    std::array<char,65> bytes{};
-    std::ifstream stream(file,std::ios::binary);
-    stream.read(bytes.data(),bytes.size());
-    if (stream.bad() || stream.gcount()!=64 ||
-        !std::all_of(bytes.begin(),bytes.begin()+64,[](char ch){return (ch>='0' && ch<='9') || (ch>='a' && ch<='f');}))
-        throw std::runtime_error("MCP 令牌文件无效或不可读取");
-    return {bytes.data(),64};
-}
-
-std::string load_token(const fs::path& folder) {
-    const auto file=folder/L"mcp-http.token";
-    if (fs::exists(file)) return read_token(file);
-    std::array<unsigned char,32> entropy{};
-    if (BCryptGenRandom(nullptr,entropy.data(),static_cast<ULONG>(entropy.size()),BCRYPT_USE_SYSTEM_PREFERRED_RNG)!=0)
-        throw std::runtime_error("MCP 令牌生成失败");
-    constexpr char digits[]="0123456789abcdef";
-    std::string value;
-    for (const auto byte:entropy) { value+=digits[byte>>4]; value+=digits[byte&15]; }
-    const auto temp=folder/path_from_utf8("mcp-token-"+id()+".tmp");
-    try {
-        std::ofstream stream(temp,std::ios::binary);
-        stream.write(value.data(),static_cast<std::streamsize>(value.size()));
-        stream.close();
-        if (!stream) throw std::runtime_error("MCP 令牌写入失败");
-        if (MoveFileExW(temp.c_str(),file.c_str(),MOVEFILE_WRITE_THROUGH)) return value;
-        if (!fs::exists(file)) throw std::runtime_error("MCP 令牌保存失败");
-    } catch (...) {
-        std::error_code ignored;
-        fs::remove(temp,ignored);
-        throw;
-    }
-    std::error_code ignored;
-    fs::remove(temp,ignored);
-    return read_token(file);
-}
-
-bool token_matches(std::string_view supplied,std::string_view expected) {
-    if (supplied.size()!=expected.size()) return false;
-    unsigned difference{};
-    for (std::size_t i=0;i<expected.size();++i) difference|=supplied[i]^expected[i];
-    return !difference;
-}
 }
 
 struct McpHttpServer::Impl {
     const int port;
-    const std::string host, local_host, key;
+    const std::string host, local_host;
     httplib::Server server;
     std::thread worker;
 
     explicit Impl(const Cluster& cluster)
         : port(port_number()),host("127.0.0.1:"+std::to_string(port)),
-          local_host("localhost:"+std::to_string(port)),key(load_token(cluster.data_directory())) {
+          local_host("localhost:"+std::to_string(port)) {
         server.set_address_family(AF_INET);
         server.set_socket_options([](socket_t socket) {
             httplib::set_socket_opt(socket,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,1);
@@ -85,7 +39,7 @@ struct McpHttpServer::Impl {
         server.set_write_timeout(5,0);
         server.set_keep_alive_max_count(1);
         server.new_task_queue=[] { return new httplib::ThreadPool(4,4,16); };
-        server.set_pre_routing_handler([this,bearer="Bearer "+key](const httplib::Request& request,httplib::Response& response) {
+        server.set_pre_routing_handler([this](const httplib::Request& request,httplib::Response& response) {
             using enum httplib::Server::HandlerResponse;
             if (request.path!="/mcp") return Unhandled;
             response.set_header("Cache-Control","no-store");
@@ -95,12 +49,6 @@ struct McpHttpServer::Impl {
                 request.get_header_value_count("Origin")>1 ||
                 (request.has_header("Origin") && origin!="http://"+host && origin!="http://"+local_host)) {
                 response.status=403;
-                return Handled;
-            }
-            if (request.get_header_value_count("Authorization")!=1 ||
-                !token_matches(request.get_header_value("Authorization"),bearer)) {
-                response.status=401;
-                response.set_header("WWW-Authenticate","Bearer realm=\"FatFishBox\"");
                 return Handled;
             }
             if (request.method!="POST") {
@@ -140,7 +88,6 @@ McpHttpServer::McpHttpServer(const Cluster& cluster):impl_(std::make_unique<Impl
 McpHttpServer::~McpHttpServer()=default;
 void McpHttpServer::wait() { if (impl_->worker.joinable()) impl_->worker.join(); }
 std::string McpHttpServer::url() const { return "http://"+impl_->host+"/mcp"; }
-const std::string& McpHttpServer::token() const { return impl_->key; }
 
 int run_mcp_http() {
     try {

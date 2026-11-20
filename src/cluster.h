@@ -26,7 +26,6 @@ public:
                             const Json& expected,const Json& value) const;
     Json desktop_snapshot(DesktopMonitor* monitor=nullptr,std::stop_token stop={}) const;
     void refresh_legacy_usage(std::stop_token stop) const;
-    const fs::path& data_directory() const { return data_; }
     static Json tools();
 private:
     fs::path data_;

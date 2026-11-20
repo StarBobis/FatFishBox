@@ -16,7 +16,6 @@ public:
     ~McpHttpServer();
     void wait();
     std::string url() const;
-    const std::string& token() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

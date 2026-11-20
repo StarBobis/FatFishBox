@@ -40,7 +40,7 @@ add_executable(FatFishBox WIN32 src/app.cpp src/app.rc src/mcp.cpp src/mcp_http.
 fatfish_target(FatFishBox)
 target_include_directories(FatFishBox SYSTEM PRIVATE "${httplib_SOURCE_DIR}")
 target_link_options(FatFishBox PRIVATE /MANIFEST:NO)
-target_link_libraries(FatFishBox PRIVATE fatfish_core NativeUI::UI user32 ole32 shell32 shcore ws2_32 bcrypt)
+target_link_libraries(FatFishBox PRIVATE fatfish_core NativeUI::UI user32 ole32 shell32 shcore ws2_32)
 install(TARGETS FatFishBox RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(DIRECTORY skills DESTINATION .)
