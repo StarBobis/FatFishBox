@@ -435,7 +435,7 @@ struct PoolSelection {
 };
 PoolSelection choose_pool(const Json& settings,const Json& sessions,const CatalogModels& models,
     const std::set<std::string>& allowed,const std::string& pinned,const Json& cooldowns,
-    const std::map<std::string,std::string>& rejected) {
+    const std::map<std::string,std::string>& rejected,const Json& role_model=Json()) {
     std::vector<std::tuple<int,int,std::string>> scores;
     Json diagnostics{{"pools",Json::array()},{"availablePools",Json::array()}};
     for (const auto& [key, pool] : settings.at("pools").items()) {
@@ -443,6 +443,8 @@ PoolSelection choose_pool(const Json& settings,const Json& sessions,const Catalo
         const auto model=pool.at("model").get<std::string>();
         const auto enabled=pool.at("enabled").get<bool>();
         const bool in_batch=allowed.empty() || allowed.contains(key);
+        const bool role_matches=role_model.is_null() ||
+            (model==role_model.at("model").get<std::string>() && pool.value("effort","")==role_model.value("effort",""));
         if (!enabled && key!=pinned && !allowed.contains(key)) continue;
         int account_count=0,pool_count=0,unverified=0;
         for (const auto& row : sessions) {
@@ -458,7 +460,7 @@ PoolSelection choose_pool(const Json& settings,const Json& sessions,const Catalo
         const auto cap = pool.at("concurrency").get<int>();
         const auto cooldown=cooldowns.value(provider,std::int64_t(0));
         const auto refusal=rejected.find(key);
-        const std::string_view reason=!in_batch?"batch_restricted":!enabled?"disabled":
+        const std::string_view reason=!in_batch?"batch_restricted":!role_matches?"role_model_mismatch":!enabled?"disabled":
             cooldown>now()?"account_cooldown":!models.contains({provider,model})?"model_unavailable":
             refusal!=rejected.end()?std::string_view(refusal->second):pool_count>=cap?"slots_full":"available";
         Json diagnostic{{"poolId",key},{"account",settings.at("accounts").at(provider).value("name",provider)},
@@ -1723,7 +1725,11 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
     resolved["authPath"]=utf8(auth);
     require_ready_dsh(resolved);
     require(settings.at("permission")!="","派发前需要设置并验证 DSH 权限预设");
-    const auto pinned=input.contains("poolId")?field(input,"poolId",100):"";
+    // For a team, poolId identifies the role's model/effort template, not a fixed account.
+    // Dispatch replay above is intentionally unchanged: never move an existing session.
+    const auto configured_pool=input.contains("poolId")?field(input,"poolId",100):"";
+    const auto role_pool=input.contains("teamProjectId")?configured_pool:std::string();
+    const auto pinned=role_pool.empty()?configured_pool:std::string();
     const auto requested=batch_allowlist(input);
     const Dsh dsh(auth,3500,12000);
     CatalogModels models;
@@ -1781,7 +1787,14 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
             cooldowns[cooling_account]=now()+60000;
             db.save();
         }
-        auto choice=choose_pool(current,occupied,models,allowed,pinned,cooldowns,rejected);
+        Json role_model;
+        if (!role_pool.empty()) {
+            require(current.at("pools").contains(role_pool),"团队角色的模型参考池不存在");
+            role_model=current.at("pools").at(role_pool);
+        }
+        // Reuse the atomic global load/capacity/cooldown selection across accounts,
+        // restricted to the exact configured model and effort for this team role.
+        auto choice=choose_pool(current,occupied,models,allowed,pinned,cooldowns,rejected,role_model);
         diagnostics=std::move(choice.diagnostics);
         if (choice.key.empty()) throw DispatchError(pool_failure(diagnostics,pinned),diagnostics);
         if (!allowed.empty()) batches[batch]=allowed;

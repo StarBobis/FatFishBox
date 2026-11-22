@@ -13,8 +13,8 @@
 5. team_start_project传稳定requestId、绝对workspace、charter、tasks（每项name/steps/acceptance/files/dependsOn/startCondition/tests）、domains恰好一个经理定义（name/mission/acceptance/dependencies=[]）。有queueId沿用原队列；响应不明原参数重试。
 6. team_get_project核对唯一经理的leadSessionId、leadState及goal.phase。程序通过DSH /goal创建目标并通过session/projections.values.goal校验active和objective；不是自报或本地伪造。
 
-## 第二步：主代理一分钟循环
-记录projectId。完整等待60秒后读取team_get_project。starting/running/finishing继续同样等待。completed才开始最终验收。不要轮询每个开发会话、读取整批历史或插手经理队列。team_wait_decisions可辅助等待但事件可能提前唤醒，要补足本轮时间。工具超时不代表任务失败或完成。用户停止/修改任务时立即遵从。
+## 第二步：主代理MCP等待循环
+记录projectId。调用team_wait_decisions（timeoutMs最长300000毫秒）收到反馈后立即读取team_get_project。starting/running/finishing继续同样等待。completed才开始最终验收。不要轮询每个开发会话、读取整批历史或插手经理队列。等待必须由MCP执行，禁止自行sleep或用代码计时；有结果即返回，不补足等待时间。项目经理使用team_wait_actions，同样最长五分钟，子任务完成或有可处理事项即返回。工具超时不代表任务失败或完成。用户停止/修改任务时立即遵从。
 
 ## 第三步：项目经理派发并消费队列
 1. 使用启动消息凭据读取team_domain_context，再读取tasks和完整计划。get_goal核对本session的真实目标。读取team_get_contract；外层operation与内层action不能混淆。
@@ -34,7 +34,7 @@
 
 ## 第五步：主代理逐项验收与合并
 从项目摘要中取verifications（workItemId/candidateSha/workspace/实际命令/exitCode/logPath）、经理证据和对应分支，逐项检查代码与契约，必要时重跑独立验证。通过一个合并一个到main，冲突解决后重跑受影响测试。实际合并成功后team_record_merge登记真实integrationSha及targetBranch=main。服务核对main引用与候选祖先关系，回执可原参数重试。
-不通过的候选不合入，写新的完整返工计划，明确缺口、当前main基线、允许修改、修复步骤、新审查/测试/验收标准。team_update_charter传完整六项新授权和expectedVersion，经理下一轮沿用同一队列与原工作项，已合入事项保留。主代理重新进入每60秒等待循环。
+不通过的候选不合入，写新的完整返工计划，明确缺口、当前main基线、允许修改、修复步骤、新审查/测试/验收标准。team_update_charter传完整六项新授权和expectedVersion，经理下一轮沿用同一队列与原工作项，已合入事项保留。主代理重新进入MCP等待循环。
 
 ## 最终交付
 按AGENTS.md只增加一次补丁版本，Release编译成功后才安装发布；完整路径识别并强制结束原发布实例，安装后校验EXE哈希，原先运行则重启确认。package-release.ps1从全新安装暂存树创建桌面版本ZIP；验证可读、全包CRC及EXE哈希一致。日志、转储、运行状态与凭据不进入ZIP。最终报告版本、验证结果、桌面ZIP绝对路径及任何实际未完成项。
@@ -46,3 +46,5 @@
 例如：A开发审计工具（tools/audit.py）、B修复已知页面1（gallery/page1.cpp）、C修复已知页面2（gallery/page2.cpp），三项无依赖；D使用工具审计页面1-64（evidence/part1/**）、E审计页面65-127（evidence/part2/**）仅依赖A；F汇总台账（docs/defects.md）依赖D/E。B/C不因等待全量审计而被推迟。未知缺陷按实际台账由主代理在下一轮提交新的完整任务表，不让经理临时规划全部开发。
 
 经理首次team_dispatch_ready就应排队A/B/C。A经历独立审查、经理真实测试并accept后，再次调用即可同时排队D/E；D/E都验收后F解锁。每个开发工作者收到自己的完整契约与前置候选SHA，必要时只在其分支合入依赖。重复requestId重放原结果，不重复建工人；每次新队列阶段用新稳定ID。旧项目缺字段须由主代理显式更新tasks，程序不推断业务依赖。
+
+等待规程v10：主代理只用team_wait_decisions，项目经理只用team_wait_actions。单次最长300000毫秒；完成、异常或待处理事项出现即返回反馈，不补时、不自行sleep。经理使用team_get_contract刷新新增工具schema。

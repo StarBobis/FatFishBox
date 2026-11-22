@@ -509,7 +509,7 @@ try {
     assert.equal((await repair.tool('cluster_next_handoff',{claimToken:firstRepair.claimToken,outcome:'Verified.'})).empty,true);
     forcedState=undefined;
     const workflow=await repair.rpc('resources/read',{uri:'fatfish://workflow'});
-    for (const marker of ['team_next_action','team_verify_candidate','team_record_merge','60秒'])
+    for (const marker of ['team_next_action','team_verify_candidate','team_record_merge','team_wait_decisions','team_wait_actions','300000'])
         assert.ok(workflow.contents[0].text.includes(marker));
 
     const fifoRoot=join(root,'fifo');

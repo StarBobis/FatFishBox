@@ -115,7 +115,7 @@ Json project_summary(const Json& p) {
     Json result;
     for (const auto* k:{"projectId","queueId","title","workspace","baseSha","status","charterVersion","updated","sequence"})
         if (p.contains(k)) result[k]=p.at(k);
-    result["pollIntervalMs"]=60000;result["tasks"]=p.value("tasks",Json::array());
+    result["pollIntervalMs"]=300000;result["tasks"]=p.value("tasks",Json::array());
     result["domains"]=Json::array();
     int complete=0,pending=0,running=0;
     for (const auto& d:p.at("domains")) {
@@ -372,7 +372,7 @@ Json lead_tool_contract() {
         const auto& fields=tool.at("inputSchema").at("properties");
         if (fields.contains("domainId") || tool.at("name")=="team_get_prompt") selected.push_back(tool);
     }
-    return {{"version",9},{"tools",selected},{"domainAction",domain_action_contract()}};
+    return {{"version",10},{"tools",selected},{"domainAction",domain_action_contract()}};
 }
 Json job_view(const Json& j) {
     Json out;for (const auto* k:{"jobId","domainId","title","role","state","sessionId","workItemId","baseSha","workspace","resultVersion","sourceJobId","error","accepted"})
@@ -462,7 +462,7 @@ void check_team_reservation(const fs::path& data,const Json& sessions,const Json
 
 Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view tool,const Json& in) {
     check(in.is_object(),"参数须为对象");
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",9},{"prompt",team_prompt(role)}};}
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",10},{"prompt",team_prompt(role)}};}
     if (tool=="team_get_settings") { Store s(data);return s.value.at("settings"); }
     if (tool=="team_update_settings") {
         const auto pools=cluster.invoke("cluster_get_settings").at("pools");
@@ -487,9 +487,9 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         for (const auto& p:s.value.at("projects")) if (p.value("queueId","")==queue) {bound=project_summary(p);break;}
         // The desktop has one execution path. Old saved direct preferences no longer select a mode.
         return {{"queueId",queue},{"mode","team"},{"project",bound},
-            {"principalPromptVersion",9},{"historyTakeoverSupported",true},
+            {"principalPromptVersion",10},{"historyTakeoverSupported",true},
             {"nextAction",bound.is_null()?"task_authorized_then_team_start_project_same_queue":"resume_bound_project"},
-            {"guidance","请使用 team_get_prompt({role:principal}) 的 v9 规程。负责人通过 team_next_action 机械循环处理统一FIFO；结果排队，不抢占，处理本条后继续下一条。项目经理在同一goal会话持续循环，主代理每60秒读取状态。"}};
+            {"guidance","请使用 team_get_prompt({role:principal}) 的 v10 规程。负责人通过 team_next_action 机械循环处理统一FIFO；结果排队，不抢占，处理本条后继续下一条。项目经理在同一goal会话持续循环，主代理通过team_wait_decisions等待，最长五分钟，有通知即处理。"}};
     }
     if (tool=="team_start_project") {
         const auto request=text(in,"requestId",100),title=text(in,"title",200);
@@ -549,7 +549,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             const auto plan_error=task_plan_error(tasks,static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
             if (!plan_error.empty()) throw std::runtime_error(plan_error);
             std::set<std::string> task_names;for (const auto& task:tasks) {check(task_names.insert(text(task,"name",200)).second,"计划任务名称须唯一");text(task,"steps",12000);text(task,"acceptance",6000);}
-            p["tasks"]=tasks;p["protocolVersion"]=9;p["pollIntervalMs"]=60000;
+            p["tasks"]=tasks;p["protocolVersion"]=10;p["pollIntervalMs"]=300000;
             p["history"]=history;
             p["backlogOwnerDomainId"]=first_domain;
             s.value["projects"][key]=p;s.value["requests"][request]={{"projectId",key},{"input",in}};s.save();
@@ -634,7 +634,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         return result;
     }
     if (tool=="team_wait_decisions") {
-        const auto timeout=in.value("timeoutMs",60000);check(timeout>=0 && timeout<=60000,"等待范围为 0–60000 毫秒");
+        const auto timeout=in.value("timeoutMs",300000);check(timeout>=0 && timeout<=300000,"等待范围为 0–300000 毫秒");
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(timeout);
         for (;;) {
             Json out;bool ready=false;
@@ -828,6 +828,30 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         s.save();return {{"workItemId",key},{"domainId",owner},{"importedSessionCount",imported.size()},{"state",item.at("state")},{"requestId",request},{"deferred",deferred}};
     }
     if (tool=="team_get_contract") {Store s(data);auto& p=project(s,in);domain(p,in);return lead_tool_contract();}
+    if (tool=="team_wait_actions") {
+        const auto timeout=in.value("timeoutMs",300000);check(timeout>=0 && timeout<=300000,"等待范围为 0–300000 毫秒");
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(timeout);
+        for (;;) {
+            Json copy;{Store s(data);auto& p=project(s,in);domain(p,in);copy=p;}
+            Json out={{"projectId",copy.at("projectId")},{"status",copy.at("status")},{"cursor",cursor(copy)}};
+            bool ready=copy.at("status")!="running";
+            out["reason"]=ready?"project_status":"timeout";
+            if (!ready) {
+                auto queue=coordinator_queue(cluster,data,copy,text(in,"domainId",100));
+                auto plan=dispatch_readiness(cluster,copy);
+                ready=!queue.value("empty",true) || !plan.at("readyTasks").empty() || plan.value("planNeedsUpdate",false);
+                bool active=false;for (const auto& j:copy.at("jobs")) if (j.at("role")!="lead" && !terminal(j.at("state").get<std::string>())) active=true;
+                if (!ready && !active && plan.at("blockedTasks").empty()) {ready=true;out["reason"]="completion_check";}
+                else if (ready) out["reason"]="action_ready";
+                out["workQueue"]=std::move(queue);out["dispatchPlan"]=std::move(plan);
+                if (in.contains("charterVersion") && in.at("charterVersion")!=copy.at("charterVersion")) {ready=true;out["reason"]="charter_changed";}
+            }
+            out["ready"]=ready;out["timedOut"]=!ready;
+            if (ready || std::chrono::steady_clock::now()>=deadline) return out;
+            // Only the MCP server waits; never retain Store's lock while sleeping.
+            Sleep(100);
+        }
+    }
     if (tool=="team_next_action") {
         Json copy;{Store s(data);auto& p=project(s,in);domain(p,in);running_project(p);copy=p;}
         auto result=coordinator_queue(cluster,data,copy,text(in,"domainId",100));result["dispatchPlan"]=dispatch_readiness(cluster,copy);return result;
@@ -850,7 +874,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json out={{"projectId",p.at("projectId")},{"queueId",p.value("queueId","")},{"status",p.at("status")},{"charter",p.at("charter")},
             {"charterVersion",p.at("charterVersion")},{"tasks",p.value("tasks",Json::array())},{"workspace",p.at("workspace")},{"baseSha",p.at("baseSha")},{"domain",d},{"jobs",Json::array()},{"decisions",Json::array()},{"dependencies",Json::array()}};
         out["domain"].erase("token");
-        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=9;
+        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=10;
         out["dispatchPolicy"]="统一FIFO：team_next_action取队首，处理/派后继后取下一项；子任务结果排队，不抢占当前项。priorityResults为兼容字段，不表示抢占优先级。";
         out["backlog"]={{"ownerDomainId",backlog_owner(p)},{"isOwner",d.at("domainId")==backlog_owner(p)},
             {"pending",p.value("backlog",Json::object()).value("pending",0)},{"actionable",p.value("backlog",Json::object()).value("actionable",0)},
@@ -1121,15 +1145,15 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
         for (const auto& old:p.at("jobs")) {
             if (!old.contains("sessionId") || old.value("observedTerminal",false)) continue;
             if (old.at("role")=="lead" && !terminal(old.at("state").get<std::string>()) &&
-                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<9 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
+                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<10 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
                 health.run("notify_policy",old.at("jobId"),[&] {
                     const auto version=p.at("charterVersion").get<int>();
                     const auto notice=scoped.invoke("cluster_send_message",{{"sessionId",old.at("sessionId")},
-                        {"requestId","team-policy9-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
-                        {"message","规程v9：重新读取team_get_prompt(role=lead)与team_domain_context。主代理负责完整任务拆分，经理先team_dispatch_ready派全就绪项，处理结果后再次派就绪项；不能只派一个独立任务就等待。一个项目经理在同一goal session循环消费待处理列表；开发后独立审查，通过后亲自调用team_verify_candidate测试，再accept；失败修复并重新审查测试。全部事项accepted即team_finish_domain，无integrator或预合并门禁。空列表有在途时等待，不结束goal。"}});
+                        {"requestId","team-policy10-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
+                        {"message","规程v10：重新读取team_get_prompt(role=lead)与team_domain_context。主代理负责完整任务拆分，经理先team_dispatch_ready派全就绪项，处理结果后再次派就绪项；不能只派一个独立任务就等待。一个项目经理在同一goal session循环消费待处理列表；开发后独立审查，通过后亲自调用team_verify_candidate测试，再accept；失败修复并重新审查测试。全部事项accepted即team_finish_domain，无integrator或预合并门禁。空列表有在途时必须调用team_wait_actions等待（最长300000毫秒，有结果立即返回），禁止自行sleep或用代码计时等待，不结束goal。先team_get_contract刷新新增工具schema。"}});
                     if (notice.value("accepted",false)) {
                         Store s(data);auto& saved=s.value["projects"][pid]["jobs"][old.at("jobId").get<std::string>()];
-                        saved["notifiedPolicyVersion"]=9;saved["notifiedCharterVersion"]=version;s.save();
+                        saved["notifiedPolicyVersion"]=10;saved["notifiedCharterVersion"]=version;s.save();
                     }
                 });
             }
@@ -1195,8 +1219,8 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
                 for (const auto& job:current.at("jobs")) if (job.at("domainId")==d.at("domainId") && job.at("role")=="lead" && (!terminal(job.at("state").get<std::string>()) || job.value("charterVersion",0)==current.at("charterVersion").get<int>())) exists=true;
                 if (exists) continue;
                 auto job=new_job(current,d,"lead","项目经理 · "+d.at("name").get<std::string>(),
-                    "读取team_domain_context和详细计划，先team_dispatch_ready一次排队全部就绪任务。每处理一条结果后再次team_dispatch_ready解锁依赖，再循环team_next_action；开发结果派独立审查，审查通过亲自执行team_verify_candidate，失败派修复并重新审查测试。空列表有在途时等待，全部事项accepted后team_finish_domain，再完成goal。",current.at("baseSha").get<std::string>());
-                job["schedulerPolicyVersion"]=9;job["wake"]=d.at("wake");
+                    "读取team_domain_context和详细计划，先team_dispatch_ready一次排队全部就绪任务。每处理一条结果后再次team_dispatch_ready解锁依赖，再循环team_next_action；开发结果派独立审查，审查通过亲自执行team_verify_candidate，失败派修复并重新审查测试。空列表有在途时必须team_wait_actions等待，禁止自行sleep，全部事项accepted后team_finish_domain，再完成goal。",current.at("baseSha").get<std::string>());
+                job["schedulerPolicyVersion"]=10;job["wake"]=d.at("wake");
                 current["jobs"][job.at("jobId").get<std::string>()]=job;d["state"]="working";
             }
             s.save();p=current;
@@ -1309,7 +1333,7 @@ Json team_tools() {
     add("team_list_projects","桌面与续接用团队项目摘要；不要周期性读取全部历史。",Json::object(),Json::array());
     add("team_get_queue","按当前队列查执行方式与绑定的团队运行摘要；已有团队时续接，不再创建项目。",{{"queueId",text}},{"queueId"});
     add("team_get_project","读取单项目阶段成果与待决策；不返回执行日志。",{{"projectId",text},{"includeCharter",{{"type","boolean"}}}},{"projectId"});
-    add("team_wait_decisions","等待关键决策、异常和里程碑；普通运行状态不唤醒主代理。宿主无主动唤醒时使用有界等待。",{{"projectId",text},{"afterCursor",text},{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",60000},{"default",60000}}}},{"projectId"});
+    add("team_wait_decisions","主代理必须使用此MCP等待；最长五分钟，经理完成、关键决策或异常时立即返回反馈。禁止自行sleep或补足等待时间。",{{"projectId",text},{"afterCursor",text},{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",300000},{"default",300000}}}},{"projectId"});
     add("team_resolve_decision","主代理回复一张决策卡；自动保存并恢复领域负责人。",{{"projectId",text},{"decisionId",text},{"expectedRevision",integer},{"requestId",text},{"resolution",text}},{"projectId","decisionId","expectedRevision","requestId","resolution"});
     add("team_update_charter","更新完整授权书；版本化保存，通知负责人重新核对受影响任务。",{{"projectId",text},{"expectedVersion",integer},{"requestId",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"changeSummary",text}},{"projectId","expectedVersion","requestId","charter","changeSummary"});
     add("team_record_merge","项目经理完成后，主代理逐项验收并实际合入main，再核对登记集成提交。",{{"projectId",text},{"requestId",text},{"workItemId",text},{"integrationSha",text},{"targetBranch",text},{"notes",text}},{"projectId","requestId","workItemId","integrationSha","targetBranch","notes"});
@@ -1322,6 +1346,7 @@ Json team_tools() {
     scoped("team_domain_jobs","分页查询本领域任务。默认仅未验收项；历史按需 includeAccepted=true。",{{"offset",integer},{"limit",integer},{"includeAccepted",{{"type","boolean"}}}},Json::array());
     scoped("team_backlog_status","负责人读取队列积压数量、可处理/在途等待分类；持续工作以队列为准，不以单项任务完成为准。",Json::object(),Json::array());
     scoped("team_get_contract","读取负责人准确工具schema和完整调用模板；CLI桥接启动前先读本工作区team-tools.json，禁止猜operation。",Json::object(),Json::array());
+    scoped("team_wait_actions","经理必须使用此MCP等待，最长五分钟；子任务完成、队首可处理、计划就绪或状态变化立即返回反馈。禁止自行sleep。",{{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",300000},{"default",300000}}}},Json::array());
     scoped("team_next_action","负责人机械循环入口：返回持久FIFO队首。处理本条/派后继后再调用；新结果只排队，不抢占。",Json::object(),Json::array());
     scoped("team_priority_results","兼容结果列表；不代表优先级。负责人统一调用team_next_action按FIFO处理。",Json::object(),Json::array());
     scoped("team_next_handoff","值守负责人领取/恢复一条交接；处置须返回的 claimToken、稳定 requestId、notes 和 outcome=confirm/linked/blocked，自动取下一条。confirm 须证据和已验收总账；linked 须同工作项在途 jobId。",{{"requestId",text},{"claimToken",text},{"outcome",{{"type","string"},{"enum",Json::array({"confirm","linked","blocked"})}}},{"notes",text},{"evidence",array},{"jobId",text},{"decisionId",text}},Json::array());

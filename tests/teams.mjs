@@ -21,7 +21,7 @@ const server=createServer(async(req,res)=>{
         switch(method) {
         case 'permissionPresets/catalog':value={defaultOptions:[{value:'local',name:'Local'}]};break;
         case 'agentPresets/list':value={presets:[]};break;
-        case 'session/modelCatalog':value={groups:[{id:'fixture',name:'Fixture',models:['lead','dev','review','integrate'].map(id=>({id,name:id}))}]};break;
+        case 'session/modelCatalog':value={groups:[{id:'fixture',name:'Fixture',models:['lead','dev','review','integrate'].map(id=>({id,name:id}))},{id:'fixture-peer',name:'Peer account',models:[{id:'dev',name:'dev'}]}]};break;
         case 'session/create':value={sessionId:`team-session-${++number}`};states.set(value.sessionId,{cursor:1,running:false,queue:[],pendingInput:[]});break;
         case 'commands/execute':{
             if(a.line.startsWith('/goal ')) {
@@ -137,7 +137,7 @@ try {
     const p=(await disk()).projects[pid],domain=Object.values(p.domains)[0];
     const authz={projectId:pid,domainId:domain.domainId,token:domain.token,charterVersion:1};
     const call=(name,args={},fail=false)=>tool(name,{...authz,...args},fail);
-    assert.equal((await call('team_get_contract')).version,9);
+    assert.equal((await call('team_get_contract')).version,10);
     const listed=(await rpc('tools/list')).tools;
     const taskSchema=listed.find(t=>t.name==='team_start_project').inputSchema.properties.tasks.items;
     assert.equal(taskSchema.properties.steps.type,'string');
@@ -150,9 +150,12 @@ try {
     assert.equal((await native()).sessions[leader.sessionId].startCursor,1,'cursor captured before automatic goal round');
     assert.ok(!p.jobs[leader.jobId].goal.objective.includes(authz.token),'credentials stay out of goal projection');
     assert.ok(bootstraps.get(await remote(leader)).content.includes(authz.token),'first turn can read manager credentials');
+    const managerWaitSchema=listed.find(t=>t.name==='team_wait_actions').inputSchema;
+    assert.equal(managerWaitSchema.properties.timeoutMs.maximum,300000);
+    assert.equal(managerWaitSchema.properties.timeoutMs.default,300000);
     const waitSchema=listed.find(t=>t.name==='team_wait_decisions').inputSchema;
-    assert.equal(waitSchema.properties.timeoutMs.maximum,60000);
-    assert.equal(waitSchema.properties.timeoutMs.default,60000);
+    assert.equal(waitSchema.properties.timeoutMs.maximum,300000);
+    assert.equal(waitSchema.properties.timeoutMs.default,300000);
     const before=Date.now();assert.equal((await tool('team_wait_decisions',{projectId:pid,timeoutMs:50})).timedOut,true);assert.ok(Date.now()-before>=50);
     const leaderRemote=await remote(leader);
     states.set(leaderRemote,{cursor:2,running:false,queue:[],pendingInput:[]});
@@ -171,6 +174,17 @@ try {
 
     const running=await until(async()=>{const j=(await disk()).projects[pid].jobs[first.jobId];return j.sessionId&&j;},'developer');
     assert.ok(running.workspace!==repo);
+    const activeNative=await native();
+    const workerRows=[activeNative.sessions[running.sessionId],activeNative.sessions[parallelLive.sessionId]];
+    assert.equal(new Set(workerRows.map(j=>j.provider)).size,2,'same-model team tasks must balance across accounts rather than pinning to developerPool');
+    assert.ok(workerRows.every(j=>j.model==='dev'),'load balancing must preserve the configured role model');
+    assert.equal((await tool('team_get_settings')).developerPool,pools.dev,'role configuration remains unchanged');
+    // A restart must preserve the existing session and pool assignments.
+    const workerBindings=workerRows.map(j=>({id:j.id,dshId:j.dshId,poolId:j.poolId}));
+    await close();({tool,rpc}=await connect());
+    const recoveredNative=await native();
+    for(const j of workerBindings) assert.deepEqual({id:recoveredNative.sessions[j.id].id,dshId:recoveredNative.sessions[j.id].dshId,poolId:recoveredNative.sessions[j.id].poolId},j);
+
     assert.match((await run('git',['-C',running.workspace,'branch','--show-current'])).stdout,/codex\/task-/);
     const finish={requestId:'finish',summary:'All tasks verified',evidence:['fixture'],acceptanceResults:[{criterion:'Independent review and actual test',outcome:'passed',evidence:'fixture'}]};
     await call('team_finish_domain',finish,true); // Empty result list but active developer.
@@ -179,7 +193,18 @@ try {
         states.set(sid,{cursor:7,running:false,queue:[],pendingInput:[]});
         return until(async()=>{const j=(await disk()).projects[pid].jobs[job.jobId];return j.observedTerminal&&j;},'terminal child');
     };
+    const idleStart=Date.now();assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true);assert.ok(Date.now()-idleStart>=100);
+    const waitInput=join(root,'wait-request.json'),waitOutput=join(root,'wait-response.json');
+    await writeFile(waitInput,JSON.stringify({tool:'team_wait_actions',arguments:{...authz,timeoutMs:20000}}));
+    const waitStart=Date.now();
+    const waiting=run(executable,['--team-call',waitInput,waitOutput],{env,windowsHide:true});
+    await new Promise(r=>setTimeout(r,200));
     const completed=await end(running);
+    await waiting;
+    const feedback=JSON.parse(await readFile(waitOutput,'utf8'));
+    assert.equal(feedback.ok,true);assert.equal(feedback.result.ready,true);assert.equal(feedback.result.timedOut,false);
+    assert.equal(feedback.result.workQueue.head.reason,'candidate_needs_review');
+    assert.ok(Date.now()-waitStart<15000,'completion must wake MCP before the wait deadline');
     assert.equal(Object.values((await disk()).projects[pid].jobs).filter(j=>j.role==='lead').length,2,'child completion must not rebuild manager; historical failed round retained');
     assert.equal((await call('team_next_action')).head.reason,'candidate_needs_review');
     await call('team_delegate',{requestId:'cannot-start-after-development-only',taskName:'After',title:'After',role:'developer',task:'Wrong early start'},true);
@@ -240,8 +265,16 @@ try {
     assert.equal((await call('team_finish_domain',finish)).completed,true);
     assert.equal((await call('team_finish_domain',finish)).completed,true,'finish idempotent after completion');
     assert.equal((await tool('team_get_project',{projectId:pid})).status,'finishing','wait for manager to end goal');
+    const principalCursor=(await tool('team_wait_decisions',{projectId:pid,timeoutMs:0})).cursor;
+    await writeFile(waitInput,JSON.stringify({tool:'team_wait_decisions',arguments:{projectId:pid,afterCursor:principalCursor,timeoutMs:20000}}));
+    const principalStart=Date.now();const principalWaiting=run(executable,['--team-call',waitInput,waitOutput],{env,windowsHide:true});
+    await new Promise(r=>setTimeout(r,200));
     goals.get(await remote(leader)).phase='complete';states.set(await remote(leader),{cursor:7,running:false,queue:[],pendingInput:[]});
     await until(async()=>(await tool('team_get_project',{projectId:pid})).status==='completed','manager ends naturally');
+    await principalWaiting;
+    const principalFeedback=JSON.parse(await readFile(waitOutput,'utf8'));
+    assert.equal(principalFeedback.ok,true);assert.equal(principalFeedback.result.ready,true);
+    assert.equal(principalFeedback.result.status,'completed');assert.ok(Date.now()-principalStart<15000,'manager completion wakes principal MCP wait');
     await tool('team_record_merge',{projectId:pid,requestId:'unmerged',workItemId:running.workItemId,integrationSha:base,targetBranch:'main',notes:'Not merged'},true);
     await run('git',['-C',repo,'merge','--ff-only',candidate]);
     await tool('team_record_merge',{projectId:pid,requestId:'merged',workItemId:running.workItemId,integrationSha:candidate,targetBranch:'main',notes:'Principal independently accepted and merged'});
@@ -259,6 +292,9 @@ try {
     assert.equal((await tool('team_get_project',{projectId:pid})).charterVersion,2);
     await tool('team_control_project',{projectId:pid,requestId:'cancel',action:'cancel'});
     await until(async()=>Object.values((await disk()).projects[pid].jobs).every(j=>['succeeded','failed','cancelled','interrupted'].includes(j.state)),'cancel all sessions');
+    const pinnedWorker=await tool('cluster_start_session',{queueId:defaultQueue,requestId:'direct-fixed-account',title:'Explicit account remains fixed',batch:'direct-fixed-account',role:'developer',workspace:repo,task:'Fixture only',baseSha:candidate,poolId:pools.dev});
+    assert.equal((await native()).sessions[pinnedWorker.id].poolId,pools.dev,'non-team explicit pool selection stays pinned');
+    await tool('cluster_cancel_session',{queueId:defaultQueue,sessionId:pinnedWorker.id});
     // A missing, wrong or paused goal cannot start a manager prompt.
     for(const mode of ['missing','mismatch','paused']) {
         nextGoalMode=mode;

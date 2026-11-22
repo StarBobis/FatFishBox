@@ -3,7 +3,7 @@ name: fatfishbox
 description: 使用肥鱼重工 MCP 按两层循环管理 DSH 派发、审查与任务总账；用于已有接入或用户明确请求的肥鱼重工任务。
 ---
 
-两层循环（单项目经理 + 持久 goal）：用户给出任务与授权后，主代理按并发上限拆分独立任务、写完整可审阅操作计划、启动唯一项目经理；随后每次等待完整60秒，再用 team_get_project 读取经理状态，running 就继续，不消费开发队列、不代调度，不因一次工具超时结束任务。项目经理循环消费待处理列表，派开发、为每个候选派独立审查、亲自在候选分支测试、失败则派修复并复审，全部 accepted 且证据绑定同一候选后结束 goal；不要求独立 integrator、不预先合并全部候选。经理完成后主代理逐项最终验收，通过才合入 main，失败则给出新的完整计划启动下一轮。用户只粘贴接入说明而无任务时，简短确认并等待，不自行编造任务，也不要求用户决定如何派发。
+两层循环（单项目经理 + 持久 goal）：用户给出任务与授权后，主代理按并发上限拆分独立任务、写完整可审阅操作计划、启动唯一项目经理；随后必须调用team_wait_decisions等待（最长300000毫秒，有反馈立即返回），再用 team_get_project 读取经理状态，running 就继续，不消费开发队列、不代调度，不因一次工具超时结束任务。项目经理循环消费待处理列表，派开发、为每个候选派独立审查、亲自在候选分支测试、失败则派修复并复审，全部 accepted 且证据绑定同一候选后结束 goal；不要求独立 integrator、不预先合并全部候选。经理完成后主代理逐项最终验收，通过才合入 main，失败则给出新的完整计划启动下一轮。用户只粘贴接入说明而无任务时，简短确认并等待，不自行编造任务，也不要求用户决定如何派发。
 
 首次使用读取一次 `fatfish://workflow`。参数、特例与准确 schema 看工具目录、team-tools.json 与 team_get_contract，不反复加载整套流程。
 
@@ -15,8 +15,10 @@ description: 使用肥鱼重工 MCP 按两层循环管理 DSH 派发、审查与
 
 每个开发或返修子会话一旦交付候选，项目经理应及时为该候选完整 SHA 单独派 role: reviewer 的独立对抗审查，不等整批结束才总审。审查任务写明原 sessionId、workItemId、候选完整 SHA、验收条件；审查通过后项目经理亲自在候选分支执行真实测试，不能把测试又派给执行者代替自己核验。失败则派修复，新候选 SHA 必须重新独立审查，旧版本通过不沿用。修复 → 复审 → 测试循环直到通过；空待处理列表且有在途不算完成，无须 integrator 门禁即可在全部 accepted 后结束。
 
-主代理每 60 秒读取经理状态直到完成，逐项验收合并并提供完整返工计划；断线按持久游标与 requestId 恢复，不以一次工具超时结束任务。详细规程见 prompts/principal.md、prompts/lead.md、prompts/worker.md。
+主代理通过team_wait_decisions等待通知后读取经理状态直到完成，逐项验收合并并提供完整返工计划；断线按持久游标与 requestId 恢复，不以一次工具超时结束任务。详细规程见 prompts/principal.md、prompts/lead.md、prompts/worker.md。
 
 项目经理使用team_verify_candidate真实执行候选测试，accept引用通过的verificationId。全部通过后team_finish_domain，再完成DSH goal；主代理等status=completed后逐项实际合并main并team_record_merge，失败team_update_charter提交完整返工计划。准确参数见schema。
 
 任务契约v9：主代理必须提交name/steps/acceptance/files/dependsOn/startCondition/tests。新项目拒绝缺字段、循环依赖、未知依赖及并行写入重叠。项目经理第一步team_dispatch_ready派全就绪项，每处理结果后再调用；空闲等待前仍有就绪项会被门禁拒绝。依赖以真实工作项accepted/integrated解锁；经理不重新拆分计划、不凭任务排列串行等待。旧计划缺字段时由主代理team_update_charter提交完整tasks替换，不从自然语言猜依赖。
+
+等待规程v10：主代理只用team_wait_decisions，项目经理只用team_wait_actions。单次最长300000毫秒；完成、异常或待处理事项出现即返回反馈，不补时、不自行sleep。经理使用team_get_contract刷新新增工具schema。

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(FatFishBox VERSION 0.1.7 LANGUAGES CXX RC)
+project(FatFishBox VERSION 0.1.8 LANGUAGES CXX RC)
 
 set(NATIVE_WIN_UI_SOURCE "C:/Dev/NativeWinUI" CACHE PATH "NativeWinUI source checkout")
 include(CTest)
