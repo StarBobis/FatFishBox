@@ -1,4 +1,5 @@
 #include "legacy.h"
+#include "dsh_history.h"
 #include "dsh.h"
 #include "state_file.h"
 #include <windows.h>
@@ -49,16 +50,25 @@ RegistryRoutes registries(const Json& settings) {
     if (fallback.empty()) fallback = env_path(L"LOCALAPPDATA") / L"dsh-workers";
     else if (fallback.is_relative()) fallback=fs::absolute(fallback);
     RegistryRoutes result;
-    const auto explicit_auth=path_from_utf8(text(settings,"authPath"));
+    std::map<fs::path,std::set<fs::path>> configured_routes;
     if (!override.empty() && override.is_relative()) return result;
     const auto default_registry=(override.empty()?fallback:override).lexically_normal()/L"registry/workers.json";
     if (default_registry.is_absolute()) {
-        auto& routes=result[default_registry];
-        if (explicit_auth.is_absolute()) routes.insert(explicit_auth);
+        result[default_registry];
     }
     std::set<fs::path> configs;
-    const auto configured = path_from_utf8(text(settings,"configPath"));
-    if (configured.is_absolute()) configs.insert(configured);
+    const auto add_profile=[&](const Json& profile) {
+        const auto config=path_from_utf8(text(profile,"configPath"));
+        const auto auth=path_from_utf8(text(profile,"authPath"));
+        if (config.is_absolute()) {
+            configs.insert(config);
+            if (auth.is_absolute()) configured_routes[config].insert(auth);
+        }
+        if (default_registry.is_absolute() && auth.is_absolute()) result[default_registry].insert(auth);
+    };
+    add_profile(settings);
+    if (settings.contains("dshConnections"))
+        for (const auto& profile:settings.at("dshConnections")) add_profile(profile);
     const auto primary = env_path(L"DSH_WORKERS_CONFIG");
     if (primary.is_absolute()) configs.insert(primary);
     const auto home = env_path(L"USERPROFILE");
@@ -76,7 +86,8 @@ RegistryRoutes registries(const Json& settings) {
             const auto root=config_relative_path(config,text(raw,"stateDir"));
             const auto registry=override.empty() && !root.empty()?root/L"registry/workers.json":default_registry;
             auto& routes=result[registry];
-            if (config==configured && explicit_auth.is_absolute()) routes.insert(explicit_auth);
+            if (const auto found=configured_routes.find(config);found!=configured_routes.end())
+                routes.insert(found->second.begin(),found->second.end());
             const auto service=raw.find("service");
             if (service==raw.end() || !service->is_object()) continue;
             const auto attached=config_relative_path(config,text(*service,"attachAuthFile"));
@@ -169,6 +180,14 @@ Json projection(const Entry& entry) {
     const auto exact = !version.empty() && entry.mark.is_object() && text(entry.mark,"version") == version;
     const auto read = exact && entry.mark.value("read",false);
     const auto processed = exact && entry.mark.value("processed",false);
+    Json failure=Json::object();
+    if (status=="failed" || status=="interrupted" || status=="policy_violation" || status=="tool_arguments_error") {
+        auto kind=text(row,"failureKind");
+        if (kind.empty()) kind=status=="failed"?"error":status;
+        failure=failure_details({{"kind",kind},{"error",row.value("error",Json())}});
+        const auto reasons=row.value("policyReasons",Json::array());
+        if (reasons.is_array() && !reasons.empty()) failure["policyReasons"]=reasons;
+    }
     if (status == "policy_violation" || status == "tool_arguments_error") status = "failed";
     const auto updated = milliseconds(row,"updatedAt");
     const auto ended = milliseconds(row,"endedAt");
@@ -185,7 +204,28 @@ Json projection(const Entry& entry) {
         {"dshId",text(row,"sessionId")},{"batch",text(row,"batchId")},{"workspace",text(row,"workspace")},
         {"role",text(row,"role")},{"provider",text(row,"provider")},{"model",text(row,"model")},{"effort",effort},
         {"status",status},{"updated",updated},{"completed",version.empty()?0:(ended?ended:updated)},
-        {"resultVersion",version},{"read",read},{"processed",processed}};
+        {"resultVersion",version},{"read",read},{"processed",processed},{"failure",std::move(failure)}};
+}
+
+fs::path archive_file(const Entry& entry) {
+    if (!terminal(text(entry.record,"status"))) return {};
+    return dsh_history_file(text(entry.record,"sessionId"),text(entry.record,"workspace"));
+}
+
+std::optional<DshHistory> archived_turn(const Entry& entry,const fs::path& file) {
+    const auto history=read_dsh_history(file,text(entry.record,"sessionId"),sequence(entry.record,"startSeq"));
+    if (!history || history->cursor<sequence(entry.record,"cursor")) return {};
+    return history;
+}
+
+Json archived_result(const Entry& entry,const DshHistory& turn) {
+    auto row=projection(entry);
+    const auto version=std::to_string(sequence(entry.record,"startSeq"))+":"+std::to_string(turn.ending.seq);
+    auto failure=row.at("resultVersion")==version?row.at("failure"):Json::object();
+    failure.update(turn.ending.failure);
+    return {{"status",turn.ending.status},{"resultVersion",version},{"resultSource","dsh_history"},
+        {"completed",turn.ending.time>0?turn.ending.time:row.at("completed").get<std::int64_t>()},
+        {"updated",row.at("updated")},{"historyCursor",turn.cursor},{"failure",std::move(failure)}};
 }
 
 void apply_live(Json& row,const Entry& entry,const LegacyObservation& observation) {
@@ -212,14 +252,16 @@ LegacyObservation observe(const Entry& entry,const Dsh& dsh,const LegacyObservat
     const auto registered=text(record,"status");
     auto row=projection(entry);
     std::string status,version;
+    Json failure=Json::object();
     std::int64_t completed=0;
     if (!live.value("pendingInput",Json()).empty()) status="waiting_input";
     else if (live.at("running").get<bool>()) status="running";
-    else if (!live.value("queue",Json()).empty()) status="queued";
+    else if (has_queued_prompt(live)) status="queued";
     else if (cursor==sequence(previous.live,"liveCursor") && terminal(text(previous.live,"status"))) {
         status=text(previous.live,"status");
         version=text(previous.live,"resultVersion");
         completed=previous.live.value("completed",std::int64_t(0));
+        failure=previous.live.value("failure",Json::object());
     } else if (registered=="policy_violation" && cursor==sequence(record,"cursor")) {
         status="failed";
         version=text(row,"resultVersion");
@@ -229,6 +271,7 @@ LegacyObservation observe(const Entry& entry,const Dsh& dsh,const LegacyObservat
         version=std::to_string(start)+":"+std::to_string(ending->seq);
         completed=ending->time>0?ending->time:row.value("completed",std::int64_t(0));
         if (completed<=0) completed=result.checked;
+        failure=ending->failure;
     } else if (terminal(registered) && cursor==sequence(record,"cursor")) {
         status=text(row,"status");
         version=text(row,"resultVersion");
@@ -240,7 +283,13 @@ LegacyObservation observe(const Entry& entry,const Dsh& dsh,const LegacyObservat
         previous.live.value("updated",std::int64_t(0)):
         (cursor==sequence(record,"cursor") && status==text(row,"status")?row.at("updated").get<std::int64_t>():
          std::max(completed,result.checked));
-    result.live={{"status",status},{"resultVersion",version},{"completed",completed},{"updated",updated},{"liveCursor",cursor}};
+    if ((status=="failed" || status=="interrupted") && !version.empty() && row.at("resultVersion")==version) {
+        auto registered_failure=row.at("failure");
+        registered_failure.update(failure);
+        failure=std::move(registered_failure);
+    }
+    result.live={{"status",status},{"resultVersion",version},{"completed",completed},{"updated",updated},{"liveCursor",cursor},
+        {"failure",std::move(failure)}};
     return result;
 }
 
@@ -261,7 +310,8 @@ std::shared_ptr<Dsh> route(const Entry& entry,Auths& auths) {
             catch (const std::exception&) {}
         }
         const auto& dsh=auths.at(path);
-        if (dsh && (origin.empty() || origin==dsh->origin() || origin==dsh->origin()+"/")) return dsh;
+        if (dsh && (origin.empty() || origin==dsh->origin() || origin==dsh->origin()+"/" ||
+                    (service=="attached" && dsh->matches_desktop_origin(origin)))) return dsh;
     }
     return {};
 }
@@ -326,22 +376,47 @@ std::string live_output(const Entry& entry,const Dsh& dsh,const Json& row) {
     return {};
 }
 
-void observe_entries(const std::map<std::string,Entry>& entries,LegacyObservations& samples,std::stop_token stop) {
+void observe_entries(const std::map<std::string,Entry>& entries,LegacyObservations& samples,std::stop_token stop,
+                     LegacyRefresh refresh) {
     std::erase_if(samples,[&](const auto& item){return !entries.contains(item.first);});
     struct Job {
         const Entry* entry;
         LegacyObservation* sample;
         std::shared_ptr<Dsh> dsh;
+        fs::path archive;
+        bool acknowledged;
+        bool reconcile_receipt;
     };
     Auths auths;
     std::vector<Job> jobs;
     for (const auto& [id,entry]:entries) {
         auto& sample=samples[id];
         const auto revision=Json::array({entry.record.value("startSeq",Json()),entry.record.value("cursor",Json()),
-            text(entry.record,"status"),text(entry.record,"serviceOrigin"),text(entry.record,"serviceId")});
+            text(entry.record,"status"),text(entry.record,"serviceOrigin"),text(entry.record,"serviceId"),
+            entry.record.value("updatedAt",Json())});
         if (sample.revision!=revision) sample={.revision=revision};
-        if (auto dsh=route(entry,auths)) jobs.push_back({&entry,&sample,std::move(dsh)});
-        else sample.stale=!text(entry.record,"serviceId").empty() || !text(entry.record,"serviceOrigin").empty();
+        const bool handoff=refresh!=LegacyRefresh::incremental;
+        const auto recent_terminal=!sample.stale && now()-sample.checked<30000 &&
+            terminal(text(sample.live,"status")) && !text(sample.live,"resultVersion").empty();
+        if (handoff && recent_terminal) continue;
+        auto archive=archive_file(entry);
+        auto dsh=refresh==LegacyRefresh::archive?std::shared_ptr<Dsh>():route(entry,auths);
+        const bool has_receipt=entry.mark.is_object() && entry.mark.value("processed",false);
+        const auto registered=has_receipt?projection(entry):Json::object();
+        const bool acknowledged=registered.value("processed",false);
+        const bool reconcile_receipt=has_receipt && !acknowledged && !archive.empty() && registered.at("status")=="failed";
+        if (!handoff && (!dsh || reconcile_receipt) && !archive.empty() && recent_terminal &&
+            text(sample.live,"resultSource")=="dsh_history") {
+            std::error_code error;
+            const auto written=fs::last_write_time(archive,error);
+            if (!error && written==sample.history_write) continue;
+        }
+        if (!archive.empty() || dsh) {
+            jobs.push_back({&entry,&sample,std::move(dsh),std::move(archive),acknowledged,reconcile_receipt});
+            if (handoff) sample.stale=true;
+        }
+        else sample.stale=!text(entry.record,"serviceId").empty() ||
+            (refresh==LegacyRefresh::incremental && !text(entry.record,"serviceOrigin").empty());
     }
     const auto is_running=[](const Job& job) {
         return !terminal(text(job.sample->live,"status",text(job.entry->record,"status")));
@@ -350,19 +425,36 @@ void observe_entries(const std::map<std::string,Entry>& entries,LegacyObservatio
         return std::pair(a.sample->checked,-milliseconds(a.entry->record,"updatedAt"))<
             std::pair(b.sample->checked,-milliseconds(b.entry->record,"updatedAt"));
     };
-    const auto terminal_jobs=std::stable_partition(jobs.begin(),jobs.end(),is_running);
-    std::sort(jobs.begin(),terminal_jobs,by_age);
-    const auto recent_end=terminal_jobs+std::min<std::ptrdiff_t>(12,jobs.end()-terminal_jobs);
-    std::partial_sort(terminal_jobs,recent_end,jobs.end(),[](const Job& a,const Job& b) {
-        return milliseconds(a.entry->record,"updatedAt")>milliseconds(b.entry->record,"updatedAt");
-    });
-    std::sort(recent_end,jobs.end(),by_age);
     std::vector<Job> selected;
-    selected.insert(selected.end(),jobs.begin(),jobs.begin()+std::min<std::ptrdiff_t>(48,terminal_jobs-jobs.begin()));
-    selected.insert(selected.end(),terminal_jobs,recent_end);
-    selected.insert(selected.end(),recent_end,recent_end+std::min<std::ptrdiff_t>(72-selected.size(),jobs.end()-recent_end));
+    if (refresh!=LegacyRefresh::incremental) {
+        const auto priority=[](const Job& job) {
+            const auto& record=job.entry->record;
+            const auto submitted=milliseconds(record,"submittedAt");
+            const auto ended=milliseconds(record,"endedAt");
+            return std::tuple(job.acknowledged,job.archive.empty(),ended?ended:submitted?submitted:milliseconds(record,"updatedAt"));
+        };
+        std::stable_sort(jobs.begin(),jobs.end(),[&](const Job& a,const Job& b){return priority(a)<priority(b);});
+        selected=std::move(jobs);
+    }
+    else {
+        const auto terminal_jobs=std::stable_partition(jobs.begin(),jobs.end(),is_running);
+        std::sort(jobs.begin(),terminal_jobs,by_age);
+        const auto recent_end=terminal_jobs+std::min<std::ptrdiff_t>(12,jobs.end()-terminal_jobs);
+        std::partial_sort(terminal_jobs,recent_end,jobs.end(),[](const Job& a,const Job& b) {
+            const auto priority=[](const Job& job) {
+                return std::tuple(!job.reconcile_receipt,job.reconcile_receipt?job.sample->checked:0,
+                    -milliseconds(job.entry->record,"updatedAt"));
+            };
+            return priority(a)<priority(b);
+        });
+        std::sort(recent_end,jobs.end(),by_age);
+        selected.insert(selected.end(),jobs.begin(),jobs.begin()+std::min<std::ptrdiff_t>(48,terminal_jobs-jobs.begin()));
+        selected.insert(selected.end(),terminal_jobs,recent_end);
+        selected.insert(selected.end(),recent_end,recent_end+std::min<std::ptrdiff_t>(72-selected.size(),jobs.end()-recent_end));
+        std::stable_partition(selected.begin(),selected.end(),[](const Job& job){return job.reconcile_receipt;});
+    }
     std::atomic_size_t next{};
-    const auto deadline=GetTickCount64()+3400;
+    const auto deadline=GetTickCount64()+(refresh!=LegacyRefresh::incremental?5500:3400);
     std::vector<std::jthread> workers;
     for (std::size_t i=0;i<std::min<std::size_t>(12,selected.size());++i) {
         workers.emplace_back([&] {
@@ -370,7 +462,30 @@ void observe_entries(const std::map<std::string,Entry>& entries,LegacyObservatio
                 const auto index=next.fetch_add(1);
                 if (index>=selected.size()) return;
                 auto& job=selected[index];
-                try { *job.sample=observe(*job.entry,*job.dsh,*job.sample); }
+                try {
+                    const bool live_first=refresh==LegacyRefresh::incremental && job.dsh && !job.reconcile_receipt;
+                    if (live_first) {
+                        try {
+                            *job.sample=observe(*job.entry,*job.dsh,*job.sample);
+                            continue;
+                        } catch (const std::exception&) {
+                            if (job.archive.empty()) throw;
+                        }
+                    }
+                    std::error_code stat_error;
+                    const auto written=job.archive.empty()?fs::file_time_type{}:fs::last_write_time(job.archive,stat_error);
+                    if (const auto history=archived_turn(*job.entry,job.archive)) {
+                        job.sample->live=archived_result(*job.entry,*history);
+                        job.sample->checked=now();
+                        job.sample->stale=false;
+                        job.sample->history_write=stat_error?fs::file_time_type{}:written;
+                    } else if (!live_first && job.dsh)
+                        *job.sample=observe(*job.entry,*job.dsh,*job.sample);
+                    else {
+                        job.sample->checked=now();
+                        job.sample->stale=true;
+                    }
+                }
                 catch (const std::exception&) { job.sample->checked=now();job.sample->stale=true; }
             }
         });
@@ -380,12 +495,13 @@ void observe_entries(const std::map<std::string,Entry>& entries,LegacyObservatio
 }
 
 LegacySessions read_legacy_sessions(const Json& settings,bool include_usage_candidates,LegacyObservations* observations,
-                                    std::stop_token stop) {
+                                    std::stop_token stop,LegacyRefresh refresh,const LegacyFilter& include) {
     LegacySessions result;
-    const auto entries=load(settings,result.sources,result.unreadable);
+    auto entries=load(settings,result.sources,result.unreadable);
+    if (include) std::erase_if(entries,[&](const auto& entry){return !include(entry.first);});
     if (observations && !result.sources && result.unreadable)
         throw std::runtime_error("Codex 会话登记暂时无法读取，已保留最近的会话列表");
-    if (observations) observe_entries(entries,*observations,stop);
+    if (observations) observe_entries(entries,*observations,stop,refresh);
     for (const auto& [key,entry] : entries) {
         auto projected=projection(entry);
         if (observations) {
@@ -406,45 +522,63 @@ LegacySessions read_legacy_sessions(const Json& settings,bool include_usage_cand
     return result;
 }
 
-Json legacy_result(const Json& settings, const std::string& id) {
+Json legacy_result(const Json& settings,const std::string& id,const Json* observed) {
     int sources=0, unreadable=0;
     const auto entries=load(settings,sources,unreadable);
     const auto found=entries.find(id);
     if (found==entries.end()) throw std::runtime_error("原插件登记中没有该会话");
     const auto& entry=found->second;
+    const auto history=archived_turn(entry,archive_file(entry));
     Auths auths;
-    const auto dsh=route(entry,auths);
-    const auto row=live_projection(entry,dsh.get());
+    const auto dsh=history?std::shared_ptr<Dsh>():route(entry,auths);
+    auto row=observed?*observed:live_projection(entry,dsh.get());
+    const auto disk=history?archived_result(entry,*history):Json();
+    const bool use_history=history && (!observed || observed->at("resultVersion")==disk.at("resultVersion"));
+    if (use_history) row.update(disk);
+    else if (observed && observed->value("resultSource","")=="dsh_history")
+        throw DshError("历史日志的结果版本已变化","history_changed");
+    Json result{{"sessionId",id},{"source","codex"},{"readOnly",true},{"resultVersion",row.at("resultVersion")}};
+    if (!row.at("failure").empty()) result["failure"]=row.at("failure");
     std::string output;
-    if (dsh && row.contains("liveCursor")) {
-        output=live_output(entry,*dsh,row);
+    if (use_history) {
+        result["resultSource"]="dsh_history";
+        output=history->output;
+    } else if (dsh && row.contains("liveCursor")) {
+        try { output=live_output(entry,*dsh,row); }
+        catch (const std::exception& error) {
+            if (!result.contains("failure")) throw;
+            result["readError"]=error.what();
+        }
         if (output.empty() && row.at("liveCursor")==entry.record.value("cursor",Json()))
             output=text(entry.record,"assistantText");
     } else output=text(entry.record,"assistantText");
-    const bool clipped=output.size()>6000;
-    if (clipped) {
-        auto start=output.size()-6000;
-        while (start<output.size() && (static_cast<unsigned char>(output[start])&0xc0)==0x80) ++start;
-        output.erase(0,start);
-    }
+    const bool clipped=false;
     Json messages=Json::array();
     if (!output.empty()) messages.push_back({{"type","assistant/message"},{"text",output},{"truncated",clipped}});
-    return {{"sessionId",id},{"source","codex"},{"readOnly",true},{"resultVersion",row.at("resultVersion")},{"messages",messages}};
+    result["messages"]=std::move(messages);
+    return result;
 }
 
 Json live_legacy_session(const Json& settings,const std::string& id) {
     int sources=0, unreadable=0;
     const auto entries=load(settings,sources,unreadable);
     const auto& entry=entries.at(id);
+    if (const auto history=archived_turn(entry,archive_file(entry))) {
+        auto row=projection(entry);
+        apply_live(row,entry,{.live=archived_result(entry,*history)});
+        return row;
+    }
     Auths auths;
     return live_projection(entry,route(entry,auths).get());
 }
 
-void complete_legacy_handoff(const Json& settings,const std::string& id,const std::string& version,
+bool complete_legacy_handoff(const Json& settings,const std::string& id,const std::string& version,
                              const std::string& outcome) {
     int sources=0, unreadable=0;
     const auto entries=load(settings,sources,unreadable);
-    auto entry=entries.at(id);
+    const auto found=entries.find(id);
+    if (found==entries.end()) return false;
+    auto entry=found->second;
     auto lock_path=entry.review_path;
     lock_path.replace_extension(L".lock");
     const ExclusiveStateLock lock(lock_path);
@@ -455,17 +589,19 @@ void complete_legacy_handoff(const Json& settings,const std::string& id,const st
             text(row,"serviceOrigin")==text(entry.record,"serviceOrigin") &&
             (!text(row,"serviceOrigin").empty() || row.value("serviceId",Json())==entry.record.value("serviceId",Json()));
     });
-    if (record==sessions.end()) throw std::runtime_error("Codex 会话登记已变化");
+    if (record==sessions.end()) return false;
     entry.record=*record;
     Auths auths;
-    const auto current=live_projection(entry,route(entry,auths).get());
-    if (current.at("resultVersion")!=version || version.empty() || current.value("stale",false))
-        throw std::runtime_error("Codex 会话的结果版本已变化");
+    const auto history=archived_turn(entry,archive_file(entry));
+    const auto current=history?archived_result(entry,*history):live_projection(entry,route(entry,auths).get());
+    if (current.value("stale",false)) throw std::runtime_error("暂时无法确认已领取的结果，请重试");
+    if (current.at("resultVersion")!=version || version.empty() || !terminal(text(current,"status"))) return false;
     auto marks=fs::exists(entry.review_path)?read_json(entry.review_path,max_registry):Json::object();
     if (!marks.is_object()) throw std::runtime_error("Codex 回执格式无效");
     auto& mark=marks[entry.review_key];
-    if (mark.is_object() && mark.value("version","")==version && mark.value("processed",false)) return;
+    if (mark.is_object() && mark.value("version","")==version && mark.value("processed",false)) return true;
     mark={{"version",version},{"read",true},{"processed",true},{"outcome",outcome}};
     write_state_file(entry.review_path,marks);
+    return true;
 }
 }

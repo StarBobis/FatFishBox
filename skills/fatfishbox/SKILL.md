@@ -1,16 +1,20 @@
 ---
 name: fatfishbox
-description: 通过肥鱼重工管理 DeepSeek Harness 的账号、模型池、会话与交接。
+description: 使用肥鱼重工 MCP 管理 DSH 派发、交接与任务总账；用于已有接入或用户明确请求的肥鱼重工任务。
 ---
 
-用 `cluster_overview` 读取进行中和未处理数量。用 `cluster_refresh_sessions` 同步本地已派发会话。
+团队执行、历史队列接管或用户一次委托任务：优先读取 `team_get_prompt({role:"principal"})`，主代理用 `team_get_queue/team_start_project` 启动或续接领域负责人，核实 leadSessionId 后持续等待关键事件与最终验收。负责人管理开发、审查、返修，主代理不直接操作集群。direct 与历史工作项不禁止团队接管；无需新建空队列。用户已经给任务和授权时不能只报告接入待命，也不能再次要求用户决定如何派发。以下原始集群操作说明仅适用于明确选择旧版直接管理的场景。
 
-用 `cluster_import_models` 从当前已授权的 DSH 配置导入模型目录。编辑前调用 `cluster_get_settings` 获取 revision。用 `cluster_update_pool` 启用模型，再更新该模型的并发和思考强度。
+首次使用读取一次 `fatfish://workflow`。公共队列、派发、领取、审查、返修、追加消息与证据规则统一维护在该资源；参数和特例看工具目录，不要反复加载整套流程。
 
-用 `cluster_start_session` 向授权工作区派发并提供稳定批次 ID。按任务选择角色，可省略。默认优先使用正在处理的会话更少的账号，指定池时传入 `poolId`。只在明确授权时调用 `cluster_cancel_session`。
+用户只粘贴接入说明时，简短确认并等待任务或续接指示。已有派发授权按原工作范围继续；接入说明本身不扩大授权。
 
-用 `cluster_next_handoff({})` 领取最早完成的未处理结果。采取实际处置后，提交同一工具的 `{claimToken, outcome}`。工具确认当前版本并返回下一条。仅传领取令牌会重读本条。遇到版本变化，重新领取后核对新结果。
+续接先核对 `queueId`，独立事项使用稳定 `workItemId`。默认交接是摘要，完整交付与日志按需分页读取；进度优先使用事件游标批量等待。
 
-同一批次首次派发可传入 `allowedPoolIds` 限定自动换池范围。从当前交接派发返修用 `cluster_repair_handoff`。返回 `claimReleased: true` 后，立即用 `cluster_next_handoff({})` 处理其他结果。返修完成后独立排队，轮到时用新的领取凭据验收。读取 `fatfish://workflow` 查看完整示例。
+派发、返修、追加消息和总账更新都保存原参数与 `requestId`，响应不明时原样核对，不换 ID 重复提交。追加消息的 accepted 只表示入队；空闲时的未确认消息须先核对原会话。
 
-用 `cluster_get_session_status({sessionId})` 查询已知会话，可传派发返回的 `id` 或 `dshId`。同批次已有返修时，用 `cluster_attach_handoff_repair({claimToken,originalVersion,sessionId})` 关联。需要共享返修的交接分别提交各自的领取凭据和版本，指向同一个返修会话。
+主代理核实候选、独立审查和证据后登记验收与集成。代理自报测试、采集时 HEAD、文件哈希分别表示不同证据，不能相互替代。历史回执不证明已合入 main。
+
+派发前按任务是否写入文件选择工作区：只读分析、日志查询和不写文件的审查可共用目录；并行修改、返修或会写入文件的构建测试须由主代理先创建独立 Git worktree 和各自构建输出目录，核对路径、分支、基线后再派发。单会话修改可按任务使用现有目录，main 的修改或集成须符合用户授权；非 Git 任务按需使用独立目录。派发接口不会自动创建 worktree，不得让并行写入共享主工作区或 main。
+
+每个开发或返修子会话一旦交付候选，主代理应及时为该会话的具体候选 SHA 单独派发 role: reviewer 的独立对抗审查，不得等整批开发结束后只安排一次总审。审查任务须明确原 sessionId、workItemId、候选 SHA 和验收条件；每条结果分别核对审查结论，审查通过后才能验收该结果。返修产生新候选 SHA 后必须重新独立审查，旧版本的通过结论不沿用。整批最终审查可追加，但不能替代逐项审查。

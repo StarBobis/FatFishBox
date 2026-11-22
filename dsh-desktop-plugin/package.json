@@ -1,0 +1,15 @@
+{
+  "name": "fatfishbox-dsh-desktop",
+  "version": "1.0.0",
+  "description": "Authorize FatFishBox to connect to this local DeepSeek Harness Desktop host",
+  "main": "./index.cjs",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": "./index.cjs",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  }
+}

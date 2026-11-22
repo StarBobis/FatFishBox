@@ -1,0 +1,6 @@
+#pragma once
+namespace fatfish {
+inline constexpr char principal_prompt[]=R"ffprompt(@PRINCIPAL_PROMPT@)ffprompt";
+inline constexpr char lead_prompt[]=R"ffprompt(@LEAD_PROMPT@)ffprompt";
+inline constexpr char worker_prompt[]=R"ffprompt(@WORKER_PROMPT@)ffprompt";
+}
