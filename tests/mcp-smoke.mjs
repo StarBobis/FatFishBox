@@ -713,8 +713,8 @@ try {
     assert.equal(structuredClaim.delivery.candidateSha,sha,'delivery survives a long trailing log');
     for(const key of ['workItemId','candidateSha','baseSha','status','issues','checksManifest','evidenceManifest','nextAction'])
         assert.notEqual(structuredClaim.delivery[key],undefined,'normalized delivery has '+key);
-    assert.ok(structuredClaim.delivery.checksManifest.startsWith('fatfish://checks/'));
-    assert.ok(structuredClaim.delivery.evidenceManifest.startsWith('fatfish://evidence/'));
+    assert.equal(structuredClaim.delivery.checksManifest,null,'reads never create proof manifests');
+    assert.equal(structuredClaim.delivery.evidenceManifest,null,'reads never collect evidence');
     assert.ok(Buffer.byteLength(JSON.stringify(structuredClaim))<4000,'default handoff remains compact');
     assert.equal(structuredClaim.resultTruncated,true);
     const durable=JSON.parse(await readFile(structuredClaim.logPath,'utf8'));

@@ -1,28 +1,21 @@
-# 两层循环简化实施计划
+# Simplified team implementation and maintenance plan
 
-## 用户目标及不可变职责
-只允许一个项目经理 session，设置持续 goal。主代理理解需求、按可用并发上限拆分独立任务、写完整操作计划并启动项目经理；随后必须通过team_wait_decisions等待（最长五分钟），有反馈立即读取项目经理状态，running就继续，不消费开发队列、不代调度。项目经理派开发并循环消费待处理列表。开发完成后安排独立对抗审查；审查失败或项目经理亲自在对应分支执行测试失败，则派开发修复，新候选重新审查和测试。所有开发事项通过才完成goal并自然退出。主代理随后逐项最终验收，通过才合入main；失败要提供新的完整计划并启动下一轮。项目经理不得要求独立integrator或预先合并所有候选才允许结束。
+The current operating procedure is [two-loop-workflow.md](two-loop-workflow.md), policy v13. Earlier implementation-era proof checklists no longer apply.
 
-## 本次实施任务与文件边界
-仅一个项目经理管理下列三个事项，不创建多领域负责人。开发与审查合计不超过已保存的总并发和角色并发；无需占满名额。开发/修复分别使用隔离Git worktree，审查只读精确候选，测试在对应分支进行，不能污染主仓库。
-1. 调度和状态：src/team.cpp、src/team.h、src/team_scheduler.h，必要时src/cluster.*、src/dsh.*、src/mcp.*、src/app.cpp。先调查后删除或停用旧多领域、抢占优先级、自动集成与反复重建负责人逻辑，统一一个项目经理、待处理列表、候选审查/验收及完成门禁。保留稳定请求ID、候选SHA绑定、持久化与真实错误，不用复杂新框架替换旧框架。确认goal通过实际DSH会话协议设置，不能仅在提示词写goal。若协议确实无该能力须提供事实和可执行替代并上报，禁止伪称完成。项目经理必须能亲自执行分支测试，不再强制把测试交给执行者。运行中的等待留在同一session，只有上下文恢复或崩溃恢复才接续。空待处理列表且子任务仍在运行不能完成。所有事项accepted且审查/测试证据绑定相同候选后，可提交完成而无需integrator/integrated状态。main合入只在主代理最终验收阶段。兼容已有存储数据，未完历史项不可静默丢失或标通过；旧API可以兼容映射，但不参与新默认路径。主代理team_wait_decisions与经理team_wait_actions均支持最长300000毫秒，任务完成或有待处理事项时提前返回反馈，禁止自行sleep。
-2. 提示词和接入说明：prompts/principal.md、prompts/lead.md、prompts/worker.md、skills/fatfishbox/SKILL.md、README.md及工具/资源说明。完整重写为上述两层循环，删去旧多领域和日常主代理决策干预规定。计划必须可审阅，要求每项任务有目的、输入、边界、步骤、分支、候选、审查标准、可执行测试、证据、失败处置。主代理每分钟读取经理状态直到完成、逐项验收合并及完整返工计划都须明确。经理循环区分开发结果与审查结果，修复候选必须重新审查。主代理不是以一次工具超时结束任务。桌面UI名称如仍是领域负责人，应改为项目经理；允许旧字段兼容，不得把实现字段暴露成用户流程。
-3. 行为验证：tests/teams.mjs、tests/scheduler-test.cpp及必要测试。必须覆盖单项目经理、任务数/并发上限、开发→独立审查→经理测试、失败→修复→重新审查、空队列有在途不完成、无integrator也能全部accepted后结束、经理结束后主代理验收/返工、MCP五分钟等待上限、完成提前唤醒与断线恢复。测试应检验行为，不能简单断言提示词字符串。保留现有适用测试，删除不再适用的旧机制断言并解释替代覆盖。公共核心文件修改有交叉时按依赖顺序执行，避免冲突。
+## Behavior
+The principal plans requested work and waits through MCP. One persistent-goal manager dispatches ready tasks, handles result FIFO, arranges independent review and repairs actual defects. Developers run relevant self-tests. The manager confirms completion using judgement; extra targeted tests are optional. Main integration remains with the principal.
 
-## 项目经理操作步骤
-先读取现有上下文、工具schema及本计划，记录基线，建立三项任务表及验收矩阵。派任务1；任务2可并行但共同文件须明确唯一写入者；任务3依据实现更新。每份开发交付都需记录workItemId、sessionId、完整候选SHA、修改文件、实际测试命令/退出码/日志。每个候选单独派独立reviewer，限定审查该SHA与任务契约，不以自报passed代替证据。开发交付进待处理列表；处理一个后继续下一项，不等待某个子任务阻塞其他结果。审查结果发现缺陷则登记具体复现、预期、实际、严重度并派修复；审查通过后在候选对应worktree亲自执行真实测试。失败继续修复；新SHA必须新审查。所有事项通过才提交结果，并提供主代理逐项验收所需候选分支/完整SHA和测试证据。
+No automatic evidence collection, capture-on-read, artifact hash inventory, mandatory verificationId, attachment prerequisite, proof list or exhaustive screenshot matrix may be introduced. Stale collector calls return collectionDisabled without scanning files. Missing report attachments or metadata differences do not automatically reject work or invalidate acceptance. Do not convert local fixes into full-product audits.
 
-## 本轮门禁
-A. 单经理持久goal确已设置；两层循环实际行为符合用户定义。
-B. 无跳过审查/测试/候选绑定的路径；任何失败不标完成；无须integrator门禁。
-C. 状态持久化和同请求重试不重复派发，现有用户数据兼容。
-D. 相关自动测试通过，Release编译通过。若测试依赖构建请配置快照自己的build，不指向原仓库build。依赖NativeWinUI在C:/Dev/NativeWinUI，可复用下载缓存但不得修改原build状态。
-E. 原仓库现有未提交内容为用户基线，禁止重置覆盖。仅回迁本轮diff。
+## Implementation boundaries
+- Keep native scheduling and global account/model load balancing with a single concurrency setting.
+- Keep isolated task branches, stable work item IDs, request replay protection, revisions and queue ownership.
+- Keep existing DSH session IDs, model/account bindings and completed work during client updates.
+- Keep role prompts and agent-facing instructions in English.
+- Use MCP waits up to 300000 ms with early feedback; no agent sleep loops.
+- Preserve old archives without creating new proof manifests or collecting blobs.
 
-## 交付与发布责任
-团队只在快照和自己的worktree修改、提交和测试，不更新用户正在运行的发布目录，不增加版本、不桌面打包。原仓库最终由主代理逐项验收、回迁差异；版本从0.1.3只增加一次至0.1.4。主代理必须运行cmake --build build --config Release --parallel，成功后按实际完整EXE路径识别已运行发布版并Stop-Process -Force且确认退出；cmake --install安装到原路径（默认out/肥鱼重工），比对EXE哈希；先前运行则原路径重启确认。运行scripts/package-release.ps1，系统解析桌面，使用全新安装暂存目录；校验ZIP可读且内EXE哈希与构建/发布一致，保留其他版本ZIP。最终报告版本和桌面ZIP绝对路径。
+## Validation
+Use isolated fixture data and mock DSH endpoints for scheduler/protocol regressions. Run real fixture commands where command execution behavior is under test. Cover normal development/review/repair/confirmation, optional manager tests, completion without proof arrays, result reads without collection, stale collector no-ops, queue ownership, replay safety, load balancing and early MCP wake-up. Do not use live user tasks as test fixtures.
 
-## 本轮现有系统引导例外
-当前运行的肥鱼重工仍是旧多领域协议。仅为完成本次改造，允许项目经理使用旧team_*所需的检查点、审查记录及隔离集成候选生成机制提交本轮成果；新实现/新文档必须真正移除这些默认复杂环节。所有为通过旧完成门禁的临时集成不得作为新机制的产品要求。遇到实际阻塞须通过团队决策给出具体事实，主代理可按已有授权裁决；不让用户反复发继续。
-
-等待规程v10：主代理只用team_wait_decisions，项目经理只用team_wait_actions。单次最长300000毫秒；完成、异常或待处理事项出现即返回反馈，不补时、不自行sleep。经理使用team_get_contract刷新新增工具schema。
+Follow repository AGENTS.md for the patch version, Release build, exact-path client replacement/restart and fresh Desktop ZIP packaging. Do not cancel or reassign DSH work to deliver a client update.

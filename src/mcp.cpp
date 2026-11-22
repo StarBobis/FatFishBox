@@ -15,14 +15,11 @@
 namespace {
 using fatfish::Json;
 using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
-constexpr auto workflow=R"workflow(# FatFishBox two-loop workflow
-Read fatfish://team/principal or team_get_prompt(principal). The principal understands the requirement, commits a complete plan with task scope, steps, review attacks, build/test commands, acceptance evidence and repair handling, and starts one manager with a real persistent goal.
-The principal must call team_wait_decisions for up to 300000 ms. Handle early events immediately and read team_get_project. Do not sleep, fill unused wait time, consume developer handoffs or take over daily scheduling.
-Tasks require name/steps/acceptance/files/dependsOn/startCondition/tests. The manager reads team_domain_context, queues all ready work with team_dispatch_ready, and handles team_next_action FIFO. Developers and repair workers must first build and test their candidates and report successful command/exitCode results; log attachments are advisory. Then dispatch independent review. After review passes, the manager personally runs team_verify_candidate in the exact candidate branch and accepts only with passed=true and its verificationId. Failed checks require repair and fresh review.
-While workers or decisions remain, the manager stays in the same goal and waits exclusively through team_wait_actions for up to 300000 ms. Actionable results wake MCP immediately; do not sleep or fill the remaining time.
-Retire obsolete terminal items through team_retire_work_item, retaining history without fake repair jobs. Ordinary missing attachments are advisory warnings. Managers may collect/correct declared or in-worktree files through team_capture_evidence; original references and real replacement hashes are retained. Report/SHA mismatches return expected/actual values and pause that result. Genuinely blocked FIFO actions can be escalated by actionId/jobId instead of spinning.
-After all current planned items are accepted, team_finish_domain and complete the DSH goal. No integrator or preliminary merge is required. After the manager exits, the principal independently accepts, actually merges main and calls team_record_merge. Failed final acceptance requires a new complete charter/tasks plan through team_update_charter, then MCP waiting resumes.
-Legacy cluster tools remain compatible. Manager tools require project credentials; stable requestId, exact candidate SHA and resultVersion prevent duplicate dispatch and stale acceptance. Old records are never automatically converted into passing evidence.
+constexpr auto workflow=R"workflow(# FatFishBox simple team workflow
+Read team_get_prompt(principal). The principal plans only the requested changes and starts one persistent-goal manager. Use team_wait_decisions for up to 300000 ms; react immediately to early feedback. Never sleep or fill unused waiting time.
+The manager calls team_dispatch_ready and handles team_next_action FIFO. Developers implement and perform relevant self-tests. Arrange independent review and repair real defects. The manager confirms completion using judgement; team_verify_candidate is optional, never a mandatory acceptance gate.
+Do not collect proof, hashes, manifests, screenshot archives or exhaustive page/configuration/frame matrices. Do not expand a local fix into a full-product audit. Stop extra proof-only work from older checklists while preserving development/testing and existing sessions. Report actual results and skipped coverage honestly. No verificationId, evidence array or acceptanceResults proof list is required.
+Use MCP team_wait_actions while workers/decisions remain. After all current tasks are confirmed, team_finish_domain with requestId/summary, then complete the goal. The principal reviews actual changes and integrates main through team_record_merge or gives a clear repair plan. Retire obsolete terminal work through team_retire_work_item, never fake repairs. Keep ordinary ownership, valid Git references and stable IDs for correct bookkeeping.
 )workflow";
 
 File open_stream(DWORD standard_handle, const char* mode, int flags) {
@@ -94,6 +91,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
         const auto params=message.value("params",Json::object());
         const auto available_tools=[&] {
             auto result=principal_only?team_tools():Cluster::tools();
+            result.erase(std::remove_if(result.begin(),result.end(),[](const Json& t){const auto name=t.at("name").get<std::string>();return name=="team_capture_evidence" || name=="cluster_capture_evidence" || name=="cluster_get_evidence_manifest";}),result.end());
             if (principal_only) {
                 const std::set<std::string> allowed{"team_get_settings","team_get_prompt","team_start_project","team_get_project","team_list_projects","team_get_queue","team_wait_decisions","team_resolve_decision","team_update_charter","team_control_project","team_record_merge","team_capture_evidence","team_retire_work_item"};
                 auto filtered=Json::array();for (auto& entry:result) if (allowed.contains(entry.at("name").get<std::string>())) filtered.push_back(std::move(entry));return filtered;
@@ -106,7 +104,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"protocolVersion",mcp_protocol_supported(version)?version:"2025-11-25"},
                 {"capabilities",{{"tools",Json::object()},{"resources",Json::object()}}},
                 {"serverInfo",{{"name","fatfishbox"},{"title","肥鱼重工"},{"version",FATFISHBOX_VERSION}}},
-                {"instructions",principal_only?"Read team_get_prompt(principal), commit a complete task plan, and start one persistent-goal manager. Wait only through team_wait_decisions for up to 300000 ms; handle early feedback immediately. After manager completion, independently accept and merge each item, or provide a complete repair plan.":mcp_handoff_instructions}};
+                {"instructions",principal_only?"Read team_get_prompt(principal), commit a complete task plan, and start one persistent-goal manager. Wait only through team_wait_decisions for up to 300000 ms; handle early feedback immediately. After manager completion, review the actual changes and merge each item, or provide a complete repair plan.":mcp_handoff_instructions}};
             if (initialized) *initialized=true;
         } else if (method=="ping") {
             value=Json::object();
@@ -127,7 +125,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             try {
                 const auto tool=params.at("name").get<std::string>();
                 const auto available=available_tools();
-                if (std::ranges::none_of(available,[&](const Json& entry){return entry.at("name")==tool;}))
+                if (tool!="team_capture_evidence" && tool!="cluster_capture_evidence" && std::ranges::none_of(available,[&](const Json& entry){return entry.at("name")==tool;}))
                     throw std::runtime_error("此操作不对 MCP 开放");
                 auto data=invoke_tool(cluster,tool,params.value("arguments",Json::object()));
                 if (tool=="cluster_refresh_sessions") data={{"synced",data.at("sessions").size()},

@@ -336,7 +336,7 @@ void remember_result_evidence(const fs::path& data,const std::string& queue,cons
     if (saved.contains("current") && saved.at("current").at("evidenceManifest")!=summary.at("evidenceManifest")) saved["history"].push_back(saved.at("current"));
     saved["current"]=summary;write_state_file(file,saved);
 }
-Json attach_result_evidence(const fs::path& data,const std::string& queue,const Json& row,Json report) {
+Json attach_result_evidence(const fs::path&,const std::string&,const Json& row,Json report) {
     if (report.value("resultVersion","").empty()) return report;
     if (!report.contains("delivery") || !report.at("delivery").is_object())
         report["delivery"]={{"status",report.contains("failure")?"failed":"missing"},{"source","unavailable"}};
@@ -354,31 +354,8 @@ Json attach_result_evidence(const fs::path& data,const std::string& queue,const 
     if (!normalized.contains("checksManifest")) normalized["checksManifest"]=nullptr;
     if (!normalized.contains("evidenceManifest")) normalized["evidenceManifest"]=nullptr;
     if (!normalized.contains("nextAction")) normalized["nextAction"]="inspect_result";
-    auto bound=row;bound["resultVersion"]=report.at("resultVersion");
-    const auto file=attachment_file(data,queue,bound);
-    try {
-        Json summary;
-        if (fs::exists(file)) {
-            const auto saved=read_json(file,4*1024*1024);
-            if (saved.at("queueId")!=queue || saved.at("sessionId")!=row.at("id") || saved.at("resultVersion")!=report.at("resultVersion"))
-                throw std::runtime_error("证据绑定身份不匹配");
-            summary=saved.at("current");
-        } else {
-            summary=capture_evidence(data,queue,bound,report.at("delivery"));
-            remember_result_evidence(data,queue,bound,summary);
-        }
-        for (const auto* reference:{"checksManifest","evidenceManifest"}) {
-            const auto manifest=read_evidence_manifest(data,queue,summary.at(reference).get<std::string>());
-            if (manifest.at("sessionId")!=row.at("id") || manifest.at("resultVersion")!=report.at("resultVersion"))
-                throw std::runtime_error("证据清单的会话或结果版本不匹配");
-        }
-        auto& delivery=report.at("delivery");
-        for (const auto* member:{"checksManifest","evidenceManifest"}) {
-            if (delivery.contains(member) && !delivery.at(member).is_null() && delivery.at(member)!=summary.at(member)) delivery[std::string("reported")+(member[0]=='c'?"ChecksManifest":"EvidenceManifest")]=delivery.at(member);
-            delivery[member]=summary.at(member);
-        }
-        report["evidence"]=summary;
-    } catch (const std::exception& error) {report["evidence"]={{"state","unavailable"},{"error",error.what()}};}
+    // Reading a task result must never capture files, hash artifacts, inspect Git,
+    // create manifests, or trigger a proof/audit workflow.
     return report;
 }
 }

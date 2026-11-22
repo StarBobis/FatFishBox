@@ -294,7 +294,7 @@ Json extract_delivery(Json& messages) {
         const auto sha=parsed.value("candidateSha",Json());
         const auto clean=parsed.value("worktreeClean",Json());
         const auto tests=parsed.value("tests",Json());
-        const auto paths=parsed.value("evidencePaths",Json());
+        const auto paths=parsed.value("evidencePaths",Json::array());
         if (!parsed.contains("candidateSha") || (!sha.is_null() && (!sha.is_string() || !commit_sha(sha.get_ref<const std::string&>()))) ||
             !clean.is_boolean() || !tests.is_array() || tests.size()>16 || !evidence_paths(paths)) continue;
         Json checks=Json::array();
@@ -1303,6 +1303,7 @@ void Cluster::delete_desktop_queue(std::string_view queue_id) const {
 
 Json Cluster::invoke_mcp(std::string_view tool,const Json& input) const {
     require(input.is_object(),"工具参数必须为 JSON 对象");
+    if(tool=="cluster_capture_evidence" || tool=="team_capture_evidence") return {{"collectionDisabled",true},{"nextAction","Evidence collection was removed; continue normal work without capture or manifests."}};
     if (!queue_scoped_tool(tool)) return invoke(tool,input);
     Cluster queue=*this;
     Json arguments=input;
@@ -1890,7 +1891,7 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
             require(bool(document),"无法保存完整项目经理启动文档，禁止激活goal");
             const auto objective=std::string("You are the only project manager: dispatch developers, arrange independent review, perform final acceptance and coordinate repairs. Do not modify product code or write audit scripts.\n")+
                 "First read the bootstrap document below for the complete instructions, current charter, task plan and credentials. Do not begin product work before reading it.\nBootstrap document: "+
-                utf8(bootstrap)+"\nImmediately call team_domain_context, then team_dispatch_ready to queue every ready task from the principal's plan. Do not re-split the plan, dispatch just one independent item and wait, or implement changes yourself. Developers must build/test before review; you test only after review passes. Use MCP waits exclusively.\nProject objective: "+user_objective;
+                utf8(bootstrap)+"\nImmediately call team_domain_context, then team_dispatch_ready to queue every ready task from the principal's plan. Do not re-split the plan, dispatch just one independent item and wait, or implement changes yourself. Developers self-test, arrange independent review, then decide completion. Extra manager tests are optional. No formal proof collection or exhaustive capture is required. Use MCP waits exclusively.\nProject objective: "+user_objective;
             // The first goal round may start before commands/execute returns.
             // Persist everything it needs and capture the cursor BEFORE activation.
             const auto before=rpc_state(dsh,row);
@@ -1936,10 +1937,10 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
                 "; original task and issue definitions: "+row.at("taskRef").get<std::string>()+". Read that metadata as needed; "
                 "code changes remain restricted to the assigned workspace. Base SHA: "+row.value("baseSha",std::string("unspecified"))+".\n\n";
             const auto prompt = role=="lead"?task:(review_worker(row)?task:task_context+"Work in the assigned workspace only. Do not change provider/model, start nested agents, "
-                "or publish changes without authorization. Return verifiable evidence. In the final answer include a fenced "
+                "or publish changes without authorization. Do not perform proof collection or exhaustive screenshot/audit sweeps. In the final answer include a fenced "
                 "```fatfish-delivery JSON block with workItemId, baseSha (full commit hash or null), candidateSha (full commit hash or null), "
-                "status (passed/failed/blocked), issues, nextAction, optional checksManifest and evidenceManifest, worktreeClean (boolean), "
-                "tests (array of {command,exitCode}), and evidencePaths (array of local absolute paths). "
+                "status (passed/failed/blocked), issues, nextAction, worktreeClean (boolean), "
+                "tests (array of actual {command,exitCode}); attachments and manifests are not required. "
                 "Only report tests you actually ran.\n\n" + task);
             const Json request{{"sessionId",sid},{"requestId",key},{"mode","queue"},
                 {"content",Json::array({{{"type","text"},{"text",prompt}}})}};
@@ -2220,7 +2221,7 @@ void Cluster::advance_prechecks(std::stop_token stop) const {
                     ". Inspect the committed diff and independently verify acceptance conditions. Never modify the candidate "
                     "worktree or switch its HEAD. If executing a build or test writes files, use a separate detached git "
                     "worktree at that SHA. Do not publish, start nested agents, or change provider/model. "
-                    "Do not rely on the developer's claims. Look for regressions and missing evidence. "
+                    "Do not rely on the developer's claims. Look for actual regressions using relevant checks; do not collect proof or run exhaustive screenshot sweeps. "
                     "Finish with exactly one fenced block named fatfish-review containing JSON with candidateSha (the exact SHA), "
                     "verdict (pass, fail, or blocked). On pass include checks (a nonempty list of short checks actually run or "
                     "inspected). On fail include findings (up to six objects with short issue, evidence, acceptance strings). "
@@ -2283,65 +2284,7 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
     if (tool.starts_with("team_")) return team_invoke(*this,data_,tool,input);
     if (tool=="cluster_get_evidence_manifest")
         return evidence_manifest_page(data_,read_evidence_manifest(data_,queue_id_,field(input,"manifestId",200)),input);
-    if (tool=="cluster_capture_evidence") {
-        const auto key=field(input,"sessionId",256);
-        auto row=invoke("cluster_get_session",{{"sessionId",key}});
-        if (input.contains("resultVersion")) require(input.at("resultVersion")==row.at("resultVersion"),"结果版本已变化，请重新核对采集来源");
-        auto artifact=load_result_artifact(data_,queue_id_,key,row.value("resultVersion",""));
-        auto delivery=artifact.is_null()?Json{{"candidateSha",nullptr},{"tests",Json::array()},{"evidencePaths",Json::array()}}:
-            artifact.value("delivery",Json{{"candidateSha",nullptr},{"tests",Json::array()},{"evidencePaths",Json::array()}});
-        if (input.contains("candidateSha")) {
-            require(input.at("candidateSha").is_string() && commit_sha(input.at("candidateSha").get<std::string>()),"candidateSha 须为完整 Git SHA");
-            delivery["candidateSha"]=input.at("candidateSha");
-        }
-        if (input.contains("tests")) delivery["tests"]=input.at("tests");
-        const auto& tests=delivery.at("tests");
-        require(tests.is_array() && tests.size()<=64,"tests 须为最多 64 项的数组");
-        for (const auto& test:tests) {
-            require(test.is_object(),"test 须为对象");field(test,"command",2000);
-            require(test.contains("exitCode") && test.at("exitCode").is_number_integer(),"test.exitCode 须为整数");
-            if (test.contains("logPath")) require(path_from_utf8(field(test,"logPath",4000)).is_absolute(),"测试日志须为绝对路径");
-        }
-        Json options=Json::object();
-        options["testSource"]=input.contains("tests")?"caller_reported":"agent_reported";
-        if (input.contains("configuration")) options["configuration"]=field(input,"configuration",120);
-        if (input.contains("files")) {
-            require(input.at("files").is_array() && input.at("files").size()<=128,"files 须为最多 128 项的数组");
-            for (const auto& entry:input.at("files")) {
-                const auto path=entry.is_string()?entry.get<std::string>():field(entry,"path",4000);
-                require(path.size()<=4000 && path.find('\0')==path.npos && path_from_utf8(path).is_absolute(),"证据须为有效绝对路径");
-                if (entry.is_object() && entry.contains("kind")) {
-                    const auto kind=field(entry,"kind",32);
-                    require(kind=="screenshot" || kind=="executable" || kind=="test_log" || kind=="build_config" || kind=="other","证据 kind 无效");
-                }
-            }
-            options["files"]=input.at("files");
-        }
-        Json corrections=Json::object();
-        if(row.contains("evidenceManifest") && row.at("evidenceManifest").is_string()) try {
-            const auto previous=read_evidence_manifest(data_,queue_id_,row.at("evidenceManifest").get<std::string>());
-            if(previous.at("sessionId")==key && previous.at("resultVersion")==row.at("resultVersion") && previous.at("candidateSha")==delivery.at("candidateSha"))
-                for(const auto& c:previous.value("fileCorrections",Json::array())) corrections[c.at("reportedPath").get<std::string>()]=c;
-        } catch(const std::exception&) { /* An unavailable old manifest cannot authorize a correction. */ }
-        if(input.contains("corrections")) {
-            require(input.at("corrections").is_array() && input.at("corrections").size()<=128,"corrections must contain at most 128 entries");
-            for(const auto& c:input.at("corrections")) {const auto reported=field(c,"reportedPath",4000),replacement=field(c,"replacementPath",4000);field(c,"reason",4000);require(path_from_utf8(reported).is_absolute() && path_from_utf8(replacement).is_absolute(),"Correction paths must be absolute");corrections[reported]=c;}
-        }
-        if(!corrections.empty()) {options["corrections"]=Json::array();for(const auto& c:corrections) options["corrections"].push_back(c);}
-        auto result=capture_evidence(data_,queue_id_,row,delivery,options);
-        remember_result_evidence(data_,queue_id_,row,result);
-        {
-            Database db(data_,true);
-            auto& rows=db.state.at("sessions");
-            if (rows.contains(key) && rows.at(key).value("resultVersion","")==row.value("resultVersion","")) {
-                rows.at(key)["checksManifest"]=result.at("checksManifest");
-                rows.at(key)["evidenceManifest"]=result.at("evidenceManifest");
-                db.save();
-            }
-        }
-        result["sessionId"]=key;result["workItemId"]=row.at("workItemId");
-        return result;
-    }
+    if (tool=="cluster_capture_evidence") return {{"collectionDisabled",true},{"nextAction","Continue normal development, relevant self-tests and review. Evidence collection has been removed."}};
     if (tool=="cluster_send_message" || tool=="cluster_get_message") {
         const auto key=field(input,"sessionId",256),request=field(input,"requestId",160);
         require(!key.starts_with("codex:"),"追加消息只支持肥鱼重工派发的 DSH 会话");
@@ -2447,17 +2390,6 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
             return result;
         }
         if (tool=="cluster_update_work_item") {
-            const auto& details=input.value("details",Json::object());
-            const auto work=field(input,"workItemId",100),request=field(input,"requestId",160);
-            const auto& saved=db.state.at("workItems").at(work);
-            const bool replay=saved.at("queueId")==queue_id_ && saved.at("operations").contains(request);
-            if (!replay) for (const auto* reference:{"checksManifest","evidenceManifest"}) if (details.contains(reference)) {
-                const auto manifest=read_evidence_manifest(data_,queue_id_,field(details,reference,200));
-                const auto& item=db.state.at("workItems").at(field(input,"workItemId",100));
-                require(item.at("queueId")==queue_id_ && item.at("sessions").contains(manifest.at("sessionId").get<std::string>()),"证据不属于该事项的会话");
-                if (details.contains("candidateSha")) require(manifest.at("candidateSha")==details.at("candidateSha"),"证据候选 SHA 不匹配");
-                require(manifest.at("kind")==std::string(reference[0]=='c'?"checks":"evidence"),"证据清单类型不匹配");
-            }
             auto result=update_work_item(db.state,queue_id_,input,observed);
             db.save();
             result["taskRef"]=publish_work_item_spec(data_,db.state.at("workItems").at(result.at("workItemId").get<std::string>()));

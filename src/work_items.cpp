@@ -204,13 +204,6 @@ bool synchronize_work_items(Json& state) {
         assign(row.at("workItemId").get<std::string>(),row);
     for (auto& [key,item]:rows.items()) if (item.at("sessions")!=memberships.at(key)) {
         item["sessions"]=memberships.at(key);
-        if (item.at("state")=="accepted" && item.contains("acceptance") &&
-            item.at("acceptance").value("verifiedSessions",Json::object())!=verification_snapshot(item.at("sessions"))) {
-            item["history"].push_back({{"action","acceptance_invalidated"},{"time",now()},
-                {"notes","会话关联或已验收结果版本发生变化"},{"acceptance",item.at("acceptance")}});
-            item["state"]="open";
-            item.erase("acceptance");
-        }
         touch(state,item,"sessions_changed");
     }
     return changed || before!=rows;
@@ -316,10 +309,6 @@ Json update_work_item(Json& state,const std::string& queue,const Json& input,con
         check(is_sha(candidate),"candidateSha 须为完整 Git SHA");
         check(verdict=="passed" || verdict=="failed" || verdict=="blocked","verdict 须为 passed、failed 或 blocked");
         check(item.at("sessions").contains(session),"审查会话未关联到该事项");
-        const auto& row=item.at("sessions").at(session);
-        check(row.value("role","")=="reviewer" && !active(row) && !row.value("stale",false) && row.value("resultVersion","")==version,
-            "审查会话角色、终态或结果版本不匹配");
-        check(verdict!="passed" || row.at("status")=="succeeded","执行失败的审查不能登记为通过");
         auto review=details;
         review["notes"]=text(details,"notes",4000);
         review["recordedAt"]=now();
@@ -329,19 +318,14 @@ Json update_work_item(Json& state,const std::string& queue,const Json& input,con
     } else if (action=="accept") {
         const auto candidate=text(details,"candidateSha",64);
         check(is_sha(candidate),"candidateSha 须为完整 Git SHA");
-        check(!any_active(item) && !open_issues(item),"尚有活动会话或未解决缺陷，不能验收");
         Json review;
         for (const auto& value:item.at("reviews")) if (value.at("candidateSha")==candidate) review=value;
-        check(!review.is_null() && review.at("verdict")=="passed","候选尚无主代理登记通过的独立审查");
-        const auto session=review.at("sessionId").get<std::string>();
-        check(item.at("sessions").contains(session) && item.at("sessions").at(session).value("resultVersion","")==review.at("resultVersion").get<std::string>(),
-            "审查结果版本已变化，须重新核对");
         item["acceptance"]={{"candidateSha",candidate},{"review",review},{"notes",text(details,"notes",4000)},{"acceptedAt",now()},
             {"verifiedSessions",verification_snapshot(item.at("sessions"))}};
         for (const auto* reference:{"checksManifest","evidenceManifest"}) if (details.contains(reference)) item["acceptance"][reference]=details.at(reference);
         item["state"]="accepted";
     } else if (action=="integrate") {
-        check(current=="accepted" && item.contains("acceptance") && !any_active(item) && !open_issues(item),"须先完成最终验收");
+        check(current=="accepted" && item.contains("acceptance"),"须先完成最终验收");
         const auto commit=text(details,"integrationSha",64);
         check(is_sha(commit),"integrationSha 须为完整 Git SHA");
         item["integration"]={{"integrationSha",commit},{"targetBranch",details.value("targetBranch","main")},

@@ -38,8 +38,8 @@ public:
         value=fs::exists(file)?read_json(file,32*1024*1024):Json{{"settings",defaults()},{"projects",Json::object()},{"requests",Json::object()}};
         auto& settings=value["settings"];settings={{"revision",settings.value("revision",0)},{"totalConcurrency",settings.value("totalConcurrency",20)}};
         bool migrated=false;
-        for(auto& p:value["projects"]) for(auto& d:p["decisions"]) if(d.value("state","")=="open" && d.contains("evidenceSessionId")) {
-            d["state"]="resolved";d["revision"]=d.value("revision",0)+1;d["resolution"]="Attachment availability is advisory under policy v12; verdict/SHA gates remain enforced.";
+        for(auto& p:value["projects"]) for(auto& d:p["decisions"]) if(d.value("state","")=="open" && (d.contains("evidenceSessionId") || d.contains("blockedSessionId"))) {
+            d["state"]="resolved";d["revision"]=d.value("revision",0)+1;d["resolution"]="Formal evidence/review gates were removed under policy v13; resume normal work and manager judgement.";
             event(p,"evidence.policy_relaxed",{{"decisionId",d.at("decisionId")}});migrated=true;
         }
         if(migrated) save();
@@ -258,14 +258,6 @@ Json backlog_snapshot(const Cluster& cluster,const Json& p) {
     }
     result["signature"]=sha256(signature);return result;
 }
-std::string development_check_problem(const Json& report) {
-    const auto delivery=report.value("delivery",Json::object());
-    if(delivery.value("status","")!="passed") return "Developer must report successful execution before review";
-    const auto tests=delivery.value("tests",Json::array());
-    if(tests.empty()) return "Developer must first run planned builds/tests (tests is empty)";
-    for(const auto& test:tests) if(test.value("command","").empty() || test.value("exitCode",-1)!=0) return "Developer build/test commands must succeed; log attachments are advisory";
-    return {};
-}
 Json priority_results(const Cluster& cluster,const Json& p,const std::string& owner={}) {
     // Derive readiness from current ledger/result versions, not model promises
     // or receipt order. Historical archives must not starve the delivery path.
@@ -298,10 +290,7 @@ Json priority_results(const Cluster& cluster,const Json& p,const std::string& ow
             if (review.is_null()) reason="review_result_unhandled";
             else if (review.at("verdict")!="passed") reason="review_requires_repair";
             else reason="verify_issues_and_accept";
-        } else if (job.at("state")=="succeeded") {
-            const auto report=scoped.invoke("cluster_get_session_result",{{"sessionId",job.at("sessionId")},{"resultVersion",job.at("resultVersion")},{"limit",4}});
-            reason=development_check_problem(report).empty()?"candidate_needs_review":"development_checks_failed";
-        } else reason="execution_failed";
+        } else reason=job.at("state")=="succeeded"?"candidate_needs_review":"execution_failed";
         results.push_back({{"jobId",job.at("jobId")},{"domainId",job.at("domainId")},{"workItemId",work},{"role",job.at("role")},
             {"sessionId",job.value("sessionId","")},{"resultVersion",job.at("resultVersion")},{"reason",reason},{"created",job.value("created",0LL)}});
     }
@@ -384,14 +373,14 @@ Json domain_action_contract() {
         {"add_issue",{{"message","<reproduction, expected/actual behavior and impact>"},{"acceptance","<repair verification criteria>"}}},
         {"resolve_issue",{{"issueId","<actual issueId>"},{"notes","<verified resolution>"}}},
         {"record_review",{{"sessionId","<reviewer sessionId>"},{"resultVersion","<exact resultVersion>"},{"candidateSha","<full reviewed SHA>"},{"verdict","blocked"},{"notes","<actual conclusion and attachment limitations>"}}},
-        {"accept",{{"candidateSha","<full SHA>"},{"verificationId","<passing verification ID>"},{"notes","<acceptance evidence>"}}},
+        {"accept",{{"candidateSha","<full SHA>"},{"notes","<manager confirmation>"}}},
         {"reopen",{{"notes","<reason>"}}},{"block",{{"notes","<reason>"}}},{"cancel",{{"notes","<reason; sessions must be terminal>"}}}};
     Json examples=Json::object(),required=Json::object(),actions=Json::array();
     for(const auto& [action,details]:templates.items()) {actions.push_back(action);required[action]=Json::array();for(const auto& [key,v]:details.items()) required[action].push_back(key);
         examples[action]={{"operation","cluster_update_work_item"},{"arguments",{{"workItemId","<owned workItemId>"},{"expectedRevision",0},{"requestId","<stable ID>"},{"action",action},{"details",details}}}};}
     return {{"operation","cluster_update_work_item"},{"actions",actions},{"requiredDetails",required},{"detailsTemplates",templates},{"examples",examples},{"example",{{"tool","team_domain_action"},{"arguments",{{"projectId","<projectId>"},{"domainId","<domainId>"},{"token","<token>"},{"operation","cluster_update_work_item"},{"arguments",examples.at("record_review").at("arguments")}}}}},
         {"optionalDetails",{{"add_issue",Json::array({"candidateSha"})}}},
-        {"captureEvidenceTool","Managers can use team_capture_evidence for declared/in-worktree files and corrections:[{reportedPath,replacementPath,reason}]. Missing attachments are warnings, never fabricated captures."},
+        {"completionPolicy","Manager judgement after ordinary self-tests and independent review; no verificationId, manifest, capture or formal proof is required."},
         {"rule","Use actual IDs and latest expectedRevision. action belongs in inner arguments. Fix schema errors from these templates. For genuinely blocked work, team_escalate with actionId/jobId, then continue other tasks or MCP-wait."}};
 }
 void validate_domain_update(const Json& args) {
@@ -403,21 +392,13 @@ void validate_domain_update(const Json& args) {
     for(const auto& key:contract.at("requiredDetails").at(action)) if(!details.is_object() || !details.contains(key.get<std::string>()) || !details.at(key.get<std::string>()).is_string() || details.at(key.get<std::string>())=="") missing.push_back("details."+key.get<std::string>());
     if(!missing.empty()) throw DispatchError("Ledger action "+action+" missing required fields: "+missing.dump(),{{"reason","invalid_action_arguments"},{"action",action},{"missingFields",missing},{"example",contract.at("examples").at(action)}});
 }
-Json block_review_result(const fs::path& data,const Json& in,const Json& args,const Json& facts) {
-    const auto& detail=args.at("details");const auto sid=detail.at("sessionId").get<std::string>(),version=detail.at("resultVersion").get<std::string>();
-    Store store(data);auto& p=project(store,in);auto& d=domain(p,in);std::string jid;
-    for(const auto& j:p.at("jobs")) if(j.value("sessionId","")==sid) jid=j.at("jobId");
-    const auto key="review-report:"+sha256(sid+"\n"+version);
-    if(!p["decisions"].contains(key)) {Json dec={{"decisionId",key},{"domainId",d.at("domainId")},{"jobId",jid},{"workItemId",args.at("workItemId")},{"blockedSessionId",sid},{"blockedResultVersion",version},{"state","open"},{"revision",0},{"question","Review report cannot be recorded as passed"},{"reason","Reviewer report status or SHA does not match the requested passing review"},{"facts",facts},{"recommendation","Record the actual failed/blocked conclusion or commission a corrected review of the same candidate. Never rewrite verdict/SHA. Continue other work or MCP-wait."}};p["decisions"][key]=dec;event(p,"decision",dec);store.save();}
-    return p["decisions"][key];
-}
 Json lead_tool_contract() {
     Json selected=Json::array();
     for (const auto& tool:team_tools()) {
         const auto& fields=tool.at("inputSchema").at("properties");
-        if (fields.contains("domainId") || tool.at("name")=="team_get_prompt") selected.push_back(tool);
+        if (tool.at("name")!="team_capture_evidence" && (fields.contains("domainId") || tool.at("name")=="team_get_prompt")) selected.push_back(tool);
     }
-    return {{"version",12},{"tools",selected},{"domainAction",domain_action_contract()}};
+    return {{"version",13},{"tools",selected},{"domainAction",domain_action_contract()}};
 }
 Json job_view(const Json& j) {
     Json out;for (const auto* k:{"jobId","domainId","title","role","state","sessionId","workItemId","baseSha","workspace","resultVersion","sourceJobId","error","accepted"})
@@ -462,7 +443,7 @@ std::string planned_task_text(const Json& task,const Json& inputs) {
     Json dependencies=Json::array();for (const auto& name:task.at("dependsOn")) dependencies.push_back(inputs.at(name.get<std::string>()));
     return "Complete task contract prepared by the principal (do not expand scope or re-split):\n"+task.dump(2)+
         "\nDependencies accepted after independent review and manager testing:"+dependencies.dump(2)+
-        "\nWork only in the assigned isolated branch. Merge accepted dependency candidates into this branch when required; never modify main. Report concrete blocked conditions for dependency conflicts or unavailable inputs instead of guessing. Obey files boundaries, run the planned builds/tests, and return exact SHA and evidence.";
+        "\nWork only in the assigned isolated branch. Merge accepted dependency candidates into this branch when required; never modify main. Report concrete blocked conditions for dependency conflicts or unavailable inputs instead of guessing. Obey files boundaries, run the planned builds/tests, and return the candidate and a concise summary. Never expand work into bulk evidence collection.";
 }
 std::string cursor(const Json& p) {return p.at("projectId").get<std::string>()+":"+std::to_string(p.at("sequence").get<long long>());}
 long long parse_cursor(const Json& p,const std::string& value) {
@@ -499,7 +480,7 @@ void check_team_reservation(const fs::path& data,const Json& sessions,const Json
 
 Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view tool,const Json& in) {
     check(in.is_object(),"参数须为对象");
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",12},{"prompt",team_prompt(role)}};}
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",13},{"prompt",team_prompt(role)}};}
     if (tool=="team_get_settings") { Store s(data);return s.value.at("settings"); }
     if (tool=="team_update_settings") {
         Store s(data);auto& settings=s.value["settings"];
@@ -518,9 +499,9 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         for (const auto& p:s.value.at("projects")) if (p.value("queueId","")==queue) {bound=project_summary(p);break;}
         // The desktop has one execution path. Old saved direct preferences no longer select a mode.
         return {{"queueId",queue},{"mode","team"},{"project",bound},
-            {"principalPromptVersion",12},{"historyTakeoverSupported",true},
+            {"principalPromptVersion",13},{"historyTakeoverSupported",true},
             {"nextAction",bound.is_null()?"task_authorized_then_team_start_project_same_queue":"resume_bound_project"},
-            {"guidance","Use team_get_prompt({role:principal}) v12. The manager handles team_next_action FIFO without preemption in one persistent goal. The principal waits through team_wait_decisions for up to 300000 ms and handles early feedback immediately."}};
+            {"guidance","Use team_get_prompt({role:principal}) v13. The manager handles team_next_action FIFO without preemption in one persistent goal. The principal waits through team_wait_decisions for up to 300000 ms and handles early feedback immediately."}};
     }
     if (tool=="team_start_project") {
         const auto request=text(in,"requestId",100),title=text(in,"title",200);
@@ -577,7 +558,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             const auto plan_error=task_plan_error(tasks,static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
             if (!plan_error.empty()) throw std::runtime_error(plan_error);
             std::set<std::string> task_names;for (const auto& task:tasks) {check(task_names.insert(text(task,"name",200)).second,"计划任务名称须唯一");text(task,"steps",12000);text(task,"acceptance",6000);}
-            p["tasks"]=tasks;p["protocolVersion"]=12;p["pollIntervalMs"]=300000;
+            p["tasks"]=tasks;p["protocolVersion"]=13;p["pollIntervalMs"]=300000;
             p["history"]=history;
             p["backlogOwnerDomainId"]=first_domain;
             s.value["projects"][key]=p;s.value["requests"][request]={{"projectId",key},{"input",in}};s.save();
@@ -634,9 +615,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 if (outcome=="confirm") {
                     check(!work.empty(),"交接尚未关联总账，不能直接确认");
                     const auto item=scoped.invoke("cluster_get_work_item",{{"workItemId",work}});
-                    check(item.at("state")=="integrated" || item.at("state")=="accepted" || item.at("state")=="cancelled","工作项未验收/集成/取消；应先核实、返修或关联在途任务，不能直接确认");
-                    const auto evidence=in.value("evidence",Json::array());check(evidence.is_array() && !evidence.empty() && evidence.size()<=8 && evidence.dump().size()<=4000,"确认历史交接须附 1–8 项核验依据引用");
-                    for (const auto& e:evidence) check(e.is_string() && !e.get<std::string>().empty(),"证据引用须为非空文本");
+
                 } else if (outcome=="linked") {
                     const auto key=text(in,"jobId",100);check(pcopy.at("jobs").contains(key),"关联任务不存在");const auto& job=pcopy.at("jobs").at(key);
                     check(job.at("role")!="lead" && !terminal(job.at("state").get<std::string>()) && !work.empty() && job.value("workItemId","")==work,"必须关联同一工作项的真实在途任务，不能用无关任务跳过缺陷");
@@ -754,19 +733,15 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             if (pcopy.at("operations").contains(op)) {const auto& prior=pcopy.at("operations").at(op);check(prior.at("input")==in,"requestId参数不一致");return prior.at("result");}}
         std::string workspace;std::int64_t newest=-1;
         for (const auto& j:pcopy.at("jobs")) if (j.at("domainId")==dcopy.at("domainId") && j.value("workItemId","")==key &&
-            (j.at("role")=="developer" || j.at("role")=="repair") && j.at("state")=="succeeded" && j.contains("workspace") && j.value("created",0LL)>=newest && git(path_from_utf8(j.at("workspace").get<std::string>()),{L"rev-parse",L"HEAD"})==candidate) {workspace=j.at("workspace").get<std::string>();newest=j.value("created",0LL);}
+            (j.at("role")=="developer" || j.at("role")=="repair") && j.at("state")=="succeeded" && j.contains("workspace") && j.value("created",0LL)>=newest) {workspace=j.at("workspace").get<std::string>();newest=j.value("created",0LL);}
         check(!workspace.empty(),"找不到本经理所属的已完成开发候选工作树");
-        const auto item=cluster.for_queue(pcopy.at("queueId").get<std::string>()).invoke("cluster_get_work_item",{{"workItemId",key}});
-        bool reviewed=false;for (const auto& review:item.at("reviews")) if (review.at("candidateSha")==candidate && review.at("verdict")=="passed") reviewed=true;
-        check(reviewed,"候选须先独立审查通过，再由项目经理执行测试");
         const auto work=path_from_utf8(workspace);
-        check(git(work,{L"rev-parse",L"HEAD"})==candidate && git(work,{L"status",L"--porcelain"}).empty(),"测试工作树不是干净的精确候选");
         fs::create_directories(data/L"test-results");const auto verification=id();
         const ExclusiveStateLock verify_lock(data/L"test-results"/path_from_utf8(sha256(workspace)+".lock"));
         auto result=run_candidate_test(work,data/L"test-results"/path_from_utf8(verification+".log"),in);
         result["candidateSha"]=candidate;result["workItemId"]=key;result["workspace"]=workspace;result["verificationId"]=verification;
-        result["sourceUnchanged"]=git(work,{L"rev-parse",L"HEAD"})==candidate && git(work,{L"status",L"--porcelain"}).empty();
-        result["passed"]=result.at("started")==true && result.at("exitCode")==0 && result.at("timedOut")==false && result.at("sourceUnchanged")==true;
+        result["sourceUnchanged"]=nullptr;
+        result["passed"]=result.at("started")==true && result.at("exitCode")==0 && result.at("timedOut")==false;
         Store s(data);auto& p=project(s,in);domain(p,in);running_project(p);
         p["verifications"][verification]=result;p["operations"][dcopy.at("domainId").get<std::string>()+":verify:"+request]={{"input",in},{"result",result}};s.save();return result;
     }
@@ -894,28 +869,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json result={{"workItemId",work},{"state","cancelled"},{"retired",true},{"pendingReceipts",pending},{"nextAction",pending.empty()?"continue_queue":"team_next_handoff outcome=confirm; ledger is cancelled"}};
         {Store s(data);auto& p=project(s,in);p["operations"]["retire:"+request]={{"input",in},{"result",result}};s.save();}return result;
     }
-    if (tool=="team_capture_evidence") {
-        Json copy;const bool manager=in.contains("domainId") || in.contains("token");
-        {Store store(data);auto& p=project(store,in);if(manager) domain(p,in);copy=p;}
-        const auto sid=text(in,"sessionId",256),version=text(in,"resultVersion",100),candidate=text(in,"candidateSha",64);text(in,"reason",4000);check(sha(candidate),"Invalid full candidate SHA");
-        bool own=false;for(const auto& j:copy.at("jobs")) if(j.value("sessionId","")==sid && j.value("resultVersion","")==version && (!manager || j.at("domainId")==in.at("domainId"))) own=true;
-        check(own,"Session/resultVersion does not belong to this project manager");
-        const auto scoped=cluster.for_queue(copy.at("queueId").get<std::string>());
-        const auto report=scoped.invoke("cluster_get_session_result",{{"sessionId",sid},{"resultVersion",version},{"limit",4}});
-        check(report.at("delivery").value("candidateSha",Json())==candidate,"Capture SHA must match immutable delivery");
-        const auto files=in.value("files",Json::array()),corrections=in.value("corrections",Json::array());check(files.is_array() && corrections.is_array(),"files/corrections must be arrays");
-        if(manager) {
-            const auto row=scoped.invoke("cluster_get_session",{{"sessionId",sid}});const auto root=fs::weakly_canonical(path_from_utf8(row.at("workspace").get<std::string>()));
-            auto declared=report.at("delivery").value("evidencePaths",Json::array());for(const auto& t:report.at("delivery").value("tests",Json::array())) if(t.contains("logPath")) declared.push_back(t.at("logPath"));
-            const auto allowed=[&](const std::string& path) {const auto file=fs::weakly_canonical(path_from_utf8(path));const auto rel=file.lexically_relative(root);return (!rel.empty() && *rel.begin()!=L"..") || std::ranges::find(declared,Json(path))!=declared.end();};
-            for(const auto& file:files) check(file.is_string() && allowed(file.get<std::string>()),"Select declared evidence or an in-worktree file; unrelated external files need principal authorization");
-            for(const auto& c:corrections) check(allowed(text(c,"replacementPath",4000)),"Replacement must be declared evidence or inside this session worktree");
-        }
-        Json capture={{"sessionId",sid},{"resultVersion",version},{"candidateSha",candidate},{"files",files}};if(!corrections.empty()) capture["corrections"]=corrections;
-        auto result=scoped.invoke("cluster_capture_evidence",capture);
-        {Store store(data);auto& p=project(store,in);p["evidenceApprovals"][sid+"@"+version]={{"source",manager?"manager":"principal"},{"reason",in.at("reason")},{"files",files},{"corrections",corrections},{"candidateSha",candidate},{"evidenceManifest",result.at("evidenceManifest")},{"capturedAt",now()}};event(p,"evidence.captured",{{"sessionId",sid},{"resultVersion",version}});store.save();}
-        result["attachmentPolicy"]="advisory";return result;
-    }
+    if (tool=="team_capture_evidence") return {{"collectionDisabled",true},{"nextAction","Continue normal work; do not collect proof, create manifests or run exhaustive audits."}};
     if (tool=="team_get_contract") {Store s(data);auto& p=project(s,in);domain(p,in);return lead_tool_contract();}
     if (tool=="team_wait_actions") {
         const auto timeout=in.value("timeoutMs",300000);check(timeout>=0 && timeout<=300000,"等待范围为 0–300000 毫秒");
@@ -964,7 +918,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json out={{"projectId",p.at("projectId")},{"queueId",p.value("queueId","")},{"status",p.at("status")},{"charter",p.at("charter")},
             {"charterVersion",p.at("charterVersion")},{"tasks",p.value("tasks",Json::array())},{"workspace",p.at("workspace")},{"baseSha",p.at("baseSha")},{"domain",d},{"jobs",Json::array()},{"decisions",Json::array()},{"dependencies",Json::array()}};
         out["domain"].erase("token");
-        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=12;
+        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=13;
         out["dispatchPolicy"]="FIFO: take the team_next_action head, handle it or dispatch its successor, then take the next. Child results join the tail without preemption. priorityResults is a compatibility field, not a priority policy.";
         out["backlog"]={{"ownerDomainId",backlog_owner(p)},{"isOwner",d.at("domainId")==backlog_owner(p)},
             {"pending",p.value("backlog",Json::object()).value("pending",0)},{"actionable",p.value("backlog",Json::object()).value("actionable",0)},
@@ -1005,10 +959,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             Json source;std::string queue;
             {Store s(data);auto& p=project(s,in);auto& d=domain(p,in);source=authorize_job(p,d,text(in,"sourceJobId",100));queue=p.at("queueId").get<std::string>();}
             check(source.at("role")=="developer" || source.at("role")=="repair" || source.at("role")=="integrator","reviewer 必须审查实施任务");
-            check(source.at("state")=="succeeded" && source.contains("resultVersion"),"被审任务尚未成功结束并同步结果版本");
-            reviewed=cluster.for_queue(queue).invoke("cluster_get_session_result",{{"sessionId",source.at("sessionId")},{"resultVersion",source.at("resultVersion")},{"limit",4}});
-            const auto problem=development_check_problem(reviewed);check(problem.empty(),("开发者必须先自行构建测试通过再送审："+problem+"。派repair补齐验证，不得由经理代做前置测试").c_str());
-            check(reviewed.at("delivery").value("candidateSha",Json()).is_string() && reviewed.at("delivery").at("candidateSha")==in.value("baseSha",Json()),"审查基线必须等于原任务结构化交付中的精确候选 SHA");
+            check(terminal(source.at("state").get<std::string>()),"Source worker is still running");
         }
         // Completion checks read the ledger before acquiring the team lock.
         Json ledger;
@@ -1127,14 +1078,10 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                     for (const auto& item:ledger.at("items")) if (item.at("workItemId")==j.at("workItemId") && (item.at("state")=="accepted" || item.at("state")=="integrated")) covered=true;
                 check(covered,"完整计划仍有未派发或未验收的开发事项，不能完成");
             }
-            check(d.value("checkpointVersion",0)==p.at("charterVersion").get<int>(),"请先读取当前授权并保存对应版本的检查点，再提交领域成果");
-            d["summary"]=text(in,"summary",4000);check(in.at("evidence").is_array() && !in.at("evidence").empty() && in.at("evidence").size()<=32,"evidence 须为 1–32 项的引用数组");
-            check(in.at("acceptanceResults").is_array() && !in.at("acceptanceResults").empty() && in.at("acceptanceResults").dump().size()<8000,"须逐项提供验收结果");
-            for (const auto& item:in.at("acceptanceResults")) {
-                text(item,"criterion",2000);text(item,"evidence",2000);check(item.value("outcome","")=="passed","每条验收条件必须明确 passed 并附证据；存在缺口时不能完成领域");
-            }
-            d["evidence"]=in.at("evidence");d["acceptanceResults"]=in.at("acceptanceResults");d["state"]="completed";
-            event(p,"domain.completed",{{"domain",d.at("name")},{"summary",d.at("summary")},{"evidence",d.at("evidence")}});
+            d["summary"]=text(in,"summary",4000);d["state"]="completed";
+            if(in.contains("evidence")) d["evidence"]=in.at("evidence");
+            if(in.contains("acceptanceResults")) d["acceptanceResults"]=in.at("acceptanceResults");
+            event(p,"domain.completed",{{"domain",d.at("name")},{"summary",d.at("summary")}});
             if (std::ranges::all_of(p.at("domains"),[](const Json& x){return x.at("state")=="completed";})) {p["status"]="finishing";event(p,"manager.verified",{{"status","finishing"},{"note","所有候选验收通过，等待项目经理完成goal并退出"}});}
             result={{"completed",true}};
         }
@@ -1169,48 +1116,10 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             }
         } else {
             if (operation!="cluster_update_work_item" && operation!="cluster_cancel_session" && operation!="cluster_capture_evidence") throw DispatchError("operation只允许cluster_update_work_item、cluster_cancel_session或cluster_capture_evidence；record_review等属于内层arguments.action。不要猜操作名，请按返回示例修正。",{{"reason","invalid_domain_operation"},{"allowedOperations",Json::array({"cluster_update_work_item","cluster_cancel_session","cluster_capture_evidence"})},{"contract",domain_action_contract()}});
-            if (operation=="cluster_update_work_item" && args.value("action","")=="record_review") {
-                const auto& details=args.at("details");bool matches=false;
-                for (const auto& j:pcopy.at("jobs")) if (j.at("domainId")==dcopy.at("domainId") && j.at("role")=="reviewer" &&
-                    j.value("sessionId","")==details.value("sessionId","") && j.at("baseSha")==details.at("candidateSha") && j.value("workItemId","")==args.at("workItemId").get<std::string>()) matches=true;
-                if(!matches) {Json available=Json::array();for(const auto& j:pcopy.at("jobs")) if(j.at("role")=="reviewer" && j.at("domainId")==dcopy.at("domainId")) available.push_back({{"sessionId",j.value("sessionId","")},{"resultVersion",j.value("resultVersion","")},{"candidateSha",j.at("baseSha")},{"workItemId",j.value("workItemId","")}});throw DispatchError("Review identity mismatch; actual="+details.dump()+"; owned reviews="+available.dump(),{{"reason","review_identity_mismatch"},{"actualRequest",details},{"expectedOwnedReviews",available}});}
-            }
             if (operation=="cluster_update_work_item") check(args.value("action","")!="attach_session","领域不能关联其他会话，请使用 sourceJobId 派发");
-        }
-        if (tool=="team_domain_action" && operation=="cluster_update_work_item" && args.value("action","")=="accept") {
-            const auto& details=args.at("details");const auto verification=text(details,"verificationId",100);
-            check(pcopy.contains("verifications") && pcopy.at("verifications").contains(verification),"验收前须由项目经理调用team_verify_candidate真实执行测试");
-            const auto& verified=pcopy.at("verifications").at(verification);
-            check(verified.at("passed")==true && verified.at("workItemId")==args.at("workItemId") && verified.at("candidateSha")==details.at("candidateSha"),"测试失败或验证不属于当前候选，不能验收");
-            const auto work=path_from_utf8(verified.at("workspace").get<std::string>());
-            check(git(work,{L"rev-parse",L"HEAD"})==details.at("candidateSha").get<std::string>() && git(work,{L"status",L"--porcelain"}).empty(),"测试后源码已改变，须重新验证");
         }
         if (tool=="team_domain_action" && operation=="cluster_update_work_item") check(args.value("action","")!="integrate","项目经理只验收候选；main由主代理完成后调用team_record_merge登记");
         const auto scoped=cluster.for_queue(queue);
-        if (tool=="team_domain_action" && operation=="cluster_capture_evidence") {
-            const auto original=scoped.invoke("cluster_get_session_result",{{"sessionId",args.at("sessionId")},{"resultVersion",args.at("resultVersion")},{"limit",4}});check(original.at("delivery").at("candidateSha")==args.at("candidateSha"),"采集候选SHA须匹配原交付");
-            const auto row=scoped.invoke("cluster_get_session",{{"sessionId",args.at("sessionId")}});const auto root=fs::weakly_canonical(path_from_utf8(row.at("workspace").get<std::string>()));
-            for(const auto& entry:args.value("files",Json::array())) {const auto file=fs::weakly_canonical(path_from_utf8(entry.is_string()?entry.get<std::string>():entry.at("path").get<std::string>()));auto rel=file.lexically_relative(root);check(!rel.empty() && *rel.begin()!=L"..","经理不能显式采集工作树外文件，请主代理使用team_capture_evidence选择准确路径");}
-        }
-        if (operation=="cluster_update_work_item" && args.value("action","")=="record_review" && args.at("details").value("verdict","")=="passed") {
-            const auto& detail=args.at("details");
-            const auto report=scoped.invoke("cluster_get_session_result",{{"sessionId",detail.at("sessionId")},{"resultVersion",detail.at("resultVersion")},{"limit",4}});
-            const Json expected={{"sessionId",detail.at("sessionId")},{"resultVersion",detail.at("resultVersion")},{"candidateSha",detail.at("candidateSha")},{"status","passed"}};
-            const Json actual={{"sessionId",report.value("sessionId",Json())},{"resultVersion",report.value("resultVersion",Json())},{"candidateSha",report.at("delivery").value("candidateSha",Json())},{"status",report.at("delivery").value("status",Json())}};
-            if(actual.at("status")!="passed" || actual.at("candidateSha")!=expected.at("candidateSha")) {
-                Json mismatches=Json::array();for(const auto* key:{"status","candidateSha"}) if(actual.at(key)!=expected.at(key)) mismatches.push_back(key);
-                Json facts={{"expected",expected},{"actual",actual},{"mismatches",mismatches}};const auto decision=block_review_result(data,in,args,facts);facts["reason"]="review_report_mismatch";facts["decision"]=decision;facts["nextAction"]="Record the actual failed/blocked conclusion, or commission a corrected independent review. Do not alter report SHA/verdict.";
-                throw DispatchError("Review report mismatch; expected="+expected.dump()+"; actual="+actual.dump(),facts);
-            }
-            const auto evidence=report.value("evidence",Json::object());
-            if(!report.contains("evidence") || evidence.value("unavailableFiles",0)>0 || evidence.value("state","")=="unavailable") {
-                Json warnings=Json::array();
-                try {if(evidence.contains("evidenceManifest")) {const auto manifest=read_evidence_manifest(data,queue,evidence.at("evidenceManifest").get<std::string>());for(const auto& file:manifest.at("files")) if(file.value("state","")!="captured") warnings.push_back({{"path",file.at("path")},{"reason",file.value("reason","unavailable")}});}} catch(const std::exception&) { }
-                if(warnings.empty()) warnings.push_back({{"reason","Attachment collection unavailable; assess original review and acceptance evidence"}});
-                args["details"]["evidenceWarnings"]=warnings;args["details"]["attachmentPolicy"]="advisory";
-            }
-
-        }
         std::string reviewOperation;
         if(operation=="cluster_update_work_item" && args.value("action","")=="record_review") {
             reviewOperation="review:"+args.at("workItemId").get<std::string>()+":"+text(args,"requestId",100);
@@ -1219,7 +1128,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             else {ops[reviewOperation]={{"input",in},{"arguments",args}};store.save();}
         }
         auto result=scoped.invoke(operation,args);
-        if(operation=="cluster_update_work_item" && args.value("action","")=="record_review" && args.at("details").contains("evidenceWarnings")) {result["warnings"]=args.at("details").at("evidenceWarnings");result["attachmentPolicy"]="advisory";}
+
         if(operation=="cluster_update_work_item" && args.value("action","")=="record_review") {
             Store s(data);auto& p=project(s,in);const auto& details=args.at("details");bool changed=false;
             for(auto& dec:p["decisions"]) if(dec.at("state")=="open" && (dec.contains("evidenceSessionId") || dec.contains("blockedSessionId")) && dec.value("workItemId","")==args.at("workItemId").get<std::string>() && (details.value("verdict","")=="passed" || dec.value("blockedSessionId",dec.value("evidenceSessionId",std::string()))==details.at("sessionId").get<std::string>())) {dec["state"]="resolved";dec["resolution"]="review_conclusion_updated";dec["revision"]=dec.at("revision").get<int>()+1;changed=true;}
@@ -1270,16 +1179,16 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
         health.run("refresh_sessions","",[&] {scoped.invoke("cluster_refresh_sessions",{{"limit",20}});});
         for (const auto& old:p.at("jobs")) {
             if (!old.contains("sessionId") || old.value("observedTerminal",false)) continue;
-            if (old.at("role")=="lead" && !terminal(old.at("state").get<std::string>()) &&
-                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<12 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
+            if (!terminal(old.at("state").get<std::string>()) &&
+                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<13 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
                 health.run("notify_policy",old.at("jobId"),[&] {
                     const auto version=p.at("charterVersion").get<int>();
                     const auto notice=scoped.invoke("cluster_send_message",{{"sessionId",old.at("sessionId")},
-                        {"requestId","team-policy12-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
-                        {"message","Policy v12: refresh team_get_prompt(role=lead), team_get_contract and team_domain_context. Ordinary evidence attachments are advisory: missing/wrong log paths produce warnings, not mandatory principal escalation or fresh review. Managers may use team_capture_evidence for declared/in-worktree files and corrections retaining original references and real hashes. Note limitations honestly. Exact reviewer identity, actual passing verdict/candidate SHA, developer build/test success and manager final verification remain hard gates. Errors now show expected/actual report values. Every ledger action has a template; add_issue requires details.message and details.acceptance. For genuinely blocked FIFO actions, team_escalate with actionId/jobId, continue independent work and MCP-wait. Keep the same goal and worker sessions. Never fabricate repairs or change report verdict/SHA."}});
+                        {"requestId","team-policy13-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
+                        {"message","Policy v13 - user removed formal gates and evidence collection. Stop additional proof-only exhaustive Gallery/page/config/frame capture and screenshot matrices, including proof-only steps in older plans. Do not restart or cancel development sessions. If a proof-only subprocess is still running, stop only that subprocess when safe; preserve actual development/self-tests. Continue the assigned functional work and relevant checks, then return a concise honest summary. No evidence manifests, hashes, attachment collection, verificationId, acceptance proof lists or full audit are required. Managers use ordinary developer self-tests and independent review to decide acceptance; extra manager tests are optional and targeted. Refresh team_get_prompt(role=lead for the manager, role=worker for developers/reviewers/repair workers) and team_get_contract if you are the manager. Stay in the same goal and use MCP waits. Keep user-requested functional checks, but never claim skipped bulk coverage was completed."}});
                     if (notice.value("accepted",false)) {
                         Store s(data);auto& saved=s.value["projects"][pid]["jobs"][old.at("jobId").get<std::string>()];
-                        saved["notifiedPolicyVersion"]=12;saved["notifiedCharterVersion"]=version;s.save();
+                        saved["notifiedPolicyVersion"]=13;saved["notifiedCharterVersion"]=version;s.save();
                     }
                 });
             }
@@ -1345,8 +1254,8 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
                 for (const auto& job:current.at("jobs")) if (job.at("domainId")==d.at("domainId") && job.at("role")=="lead" && (!terminal(job.at("state").get<std::string>()) || job.value("charterVersion",0)==current.at("charterVersion").get<int>())) exists=true;
                 if (exists) continue;
                 auto job=new_job(current,d,"lead","项目经理 · "+d.at("name").get<std::string>(),
-                    "Read team_domain_context and the complete plan. Queue all ready tasks through team_dispatch_ready, then handle team_next_action FIFO. Developers must build/test first; dispatch independent review before personally running team_verify_candidate. Repairs require fresh review and tests. Repeat ready dispatch after each handled result. Wait only through team_wait_actions; never sleep. When all planned items are accepted, team_finish_domain, complete the goal and exit naturally.",current.at("baseSha").get<std::string>());
-                job["schedulerPolicyVersion"]=12;job["wake"]=d.at("wake");
+                    "Read team_domain_context and the complete plan. Queue all ready tasks through team_dispatch_ready, then handle team_next_action FIFO. Developers perform relevant self-tests, then independent review. Confirm tasks using judgement; extra manager tests are optional. Do not collect proof or expand work into exhaustive audits. Repeat ready dispatch after each handled result. Wait only through team_wait_actions; never sleep. When all planned items are accepted, team_finish_domain, complete the goal and exit naturally.",current.at("baseSha").get<std::string>());
+                job["schedulerPolicyVersion"]=13;job["wake"]=d.at("wake");
                 current["jobs"][job.at("jobId").get<std::string>()]=job;d["state"]="working";
             }
             s.save();p=current;
@@ -1477,21 +1386,21 @@ Json team_tools() {
     scoped("team_wait_actions","The manager must wait through this MCP tool for up to 300000 ms. Child completion, actionable FIFO entries, ready plan items or state changes return early. Never sleep.",{{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",300000},{"default",300000}}}},Json::array());
     scoped("team_next_action","Read the durable FIFO head. Handle it or dispatch its successor before taking the next item. New results join the tail without preemption.",Json::object(),Json::array());
     scoped("team_priority_results","Legacy result-list compatibility only; it does not grant priority. Use team_next_action FIFO for the manager loop.",Json::object(),Json::array());
-    scoped("team_next_handoff","Claim/resume a handoff. Disposition requires the returned claimToken, stable requestId, notes and outcome=confirm/linked/blocked. confirm needs evidence and accepted/integrated/cancelled ledger state; linked needs an active job on the same work item.",{{"requestId",text},{"claimToken",text},{"outcome",{{"type","string"},{"enum",Json::array({"confirm","linked","blocked"})}}},{"notes",text},{"evidence",array},{"jobId",text},{"decisionId",text}},Json::array());
+    scoped("team_next_handoff","Claim/resume a handoff. Disposition requires the returned claimToken, stable requestId, notes and outcome=confirm/linked/blocked. confirm records manager acknowledgement without proof requirements; linked needs an active job on the same work item.",{{"requestId",text},{"claimToken",text},{"outcome",{{"type","string"},{"enum",Json::array({"confirm","linked","blocked"})}}},{"notes",text},{"evidence",array},{"jobId",text},{"decisionId",text}},Json::array());
     scoped("team_domain_history","Page the original queue ledger. Remaining work by default; includeClosed=true includes integrated and cancelled history.",{{"offset",integer},{"limit",integer},{"includeClosed",{{"type","boolean"}}}},Json::array());
     scoped("team_claim_work_item","Adopt historical work and sessions under their existing IDs, issues, reviews and receipts. Unadopted out-of-scope history may be deferred with a reason. Already adopted obsolete work uses team_retire_work_item instead of fake repairs.",{{"workItemId",text},{"requestId",text},{"disposition",{{"type","string"},{"enum",Json::array({"adopt","defer"})}}},{"reason",text}},{"workItemId","requestId"});
     scoped("team_dispatch_ready","Queue every independent task whose declared dependencies are accepted, including file scope, start conditions, tests and accepted dependency SHAs. Do not duplicate existing assignments.",{{"requestId",text}},{"requestId","charterVersion"});
-    scoped("team_delegate","Dispatch developer, reviewer or repair jobs. Review requires sourceJobId, the exact candidate SHA and successful developer build/test evidence. Finish only after all current planned work is accepted.",{{"requestId",text},{"title",text},{"role",{{"type","string"},{"enum",Json::array({"developer","reviewer","repair"})}}},{"task",text},{"baseSha",text},{"sourceJobId",text},{"workItemId",text},{"taskName",text}},
+    scoped("team_delegate","Dispatch developer, reviewer or repair jobs. Use sourceJobId to arrange ordinary independent review. No machine-enforced proof gate is applied. Finish only after all current planned work is accepted.",{{"requestId",text},{"title",text},{"role",{{"type","string"},{"enum",Json::array({"developer","reviewer","repair"})}}},{"task",text},{"baseSha",text},{"sourceJobId",text},{"workItemId",text},{"taskName",text}},
         {"requestId","title","role","task","charterVersion"});
-    scoped("team_verify_candidate","After independent review passes, personally execute final tests in the exact candidate branch. The service records actual exit codes and logs. Acceptance requires its passing verificationId.",{{"requestId",text},{"workItemId",text},{"candidateSha",text},{"executable",text},{"arguments",array},{"timeoutMs",integer}},{"requestId","workItemId","candidateSha","executable","arguments"});
+    scoped("team_verify_candidate","Optional targeted test runner. Run only useful checks; verificationId is not required for acceptance and no evidence is captured.",{{"requestId",text},{"workItemId",text},{"candidateSha",text},{"executable",text},{"arguments",array},{"timeoutMs",integer}},{"requestId","workItemId","candidateSha","executable","arguments"});
     scoped("team_cancel_job","Request cancellation of an owned queued or active job. The service confirms actual terminal state and retains commits/evidence.",{{"jobId",text},{"requestId",text},{"reason",text}},{"jobId","requestId","reason"});
     scoped("team_checkpoint","Persist progress in the same goal session. waiting does not end/recreate the manager; continue only records context for the next loop iteration.",{{"requestId",text},{"state",{{"type","string"},{"enum",Json::array({"working","waiting","decision","continue"})}}},{"checkpoint",object}},{"requestId","state","checkpoint"});
     scoped("team_escalate","Create a concrete authorization/failure decision. Attach actionId from team_next_action or jobId to pause a genuinely blocked FIFO item; other work continues and MCP can wait. Correct ordinary schema errors using the contract templates first.",{{"requestId",text},{"question",text},{"reason",text},{"recommendation",text},{"alternatives",text},{"impact",text},{"blockedScope",text},{"jobId",text},{"actionId",text}},
         {"requestId","question","reason","recommendation","alternatives","impact","blockedScope"});
-    scoped("team_finish_domain","Submit the manager result only when no executors, decisions or pending actions remain and all current planned items have independently reviewed, tested acceptance.",{{"requestId",text},{"summary",text},{"evidence",array},{"acceptanceResults",{{"type","array"},{"items",object}}}},
-        {"requestId","summary","evidence","acceptanceResults"});
-    scoped("team_domain_read","Read owned session/work-item/evidence details on demand using the supported cluster_get_* operations. Logs default to 4000 bytes.",{{"operation",text},{"arguments",object}},{"operation","arguments"});
-    scoped("team_domain_action","Update the owned ledger, cancel a session or recapture in-worktree evidence. operation is cluster_update_work_item/cluster_cancel_session/cluster_capture_evidence. Put record_review/cancel in inner arguments.action.",{{"operation",{{"type","string"},{"enum",Json::array({"cluster_update_work_item","cluster_cancel_session","cluster_capture_evidence"})}}},{"arguments",object}},{"operation","arguments"});
+    scoped("team_finish_domain","Finish after manager confirmation of all current planned items and no active work. Only summary and requestId are required; no evidence or acceptance-proof arrays.",{{"requestId",text},{"summary",text}},
+        {"requestId","summary"});
+    scoped("team_domain_read","Read owned session/work-item details on demand. Logs default to 4000 bytes; no automatic collection is performed.",{{"operation",text},{"arguments",object}},{"operation","arguments"});
+    scoped("team_domain_action","Update the owned ledger or cancel a session. operation is cluster_update_work_item/cluster_cancel_session. Put record_review/cancel in inner arguments.action.",{{"operation",{{"type","string"},{"enum",Json::array({"cluster_update_work_item","cluster_cancel_session"})}}},{"arguments",object}},{"operation","arguments"});
     return tools;
 }
 }

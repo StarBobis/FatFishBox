@@ -56,8 +56,8 @@ try {
     assert.equal(item.sessions.repair.id,'repair','repair is grouped under its original task');
     let totals=(await invoke('cluster_list_work_items')).counts;
     assert.equal(totals.total,1);assert.equal(totals.remaining,1,'processed session does not mean integrated work');
-    await update('accept',{candidateSha:sha,notes:'No review yet'},'premature',true);
-    await update('record_review',{sessionId:'dev',resultVersion:'1:8',candidateSha:sha,verdict:'passed',notes:'Wrong role'},'wrong-review',true);
+    await update('accept',{candidateSha:sha,notes:'No review yet'},'premature');
+    await update('record_review',{sessionId:'dev',resultVersion:'1:8',candidateSha:sha,verdict:'passed',notes:'Wrong role'},'wrong-review');
     const issue=await update('add_issue',{message:'Regression',acceptance:'Run the regression',candidateSha:sha});
     const replayRequest={workItemId:item.workItemId,requestId:'add_issue',expectedRevision:item.revision,action:'add_issue',
         details:{message:'Regression',acceptance:'Run the regression',candidateSha:sha}};
@@ -66,9 +66,9 @@ try {
     const replay=await invoke('cluster_update_work_item',replayRequest);
     assert.equal(JSON.parse(await readFile(issue.taskRef,'utf8')).issues[issue.issueId].message,'Regression');
     assert.equal(replay.issueId,issue.issueId);assert.equal(replay.replayed,true);
-    await update('record_review',{sessionId:'review',resultVersion:'old',candidateSha:sha,verdict:'passed',notes:'Wrong version'},'wrong-version',true);
+    await update('record_review',{sessionId:'review',resultVersion:'old',candidateSha:sha,verdict:'passed',notes:'Wrong version'},'wrong-version');
     await update('record_review',{sessionId:'review',resultVersion:'1:8',candidateSha:sha,verdict:'passed',notes:'Independent checks read'},'review-pass');
-    await update('accept',{candidateSha:sha,notes:'Issue still open'},'open-issue',true);
+    await update('accept',{candidateSha:sha,notes:'Issue still open'},'open-issue');
     await update('resolve_issue',{issueId:issue.issueId,notes:'Regression fixed and checked'});
     await update('accept',{candidateSha:sha,notes:'Final acceptance complete'});
     totals=(await invoke('cluster_list_work_items')).counts;
@@ -76,8 +76,7 @@ try {
     const superseded=JSON.parse(await readFile(file,'utf8'));
     superseded.sessions.review.resultVersion='1:9';
     await writeFile(file,JSON.stringify(superseded));
-    assert.equal((await get()).state,'open','new review result invalidates an old acceptance');
-    await update('integrate',{integrationSha:integration,notes:'Outdated acceptance'},'outdated-integration',true);
+    assert.equal((await get()).state,'accepted','metadata changes do not revoke manager judgement');
     await update('record_review',{sessionId:'review',resultVersion:'1:9',candidateSha:sha,verdict:'passed',notes:'Updated independent review read'},'review-new');
     await update('accept',{candidateSha:sha,notes:'Updated result accepted'},'accept-new');
     await update('integrate',{integrationSha:integration,targetBranch:'main',notes:'Integration commit recorded'});
@@ -116,7 +115,7 @@ try {
     await close();tool=await connect();
     assert.equal((await invoke('cluster_get_work_item',{workItemId:savedId})).workItemId,savedId);
     assert.equal((await invoke('cluster_list_work_items')).counts.total,2);
-    console.log('Work ledger passed: stable repair identity, review/version gates, issue lifecycle, revision/replay safety, integration counts, shared repairs and restart.');
+    console.log('Work ledger passed: stable repair identity, manager judgement without proof gates, issue lifecycle, revision/replay safety, integration counts, shared repairs and restart.');
 } finally {
     if (child) {const ended=once(child,'exit');child.stdin.end();await ended;}
     await rm(folder,{recursive:true,force:true});
