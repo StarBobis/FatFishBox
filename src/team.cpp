@@ -1090,7 +1090,11 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
                     }
                 }
                 if (current.at("status")=="finishing" && std::ranges::all_of(current.at("jobs"),[](const Json& j){return terminal(j.at("state").get<std::string>());})) {
-                    const bool natural=std::ranges::all_of(current.at("jobs"),[](const Json& j){return j.at("role")!="lead" || (j.at("state")=="succeeded" && (!j.contains("goal") || j.at("goal").value("phase","")=="complete"));});
+                    const bool natural=std::ranges::all_of(current.at("jobs"),[&](const Json& j){
+                        if (j.at("role")!="lead") return true;
+                        for (const auto& later:current.at("jobs")) if (later.at("role")=="lead" && later.at("domainId")==j.at("domainId") && later.value("created",0LL)>j.value("created",0LL)) return true;
+                        return j.at("state")=="succeeded" && (!j.contains("goal") || j.at("goal").value("phase","")=="complete");
+                    });
                     if (natural) {current["status"]="completed";event(current,"project.completed",{{"status","completed"},{"note","项目经理已退出，等待主代理逐项验收合并"}});}
                     else incident(current,d,"manager-goal-incomplete-"+job.at("jobId").get<std::string>(),"候选已验收，但项目经理goal未自然完成；不能交给主代理作为成功结果。");
                 }
@@ -1179,7 +1183,11 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
                     args={{"requestId",job.at("requestId")},{"title",job.at("title")},{"batch",pid+"-"+role},{"role",role},{"workspace",utf8(workspace)},
                         {"task",prompt},{"baseSha",job.at("baseSha")},{"poolId",role_pool(live.at("config"),role)},
                         {"teamProjectId",pid},{"teamDomainId",d.at("domainId")},{"teamJobId",jid},{"teamCharterVersion",live.at("charterVersion")}};
-                    if (role=="lead") args["teamGoal"]=live.at("charter").at("objective");
+                    if (role=="lead") {
+                        args["teamGoal"]=live.at("charter").at("objective");
+                        args["teamBootstrapContext"]={{"charterVersion",live.at("charterVersion")},{"charter",live.at("charter")},
+                            {"tasks",live.value("tasks",Json::array())},{"workspace",live.at("workspace")},{"baseSha",live.at("baseSha")},{"acceptance",d.at("acceptance")}};
+                    }
                     if (!work.empty()) args["workItemId"]=work;
                     saved["launch"]=args;saved["workspace"]=utf8(workspace);saved["state"]="starting";s.save();
                 } else args=saved.at("launch");

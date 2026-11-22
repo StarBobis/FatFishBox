@@ -11,7 +11,7 @@ import {join,resolve} from 'node:path';
 const run=promisify(execFile),executable=resolve(process.argv[2]||'build/Release/FatFishBox.exe');
 const root=await mkdtemp(join(tmpdir(),'fatfish-teams-')),data=join(root,'data'),repo=join(root,'repository with spaces');
 await Promise.all([mkdir(data),mkdir(repo)]);
-const goals=new Map(),reports=new Map(),goalModes=new Map(),goalReads=new Map(),goalWrites=new Map();
+const goals=new Map(),reports=new Map(),goalModes=new Map(),goalReads=new Map(),goalWrites=new Map(),bootstraps=new Map();
 let nextGoalMode="delayed";
 const states=new Map(),prompts=new Map(),selected=new Map(),unavailableSessions=new Set(),failedCancellations=new Set();let number=0,child,candidate;
 const server=createServer(async(req,res)=>{
@@ -29,7 +29,17 @@ const server=createServer(async(req,res)=>{
                 else {
                     goalWrites.set(a.agentId,(goalWrites.get(a.agentId)||0)+1);
                     goalModes.set(a.agentId,nextGoalMode);nextGoalMode='normal';
-                    goals.set(a.agentId,{id:'goal-'+a.agentId,revision:1,phase:'active',objective:a.line.slice(6).trim()});
+                    const objective=a.line.slice(6).trim();
+                    // Model the real race: /goal starts a round before the RPC returns.
+                    // The first round must already know the manager role and full startup file.
+                    assert.match(objective,/禁止自己修改产品代码或审计脚本/);
+                    const file=objective.match(/启动文档：([^\r\n]+)/u)?.[1];assert.ok(file,'bootstrap path must be part of first goal context');
+                    const startup=await readFile(file,'utf8');
+                    assert.match(startup,/项目经理/);assert.match(startup,/team_delegate/);assert.match(startup,/凭据/);
+                    assert.match(startup,/完整项目授权与任务计划/);assert.match(startup,/"tasks"/);
+                    bootstraps.set(a.agentId,{file,content:startup});
+                    goals.set(a.agentId,{id:'goal-'+a.agentId,revision:1,phase:'active',objective});
+                    states.set(a.agentId,{cursor:2,running:true,queue:[],pendingInput:[]});
                 }
             }
             value={result:{kind:'success'}};break;
@@ -49,7 +59,7 @@ const server=createServer(async(req,res)=>{
         }
         case 'session/selectModel':selected.set(a.sessionId,a.model);value={selected:a};break;
         case 'session/state':if(unavailableSessions.has(a.sessionId)){res.writeHead(503).end('fixture temporary failure');return;}value=states.get(a.sessionId);break;
-        case 'session/prompt':if(!prompts.has(a.sessionId)){prompts.set(a.sessionId,a.content[0].text);states.set(a.sessionId,{cursor:2,running:true,queue:[],pendingInput:[]});}value={accepted:true};break;
+        case 'session/prompt':assert.equal(goals.has(a.sessionId),false,'manager must never queue a second startup prompt');if(!prompts.has(a.sessionId)){prompts.set(a.sessionId,a.content[0].text);states.set(a.sessionId,{cursor:2,running:true,queue:[],pendingInput:[]});}value={accepted:true};break;
         case 'session/cancel':if(failedCancellations.has(a.sessionId)){res.writeHead(503).end('fixture cancellation failure');return;}states.set(a.sessionId,{cursor:7,running:false,queue:[],pendingInput:[]});value={};break;
         case 'session/page':value={records:[{type:'event',event:{seq:6,type:'assistant/message',data:{message:{content:[{text:'Fixture complete\n```fatfish-delivery\n'+JSON.stringify(reports.get(a.sessionId)||{candidateSha:candidate,status:'passed',worktreeClean:true,tests:[],evidencePaths:[]})+'\n```'}]}}}},
             {type:'event',event:{seq:7,type:'turn/end',time:Date.now(),data:{reason:{kind:'completed'}}}}]};break;
@@ -107,6 +117,18 @@ try {
     const native=async()=>JSON.parse(await readFile(join(data,'state.json'),'utf8'));
     const remote=async job=>(await native()).sessions[job.sessionId].dshId;
     assert.equal(goals.get(await remote(leader)).phase,'active','goal must be created through actual DSH command protocol');
+    await close();
+    const withHistory=await disk();
+    withHistory.projects[pid].jobs['previous-failed-manager']={jobId:'previous-failed-manager',domainId:leader.domainId,role:'lead',state:'failed',created:0,observedTerminal:true,charterVersion:0,title:'Previous failed manager'};
+    // Reproduce interruption after native activation but before team/session linkage.
+    delete withHistory.projects[pid].jobs[leader.jobId].sessionId;
+    delete withHistory.projects[pid].jobs[leader.jobId].workItemId;
+    withHistory.projects[pid].jobs[leader.jobId].state='starting';
+    await writeFile(join(data,'teams.json'),JSON.stringify(withHistory));
+    ({tool,rpc}=await connect());
+    await until(async()=>(await disk()).projects[pid].jobs[leader.jobId].sessionId===leader.sessionId,'recover original manager activation without replay');
+    assert.equal(goalWrites.get(await remote(leader)),1,'cross-file recovery must not activate goal twice');
+    assert.equal(states.get(await remote(leader)).queue.length,0,'recovery must not queue a manager prompt');
     const p=(await disk()).projects[pid],domain=Object.values(p.domains)[0];
     const authz={projectId:pid,domainId:domain.domainId,token:domain.token,charterVersion:1};
     const call=(name,args={},fail=false)=>tool(name,{...authz,...args},fail);
@@ -117,7 +139,12 @@ try {
     assert.deepEqual(taskSchema.required,['name','steps','acceptance']);
     assert.equal(goalWrites.get(await remote(leader)),1,'projection retries never replay /goal creation');
     assert.ok(goalReads.get(await remote(leader))>=4,'delayed nested projection was polled');
-    assert.equal(p.jobs[leader.jobId].goal.objective,charter.objective.trim(),'only edge whitespace normalization');
+    assert.ok(p.jobs[leader.jobId].goal.objective.endsWith(charter.objective.trim()),'user objective retained after bootstrap contract');
+    assert.equal(prompts.has(await remote(leader)),false,'no unread manager startup prompt');
+    assert.equal(states.get(await remote(leader)).queue.length,0);
+    assert.equal((await native()).sessions[leader.sessionId].startCursor,1,'cursor captured before automatic goal round');
+    assert.ok(!p.jobs[leader.jobId].goal.objective.includes(authz.token),'credentials stay out of goal projection');
+    assert.ok(bootstraps.get(await remote(leader)).content.includes(authz.token),'first turn can read manager credentials');
     const waitSchema=listed.find(t=>t.name==='team_wait_decisions').inputSchema;
     assert.equal(waitSchema.properties.timeoutMs.maximum,60000);
     assert.equal(waitSchema.properties.timeoutMs.default,60000);
@@ -138,7 +165,7 @@ try {
         return until(async()=>{const j=(await disk()).projects[pid].jobs[job.jobId];return j.observedTerminal&&j;},'terminal child');
     };
     const completed=await end(running);
-    assert.equal(Object.values((await disk()).projects[pid].jobs).filter(j=>j.role==='lead').length,1,'child completion must not rebuild manager');
+    assert.equal(Object.values((await disk()).projects[pid].jobs).filter(j=>j.role==='lead').length,2,'child completion must not rebuild manager; historical failed round retained');
     assert.equal((await call('team_next_action')).head.reason,'candidate_needs_review');
     await call('team_delegate',{requestId:'integrator',role:'integrator',title:'Wrong',task:'Wrong'},true);
     const reviewArgs={title:'Adversarial review',role:'reviewer',sourceJobId:completed.jobId,baseSha:base,task:'Review exact candidate'};
@@ -190,7 +217,7 @@ try {
     await tool('team_update_charter',{projectId:pid,requestId:'rework-plan',expectedVersion:1,charter:{...charter,objective:'Complete a new explicitly documented rework plan'},changeSummary:'Principal final acceptance requests rework'});
     authz.charterVersion=2;
     const nextManager=await until(async()=>Object.values((await disk()).projects[pid].jobs).find(j=>j.role==='lead'&&j.jobId!==leader.jobId&&j.sessionId&&j.state==='running'),'next full-plan manager round');
-    assert.equal(goals.get(await remote(nextManager)).objective,'Complete a new explicitly documented rework plan');
+    assert.ok(goals.get(await remote(nextManager)).objective.endsWith('Complete a new explicitly documented rework plan'));
     // Restart transport: state and accepted source remain durable.
     await close();({tool,rpc}=await connect());
     assert.equal((await tool('team_get_project',{projectId:pid})).charterVersion,2);
@@ -208,7 +235,7 @@ try {
         assert.equal(goals.get(failedNative.dshId).phase,'paused','failed setup must not orphan an armed goal');
         assert.equal(prompts.has(failedNative.dshId),false,'unverified goal never receives task prompt');
         assert.equal(goalWrites.get(failedNative.dshId),1,'never duplicate goal command');
-        assert.equal(goalReads.get(failedNative.dshId),20,'verification stops after bounded reads');
+        assert.ok(goalReads.get(failedNative.dshId)>=20 && goalReads.get(failedNative.dshId)<40,'verification stops after bounded reads including background observation');
         await tool('team_control_project',{projectId:failedProject.projectId,requestId:`cancel-${mode}`,action:'cancel'});
     }
     console.log('Two-loop behavior passed: one real goal, isolated branches, failed review/repair/new review, actual failed/passed tests, acceptance without integrator, principal merge, durable rework and cancellation.');

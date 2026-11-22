@@ -121,3 +121,7 @@ node tests/mcp-http-smoke.mjs "out/肥鱼重工/FatFishBox.exe"
 实际 DSH 投影路径为 `values.goal.goal`；FatFishBox 统一解析该嵌套快照，并兼容旧扁平投影。创建 goal 只发送一次命令，最多20次只读回查、间隔100毫秒，总连接期限5秒；瞬时可重试传输失败计入期限。只按 DSH 的 JavaScript trim 规则忽略目标首尾空白，目标内容不一致或非active仍拒绝派发，并记录观察到的phase及匹配状态。运行中状态刷新使用相同解析器。`team_start_project.tasks` schema明确要求name、steps、acceptance，steps是单个字符串，多步用换行分隔。
 
 会话页默认团队协作，不再显示执行方式选择器。项目经理任务直接显示在团队协作状态区域；暂停执行、领域进度、负责人显隐及手动同步入口已移除，定时同步机制保持不变。
+
+## 0.1.6：项目经理首次执行的职责与凭据
+
+激活goal前先生成完整manager-bootstrap.md（规程、授权、任务计划、工具凭据），并记录激活前的session cursor。goal首轮明确项目经理职责，第一步读取该文档并派发开发；不再随后排队发送启动prompt。凭据保留在本地启动文档，不放进goal目标或投影摘要。开发/审查/修复会话仍使用原来的单次prompt派发。历史失败经理不再阻断新一轮经理的正常完成。

@@ -929,7 +929,7 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
         live={{"cursor",local_history->cursor},{"running",false},{"pendingInput",Json::array()},{"queue",Json::array()}};
     }
     Json manager_goal;
-    if (prior.value("role","")=="lead" && prior.contains("goal") && !local_history) {
+    if (prior.value("role","")=="lead" && (prior.contains("goal") || prior.contains("managerBootstrapPath")) && !local_history) {
         const auto view=connection->request("session/projections",{{"sessionId",prior.at("dshId")}});
         manager_goal=goal_snapshot(view);
         require(!manager_goal.is_null(),"项目经理 goal 投影缺失，不能推断会话完成");
@@ -1877,8 +1877,24 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
         }
         if (role=="lead" && input.contains("teamGoal")) {
             stage="set_goal";
-            const auto objective=normalized_goal_objective(field(input,"teamGoal",12000));
-            require(!objective.empty(),"项目经理goal目标不可为空");
+            const auto user_objective=normalized_goal_objective(field(input,"teamGoal",12000));
+            require(!user_objective.empty(),"项目经理goal目标不可为空");
+            stage="prepare_manager_bootstrap";
+            const auto bootstrap=workspace/L"manager-bootstrap.md";
+            const auto content=task+"\n\n完整项目授权与任务计划\n"+input.value("teamBootstrapContext",Json::object()).dump(2);
+            std::ofstream document(bootstrap,std::ios::binary|std::ios::trunc);
+            document.write(content.data(),static_cast<std::streamsize>(content.size()));document.close();
+            require(bool(document),"无法保存完整项目经理启动文档，禁止激活goal");
+            const auto objective=std::string("你是唯一项目经理，只负责派发开发、独立审查、亲自验收及修复调度，禁止自己修改产品代码或审计脚本。\n")+
+                "第一步必须读取以下启动文档，取得完整规程、当前授权、任务计划和派发凭据；读取前不要执行产品工作。\n启动文档："+
+                utf8(bootstrap)+"\n随后立即调用team_domain_context并按计划team_delegate派发开发，不要把准备工作变成自行开发。\n项目目标："+user_objective;
+            // The first goal round may start before commands/execute returns.
+            // Persist everything it needs and capture the cursor BEFORE activation.
+            const auto before=rpc_state(dsh,row);
+            row["startCursor"]=before.at("cursor");row["cursor"]=before.at("cursor");
+            row["managerBootstrapPath"]=utf8(bootstrap);row["managerObjective"]=user_objective;
+            {Database db(data_,true);db.state["sessions"][key]=row;db.save();}
+            stage="set_goal";
             // One mutation only. Projection propagation is allowed a bounded read-only wait.
             const Dsh goal_connection(auth,1000,5000);
             const auto set=goal_connection.call("commands/execute",{{"agentId",sid},{"line","/goal "+objective},{"submittedAttachments",Json::array()}});
@@ -1904,39 +1920,43 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
                     ", objectiveMatches="+(matches?std::string("true"):std::string("false"))+", transport="+(transient.empty()?"none":transient)+"）");
             }
             row["goal"]=observed;
+            row["status"]="running";row["dispatchState"]="confirmed";
+            // /goal is the sole execution trigger for a manager. A later queued
+            // prompt could remain unread for the entire goal and must not exist.
+        } else {
+            stage="session_state";
+            const auto live = rpc_state(dsh, row);
+            row["startCursor"] = live.at("cursor");
+            row["cursor"] = live.at("cursor");
+            row["dispatchState"]="submitting";
+            const auto task_context="Task ledger (read-only metadata): workItemId="+row.at("workItemId").get<std::string>()+
+                "; original task and issue definitions: "+row.at("taskRef").get<std::string>()+". Read that metadata as needed; "
+                "code changes remain restricted to the assigned workspace. Base SHA: "+row.value("baseSha",std::string("unspecified"))+".\n\n";
+            const auto prompt = role=="lead"?task:(review_worker(row)?task:task_context+"Work in the assigned workspace only. Do not change provider/model, start nested agents, "
+                "or publish changes without authorization. Return verifiable evidence. In the final answer include a fenced "
+                "```fatfish-delivery JSON block with workItemId, baseSha (full commit hash or null), candidateSha (full commit hash or null), "
+                "status (passed/failed/blocked), issues, nextAction, optional checksManifest and evidenceManifest, worktreeClean (boolean), "
+                "tests (array of {command,exitCode}), and evidencePaths (array of local absolute paths). "
+                "Only report tests you actually ran.\n\n" + task);
+            const Json request{{"sessionId",sid},{"requestId",key},{"mode","queue"},
+                {"content",Json::array({{{"type","text"},{"text",prompt}}})}};
+            row["pendingPrompt"]={{"request",request},{"retryAt",now()+15000}};
+            {
+                Database db(data_, true);
+                db.state["sessions"][key] = row;
+                db.save();
+            }
+            stage="submit_prompt";
+            const Dsh submission(auth,3500);
+            require(submission.matches_owner(dsh.owner()),"没有连接到该会话最初所属的 DSH 服务");
+            may_have_dispatched = true;
+            const auto reply = submission.request("session/prompt",request);
+            may_have_dispatched = reply.value("accepted",false);
+            require(may_have_dispatched, "DSH 拒绝了任务");
+            row["status"] = "queued";
+            row["dispatchState"]="confirmed";
+            row.erase("pendingPrompt");
         }
-        stage="session_state";
-        const auto live = rpc_state(dsh, row);
-        row["startCursor"] = live.at("cursor");
-        row["cursor"] = live.at("cursor");
-        row["dispatchState"]="submitting";
-        const auto task_context="Task ledger (read-only metadata): workItemId="+row.at("workItemId").get<std::string>()+
-            "; original task and issue definitions: "+row.at("taskRef").get<std::string>()+". Read that metadata as needed; "
-            "code changes remain restricted to the assigned workspace. Base SHA: "+row.value("baseSha",std::string("unspecified"))+".\n\n";
-        const auto prompt = role=="lead"?task:(review_worker(row)?task:task_context+"Work in the assigned workspace only. Do not change provider/model, start nested agents, "
-            "or publish changes without authorization. Return verifiable evidence. In the final answer include a fenced "
-            "```fatfish-delivery JSON block with workItemId, baseSha (full commit hash or null), candidateSha (full commit hash or null), "
-            "status (passed/failed/blocked), issues, nextAction, optional checksManifest and evidenceManifest, worktreeClean (boolean), "
-            "tests (array of {command,exitCode}), and evidencePaths (array of local absolute paths). "
-            "Only report tests you actually ran.\n\n" + task);
-        const Json request{{"sessionId",sid},{"requestId",key},{"mode","queue"},
-            {"content",Json::array({{{"type","text"},{"text",prompt}}})}};
-        row["pendingPrompt"]={{"request",request},{"retryAt",now()+15000}};
-        {
-            Database db(data_, true);
-            db.state["sessions"][key] = row;
-            db.save();
-        }
-        stage="submit_prompt";
-        const Dsh submission(auth,3500);
-        require(submission.matches_owner(dsh.owner()),"没有连接到该会话最初所属的 DSH 服务");
-        may_have_dispatched = true;
-        const auto reply = submission.request("session/prompt",request);
-        may_have_dispatched = reply.value("accepted",false);
-        require(may_have_dispatched, "DSH 拒绝了任务");
-        row["status"] = "queued";
-        row["dispatchState"]="confirmed";
-        row.erase("pendingPrompt");
         if (!rejected.empty()) row["poolFallbacks"]=rejected;
     } catch (const std::exception& e) {
         // /goal may arm a round before the task prompt. A rejected setup must
@@ -1995,7 +2015,10 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
         } else if (row.value("dispatchState","")=="confirmed" || row.contains("poolFallbacks") ||
                    (dispatch_pending(stored) && row.value("dispatchState","")=="unconfirmed")) {
             if (row.value("dispatchState","")=="confirmed") {
-                if (dispatch_pending(stored)) stored["status"]="queued";
+                if (row.contains("managerBootstrapPath")) {
+                    for (const auto* field:{"goal","managerBootstrapPath","managerObjective"}) stored[field]=row.at(field);
+                }
+                if (dispatch_pending(stored)) stored["status"]=row.contains("managerBootstrapPath")?"running":"queued";
                 stored["dispatchState"]="confirmed";
                 clear_dispatch_diagnostics(stored);
                 stored.erase("pendingPrompt");
