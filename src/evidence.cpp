@@ -5,10 +5,12 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <algorithm>
+#include <ranges>
 #include <array>
 #include <cwctype>
 #include <fstream>
 #include <optional>
+#include <map>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -226,14 +228,27 @@ Json capture_evidence(const fs::path& data,const std::string& queue,const Json& 
         const auto file=workspace/name;std::error_code error;
         if (fs::is_regular_file(file,error)) candidates.push_back({{"path",utf8(file)},{"origin","automatic_build_file"},{"explicit",false}});
     }
+    const auto corrections=options.value("corrections",Json::array());
+    if(!corrections.is_array() || corrections.size()>128) throw std::runtime_error("corrections must be an array of at most 128 entries");
+    std::map<std::string,Json> corrected;
+    for(const auto& correction:corrections) {
+        const auto reported=correction.at("reportedPath").get<std::string>(),replacement=correction.at("replacementPath").get<std::string>(),reason=correction.at("reason").get<std::string>();
+        if(!path_from_utf8(reported).is_absolute() || !path_from_utf8(replacement).is_absolute() || reason.empty()) throw std::runtime_error("Evidence correction requires absolute reportedPath/replacementPath and a nonempty reason");
+        if(!std::ranges::any_of(candidates,[&](const Json& file){return file.at("path")==reported;})) throw std::runtime_error("reportedPath is not declared by this exact result: "+reported);
+        if(!corrected.emplace(reported,correction).second) throw std::runtime_error("Duplicate evidence correction: "+reported);
+    }
     Json files=Json::array(),build=Json::object();std::set<std::wstring> seen;
     int reused=0,unavailable=0;bool truncated=false;
     std::uint64_t remaining=512ULL*1024*1024;
     for (auto entry:candidates) {
         if (files.size()>=128) {truncated=true;break;}
-        const auto path=path_from_utf8(entry.at("path").get<std::string>());
-        auto normalized=path.lexically_normal().wstring();for(auto& ch:normalized)ch=static_cast<wchar_t>(towlower(ch));
+        const auto reported=entry.at("path").get<std::string>();
+        auto normalized=path_from_utf8(reported).lexically_normal().wstring();for(auto& ch:normalized)ch=static_cast<wchar_t>(towlower(ch));
         if (!seen.insert(normalized).second) continue;
+        if(corrected.contains(reported)) {
+            const auto& correction=corrected.at(reported);entry["reportedPath"]=reported;entry["path"]=correction.at("replacementPath");entry["correctionReason"]=correction.at("reason");entry["origin"]="explicit_correction";entry.erase("kind");
+        }
+        const auto path=path_from_utf8(entry.at("path").get<std::string>());
         const auto kind=entry.value("kind",kind_for(path));
         const auto explicitly_selected=entry.value("explicit",false);entry.erase("explicit");entry["kind"]=kind;
         if (!path.is_absolute()) entry.update({{"state","unavailable"},{"reason","absolute_path_required"}});
@@ -277,12 +292,12 @@ Json capture_evidence(const fs::path& data,const std::string& queue,const Json& 
     const auto checks_ref=store_manifest(data,queue,checks);
     auto manifest=identity;
     manifest.update({{"kind","evidence"},{"checksManifest",checks_ref},{"source",source},{"build",build},{"files",files},
-        {"filesTruncated",truncated},{"sourceBinding","capture_time_only"}});
+        {"filesTruncated",truncated},{"fileCorrections",corrections},{"sourceBinding","capture_time_only"}});
     const auto evidence_ref=store_manifest(data,queue,manifest);
     return {{"checksManifest",checks_ref},{"evidenceManifest",evidence_ref},{"sourceSha",source.value("head",Json())},
         {"matchesExpectedCandidate",source.at("matchesExpectedCandidate")},{"worktreeClean",source.value("worktreeClean",Json())},{"sourceChangedDuringCapture",source.at("changedDuringCapture")},
         {"fileCount",files.size()},{"testCount",tests.size()},{"unavailableFiles",unavailable},{"reusedBlobs",reused},
-        {"filesTruncated",truncated},{"capturedAt",now()},{"testExecutionVerified",false},{"sourceBinding","capture_time_only"}};
+        {"filesTruncated",truncated},{"fileCorrections",corrections},{"capturedAt",now()},{"testExecutionVerified",false},{"sourceBinding","capture_time_only"}};
 }
 Json read_evidence_manifest(const fs::path& data,const std::string& queue,const std::string& reference) {
     const auto key=manifest_key(reference);

@@ -2317,6 +2317,17 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
             }
             options["files"]=input.at("files");
         }
+        Json corrections=Json::object();
+        if(row.contains("evidenceManifest") && row.at("evidenceManifest").is_string()) try {
+            const auto previous=read_evidence_manifest(data_,queue_id_,row.at("evidenceManifest").get<std::string>());
+            if(previous.at("sessionId")==key && previous.at("resultVersion")==row.at("resultVersion") && previous.at("candidateSha")==delivery.at("candidateSha"))
+                for(const auto& c:previous.value("fileCorrections",Json::array())) corrections[c.at("reportedPath").get<std::string>()]=c;
+        } catch(const std::exception&) { /* An unavailable old manifest cannot authorize a correction. */ }
+        if(input.contains("corrections")) {
+            require(input.at("corrections").is_array() && input.at("corrections").size()<=128,"corrections must contain at most 128 entries");
+            for(const auto& c:input.at("corrections")) {const auto reported=field(c,"reportedPath",4000),replacement=field(c,"replacementPath",4000);field(c,"reason",4000);require(path_from_utf8(reported).is_absolute() && path_from_utf8(replacement).is_absolute(),"Correction paths must be absolute");corrections[reported]=c;}
+        }
+        if(!corrections.empty()) {options["corrections"]=Json::array();for(const auto& c:corrections) options["corrections"].push_back(c);}
         auto result=capture_evidence(data_,queue_id_,row,delivery,options);
         remember_result_evidence(data_,queue_id_,row,result);
         {
@@ -3640,7 +3651,7 @@ Json Cluster::tools() {
         {"required",Json::array({"command","exitCode"})},{"additionalProperties",false}};
     add("cluster_capture_evidence","Capture source identity, build metadata, file hashes and reported checks into reusable manifests. Explicit files may be external. This does not execute tests.",
         {{"sessionId",text},{"resultVersion",text},{"candidateSha",text},{"configuration",text},
-         {"files",{{"type","array"},{"items",evidence_file},{"maxItems",128}}},
+         {"corrections",{{"type","array"},{"items",{{"type","object"},{"properties",{{"reportedPath",text},{"replacementPath",text},{"reason",text}}},{"required",Json::array({"reportedPath","replacementPath","reason"})}}}}},{"files",{{"type","array"},{"items",evidence_file},{"maxItems",128}}},
          {"tests",{{"type","array"},{"items",reported_test},{"maxItems",64}}}},{"sessionId"});
     add("cluster_get_evidence_manifest","Page evidence metadata by manifest reference, verifying content hash and queue ownership.",
         {{"manifestId",text},{"offset",integer},{"limit",integer}},{"manifestId"});

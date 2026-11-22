@@ -31,11 +31,18 @@ bool sha(const std::string& s) { return (s.size()==40 || s.size()==64) && s.find
 Json defaults() {
     return {{"revision",0},{"totalConcurrency",20}};
 }
+void event(Json&,const std::string&,const Json&);
 class Store {
 public:
     explicit Store(const fs::path& data):file(data/L"teams.json"),lock(data/L"teams.lock") {
         value=fs::exists(file)?read_json(file,32*1024*1024):Json{{"settings",defaults()},{"projects",Json::object()},{"requests",Json::object()}};
         auto& settings=value["settings"];settings={{"revision",settings.value("revision",0)},{"totalConcurrency",settings.value("totalConcurrency",20)}};
+        bool migrated=false;
+        for(auto& p:value["projects"]) for(auto& d:p["decisions"]) if(d.value("state","")=="open" && d.contains("evidenceSessionId")) {
+            d["state"]="resolved";d["revision"]=d.value("revision",0)+1;d["resolution"]="Attachment availability is advisory under policy v12; verdict/SHA gates remain enforced.";
+            event(p,"evidence.policy_relaxed",{{"decisionId",d.at("decisionId")}});migrated=true;
+        }
+        if(migrated) save();
     }
     void save() { write_state_file(file,value); }
     Json value;
@@ -253,12 +260,10 @@ Json backlog_snapshot(const Cluster& cluster,const Json& p) {
 }
 std::string development_check_problem(const Json& report) {
     const auto delivery=report.value("delivery",Json::object());
-    if (delivery.value("status","")!="passed" || !delivery.value("worktreeClean",false)) return "开发交付必须声明 passed 且候选工作树干净";
+    if(delivery.value("status","")!="passed") return "Developer must report successful execution before review";
     const auto tests=delivery.value("tests",Json::array());
-    if (tests.empty()) return "开发者尚未先执行计划中的构建与测试（tests为空）";
-    for (const auto& test:tests) if (test.value("command","").empty() || test.value("exitCode",-1)!=0 || test.value("logPath","").empty()) return "每条开发构建/测试必须成功并提供实际日志logPath";
-    const auto evidence=report.value("evidence",Json::object());
-    if (evidence.value("unavailableFiles",1)!=0 || evidence.value("matchesExpectedCandidate",Json())!=true || evidence.value("worktreeClean",Json())!=true || evidence.value("sourceChangedDuringCapture",true)) return "开发测试日志尚未完整采集，或实际工作树与候选SHA不一致";
+    if(tests.empty()) return "Developer must first run planned builds/tests (tests is empty)";
+    for(const auto& test:tests) if(test.value("command","").empty() || test.value("exitCode",-1)!=0) return "Developer build/test commands must succeed; log attachments are advisory";
     return {};
 }
 Json priority_results(const Cluster& cluster,const Json& p,const std::string& owner={}) {
@@ -312,6 +317,7 @@ Json domain_worklist(const Cluster& cluster,const Json& p,const std::string& own
     for (const auto& j:p.at("jobs")) if (j.at("domainId")==owner && j.at("role")!="lead" && j.contains("workItemId")) owned.insert(j.at("workItemId").get<std::string>());
     const auto scoped=cluster.for_queue(p.at("queueId").get<std::string>());
     for (const auto& key:owned) {
+        if(std::ranges::any_of(p.at("decisions"),[&](const Json& dec){return dec.at("state")=="open" && dec.value("blockedWorkItemId","")==key;})) continue;
         bool linked=false;
         for (const auto& j:p.at("jobs")) if (j.at("domainId")==owner && j.at("role")!="lead" && j.value("workItemId","")==key) {
             if (!terminal(j.at("state").get<std::string>())) linked=true;
@@ -359,6 +365,9 @@ Json coordinator_queue(const Cluster& cluster,const fs::path& data,const Json& p
             candidates[key]={{"actionId",key},{"kind","handoff"},{"sessionId",row.at("id")},{"workItemId",work},{"resultVersion",row.value("resultVersion","")},{"completed",row.value("completed",0LL)}};
         }
     }
+    for(const auto& dec:p.at("decisions")) if(dec.at("state")=="open" && dec.contains("actionId")) {
+        for(auto it=candidates.begin();it!=candidates.end();) {if(it->first==dec.at("actionId").get<std::string>() || (!dec.value("blockedWorkItemId","").empty() && it->second.value("workItemId","")==dec.at("blockedWorkItemId").get<std::string>())) it=candidates.erase(it);else ++it;}
+    }
     Store s(data);auto& live=s.value["projects"][p.at("projectId").get<std::string>()];auto& d=live["domains"][owner];
     Json order=Json::array(),items=Json::array();std::set<std::string> seen;
     for (const auto& key:d.value("actionQueue",Json::array())) if (candidates.contains(key.get<std::string>()) && seen.insert(key.get<std::string>()).second) order.push_back(key);
@@ -371,14 +380,36 @@ Json coordinator_queue(const Cluster& cluster,const fs::path& data,const Json& p
     return {{"items",items},{"count",items.size()},{"empty",items.empty()},{"head",items.empty()?Json():items.front()},{"policy","fifo"}};
 }
 Json domain_action_contract() {
-    return {{"operation","cluster_update_work_item"},{"actions",Json::array({"record_review","add_issue","resolve_issue","accept","reopen","block","cancel"})},
-        {"example",{{"tool","team_domain_action"},{"arguments",{{"projectId","<current projectId>"},{"domainId","<current domainId>"},{"token","<current token>"},
-            {"operation","cluster_update_work_item"},{"arguments",{{"workItemId","<owned workItemId>"},{"expectedRevision",0},{"requestId","<stable operation ID>"},{"action","record_review"},
-                {"details",{{"sessionId","<reviewer sessionId>"},{"resultVersion","<exact resultVersion>"},{"candidateSha","<full candidate SHA>"},{"verdict","blocked"},{"notes","<verified conclusion>"}}}}}}}}},
-        {"cancelExample",{{"operation","cluster_update_work_item"},{"arguments",{{"workItemId","<owned workItemId>"},{"expectedRevision",0},{"requestId","<stable ID>"},{"action","cancel"},{"details",{{"notes","<explicit cancellation reason; all sessions already terminal>"}}}}}}},
-        {"captureEvidenceOperation","cluster_capture_evidence; sessionId/resultVersion/candidateSha and optional files (inside that session workspace only). External exact paths require principal team_capture_evidence."},
-        {"retireTool","team_retire_work_item closes obsolete terminal historical work; never create a fake repair just to link a handoff."},
-        {"rule","Replace placeholders with real context; expectedRevision comes from the current ledger. action belongs inside inner arguments, never in operation. Do not probe invented operation names. Read team_get_contract once; if still blocked escalate with jobId and the exact error."}};
+    const Json templates={
+        {"add_issue",{{"message","<reproduction, expected/actual behavior and impact>"},{"acceptance","<repair verification criteria>"}}},
+        {"resolve_issue",{{"issueId","<actual issueId>"},{"notes","<verified resolution>"}}},
+        {"record_review",{{"sessionId","<reviewer sessionId>"},{"resultVersion","<exact resultVersion>"},{"candidateSha","<full reviewed SHA>"},{"verdict","blocked"},{"notes","<actual conclusion and attachment limitations>"}}},
+        {"accept",{{"candidateSha","<full SHA>"},{"verificationId","<passing verification ID>"},{"notes","<acceptance evidence>"}}},
+        {"reopen",{{"notes","<reason>"}}},{"block",{{"notes","<reason>"}}},{"cancel",{{"notes","<reason; sessions must be terminal>"}}}};
+    Json examples=Json::object(),required=Json::object(),actions=Json::array();
+    for(const auto& [action,details]:templates.items()) {actions.push_back(action);required[action]=Json::array();for(const auto& [key,v]:details.items()) required[action].push_back(key);
+        examples[action]={{"operation","cluster_update_work_item"},{"arguments",{{"workItemId","<owned workItemId>"},{"expectedRevision",0},{"requestId","<stable ID>"},{"action",action},{"details",details}}}};}
+    return {{"operation","cluster_update_work_item"},{"actions",actions},{"requiredDetails",required},{"detailsTemplates",templates},{"examples",examples},{"example",{{"tool","team_domain_action"},{"arguments",{{"projectId","<projectId>"},{"domainId","<domainId>"},{"token","<token>"},{"operation","cluster_update_work_item"},{"arguments",examples.at("record_review").at("arguments")}}}}},
+        {"optionalDetails",{{"add_issue",Json::array({"candidateSha"})}}},
+        {"captureEvidenceTool","Managers can use team_capture_evidence for declared/in-worktree files and corrections:[{reportedPath,replacementPath,reason}]. Missing attachments are warnings, never fabricated captures."},
+        {"rule","Use actual IDs and latest expectedRevision. action belongs in inner arguments. Fix schema errors from these templates. For genuinely blocked work, team_escalate with actionId/jobId, then continue other tasks or MCP-wait."}};
+}
+void validate_domain_update(const Json& args) {
+    const auto contract=domain_action_contract();const auto action=args.value("action","");Json missing=Json::array();
+    for(const auto* key:{"workItemId","requestId","action"}) if(!args.contains(key) || !args.at(key).is_string() || args.at(key)=="") missing.push_back(key);
+    if(!args.contains("expectedRevision") || !args.at("expectedRevision").is_number_integer()) missing.push_back("expectedRevision");
+    if(!contract.at("requiredDetails").contains(action)) throw DispatchError("Unknown ledger action: "+action,{{"reason","invalid_domain_action"},{"actualAction",action},{"contract",contract}});
+    const auto details=args.value("details",Json::object());
+    for(const auto& key:contract.at("requiredDetails").at(action)) if(!details.is_object() || !details.contains(key.get<std::string>()) || !details.at(key.get<std::string>()).is_string() || details.at(key.get<std::string>())=="") missing.push_back("details."+key.get<std::string>());
+    if(!missing.empty()) throw DispatchError("Ledger action "+action+" missing required fields: "+missing.dump(),{{"reason","invalid_action_arguments"},{"action",action},{"missingFields",missing},{"example",contract.at("examples").at(action)}});
+}
+Json block_review_result(const fs::path& data,const Json& in,const Json& args,const Json& facts) {
+    const auto& detail=args.at("details");const auto sid=detail.at("sessionId").get<std::string>(),version=detail.at("resultVersion").get<std::string>();
+    Store store(data);auto& p=project(store,in);auto& d=domain(p,in);std::string jid;
+    for(const auto& j:p.at("jobs")) if(j.value("sessionId","")==sid) jid=j.at("jobId");
+    const auto key="review-report:"+sha256(sid+"\n"+version);
+    if(!p["decisions"].contains(key)) {Json dec={{"decisionId",key},{"domainId",d.at("domainId")},{"jobId",jid},{"workItemId",args.at("workItemId")},{"blockedSessionId",sid},{"blockedResultVersion",version},{"state","open"},{"revision",0},{"question","Review report cannot be recorded as passed"},{"reason","Reviewer report status or SHA does not match the requested passing review"},{"facts",facts},{"recommendation","Record the actual failed/blocked conclusion or commission a corrected review of the same candidate. Never rewrite verdict/SHA. Continue other work or MCP-wait."}};p["decisions"][key]=dec;event(p,"decision",dec);store.save();}
+    return p["decisions"][key];
 }
 Json lead_tool_contract() {
     Json selected=Json::array();
@@ -386,7 +417,7 @@ Json lead_tool_contract() {
         const auto& fields=tool.at("inputSchema").at("properties");
         if (fields.contains("domainId") || tool.at("name")=="team_get_prompt") selected.push_back(tool);
     }
-    return {{"version",11},{"tools",selected},{"domainAction",domain_action_contract()}};
+    return {{"version",12},{"tools",selected},{"domainAction",domain_action_contract()}};
 }
 Json job_view(const Json& j) {
     Json out;for (const auto* k:{"jobId","domainId","title","role","state","sessionId","workItemId","baseSha","workspace","resultVersion","sourceJobId","error","accepted"})
@@ -468,7 +499,7 @@ void check_team_reservation(const fs::path& data,const Json& sessions,const Json
 
 Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view tool,const Json& in) {
     check(in.is_object(),"参数须为对象");
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",11},{"prompt",team_prompt(role)}};}
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",12},{"prompt",team_prompt(role)}};}
     if (tool=="team_get_settings") { Store s(data);return s.value.at("settings"); }
     if (tool=="team_update_settings") {
         Store s(data);auto& settings=s.value["settings"];
@@ -487,9 +518,9 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         for (const auto& p:s.value.at("projects")) if (p.value("queueId","")==queue) {bound=project_summary(p);break;}
         // The desktop has one execution path. Old saved direct preferences no longer select a mode.
         return {{"queueId",queue},{"mode","team"},{"project",bound},
-            {"principalPromptVersion",11},{"historyTakeoverSupported",true},
+            {"principalPromptVersion",12},{"historyTakeoverSupported",true},
             {"nextAction",bound.is_null()?"task_authorized_then_team_start_project_same_queue":"resume_bound_project"},
-            {"guidance","Use team_get_prompt({role:principal}) v11. The manager handles team_next_action FIFO without preemption in one persistent goal. The principal waits through team_wait_decisions for up to 300000 ms and handles early feedback immediately."}};
+            {"guidance","Use team_get_prompt({role:principal}) v12. The manager handles team_next_action FIFO without preemption in one persistent goal. The principal waits through team_wait_decisions for up to 300000 ms and handles early feedback immediately."}};
     }
     if (tool=="team_start_project") {
         const auto request=text(in,"requestId",100),title=text(in,"title",200);
@@ -546,7 +577,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             const auto plan_error=task_plan_error(tasks,static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
             if (!plan_error.empty()) throw std::runtime_error(plan_error);
             std::set<std::string> task_names;for (const auto& task:tasks) {check(task_names.insert(text(task,"name",200)).second,"计划任务名称须唯一");text(task,"steps",12000);text(task,"acceptance",6000);}
-            p["tasks"]=tasks;p["protocolVersion"]=11;p["pollIntervalMs"]=300000;
+            p["tasks"]=tasks;p["protocolVersion"]=12;p["pollIntervalMs"]=300000;
             p["history"]=history;
             p["backlogOwnerDomainId"]=first_domain;
             s.value["projects"][key]=p;s.value["requests"][request]={{"projectId",key},{"input",in}};s.save();
@@ -864,17 +895,26 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         {Store s(data);auto& p=project(s,in);p["operations"]["retire:"+request]={{"input",in},{"result",result}};s.save();}return result;
     }
     if (tool=="team_capture_evidence") {
-        Json copy;{Store s(data);copy=project(s,in);check(!in.contains("domainId") && !in.contains("token"),"外部证据须由主代理显式选择；经理使用team_domain_action cluster_capture_evidence采集工作树内证据");}
-        check(in.at("files").is_array() && !in.at("files").empty(),"须显式提供准确证据路径");
-        const auto sid=text(in,"sessionId",256);text(in,"reason",4000);const auto version=text(in,"resultVersion",100),candidate=text(in,"candidateSha",64);check(sha(candidate),"候选SHA无效");
-        bool own=false;for (const auto& job:copy.at("jobs")) if(job.value("sessionId","")==sid && job.value("resultVersion","")==version) own=true;
-        check(own,"会话及结果版本不属于本项目");
+        Json copy;const bool manager=in.contains("domainId") || in.contains("token");
+        {Store store(data);auto& p=project(store,in);if(manager) domain(p,in);copy=p;}
+        const auto sid=text(in,"sessionId",256),version=text(in,"resultVersion",100),candidate=text(in,"candidateSha",64);text(in,"reason",4000);check(sha(candidate),"Invalid full candidate SHA");
+        bool own=false;for(const auto& j:copy.at("jobs")) if(j.value("sessionId","")==sid && j.value("resultVersion","")==version && (!manager || j.at("domainId")==in.at("domainId"))) own=true;
+        check(own,"Session/resultVersion does not belong to this project manager");
         const auto scoped=cluster.for_queue(copy.at("queueId").get<std::string>());
         const auto report=scoped.invoke("cluster_get_session_result",{{"sessionId",sid},{"resultVersion",version},{"limit",4}});
-        check(report.at("delivery").value("candidateSha",Json())==candidate,"采集候选SHA与交付不匹配");
-        auto result=scoped.invoke("cluster_capture_evidence",{{"sessionId",sid},{"resultVersion",version},{"candidateSha",candidate},{"files",in.at("files")}});
-        if(result.value("unavailableFiles",1)==0) {Store s(data);auto& p=project(s,in);p["evidenceApprovals"][sid+"@"+version]={{"reason",in.at("reason")},{"files",in.at("files")},{"candidateSha",candidate},{"evidenceManifest",result.at("evidenceManifest")},{"capturedAt",now()}};for(auto& decision:p["decisions"]) if(decision.value("evidenceSessionId","")==sid && decision.value("evidenceResultVersion","")==version && decision.at("state")=="open") {decision["state"]="resolved";decision["resolution"]="explicit_evidence_captured";decision["revision"]=decision.at("revision").get<int>()+1;}event(p,"evidence.captured",{{"sessionId",sid},{"resultVersion",version}});s.save();}
-        return result;
+        check(report.at("delivery").value("candidateSha",Json())==candidate,"Capture SHA must match immutable delivery");
+        const auto files=in.value("files",Json::array()),corrections=in.value("corrections",Json::array());check(files.is_array() && corrections.is_array(),"files/corrections must be arrays");
+        if(manager) {
+            const auto row=scoped.invoke("cluster_get_session",{{"sessionId",sid}});const auto root=fs::weakly_canonical(path_from_utf8(row.at("workspace").get<std::string>()));
+            auto declared=report.at("delivery").value("evidencePaths",Json::array());for(const auto& t:report.at("delivery").value("tests",Json::array())) if(t.contains("logPath")) declared.push_back(t.at("logPath"));
+            const auto allowed=[&](const std::string& path) {const auto file=fs::weakly_canonical(path_from_utf8(path));const auto rel=file.lexically_relative(root);return (!rel.empty() && *rel.begin()!=L"..") || std::ranges::find(declared,Json(path))!=declared.end();};
+            for(const auto& file:files) check(file.is_string() && allowed(file.get<std::string>()),"Select declared evidence or an in-worktree file; unrelated external files need principal authorization");
+            for(const auto& c:corrections) check(allowed(text(c,"replacementPath",4000)),"Replacement must be declared evidence or inside this session worktree");
+        }
+        Json capture={{"sessionId",sid},{"resultVersion",version},{"candidateSha",candidate},{"files",files}};if(!corrections.empty()) capture["corrections"]=corrections;
+        auto result=scoped.invoke("cluster_capture_evidence",capture);
+        {Store store(data);auto& p=project(store,in);p["evidenceApprovals"][sid+"@"+version]={{"source",manager?"manager":"principal"},{"reason",in.at("reason")},{"files",files},{"corrections",corrections},{"candidateSha",candidate},{"evidenceManifest",result.at("evidenceManifest")},{"capturedAt",now()}};event(p,"evidence.captured",{{"sessionId",sid},{"resultVersion",version}});store.save();}
+        result["attachmentPolicy"]="advisory";return result;
     }
     if (tool=="team_get_contract") {Store s(data);auto& p=project(s,in);domain(p,in);return lead_tool_contract();}
     if (tool=="team_wait_actions") {
@@ -895,7 +935,8 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 out["workQueue"]=std::move(queue);out["dispatchPlan"]=std::move(plan);
                 if (in.contains("charterVersion") && in.at("charterVersion")!=copy.at("charterVersion")) {ready=true;out["reason"]="charter_changed";}
             }
-            out["ready"]=ready;out["timedOut"]=!ready;
+            out["blockedDecisions"]=Json::array();for(const auto& d:copy.at("decisions")) if(d.at("state")=="open" && out["blockedDecisions"].size()<8) out["blockedDecisions"].push_back({{"decisionId",d.at("decisionId")},{"jobId",d.value("jobId","")},{"actionId",d.value("actionId","")}});
+            out["ready"]=ready;out["timedOut"]=!ready;if(!ready && !out["blockedDecisions"].empty()) out["reason"]="blocked_decisions";
             if (ready || std::chrono::steady_clock::now()>=deadline) return out;
             // Only the MCP server waits; never retain Store's lock while sleeping.
             Sleep(100);
@@ -923,7 +964,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json out={{"projectId",p.at("projectId")},{"queueId",p.value("queueId","")},{"status",p.at("status")},{"charter",p.at("charter")},
             {"charterVersion",p.at("charterVersion")},{"tasks",p.value("tasks",Json::array())},{"workspace",p.at("workspace")},{"baseSha",p.at("baseSha")},{"domain",d},{"jobs",Json::array()},{"decisions",Json::array()},{"dependencies",Json::array()}};
         out["domain"].erase("token");
-        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=11;
+        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=12;
         out["dispatchPolicy"]="FIFO: take the team_next_action head, handle it or dispatch its successor, then take the next. Child results join the tail without preemption. priorityResults is a compatibility field, not a priority policy.";
         out["backlog"]={{"ownerDomainId",backlog_owner(p)},{"isOwner",d.at("domainId")==backlog_owner(p)},
             {"pending",p.value("backlog",Json::object()).value("pending",0)},{"actionable",p.value("backlog",Json::object()).value("actionable",0)},
@@ -954,7 +995,8 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 const auto& old=p.at("operations").at(key);check(old.at("input")==in,"requestId 参数不一致");return old.at("result");
             }
         }
-        Json reviewed,plan_guard;
+        Json reviewed,plan_guard,action_guard;
+        if(tool=="team_escalate" && in.contains("actionId")) {Json copy;{Store store(data);copy=project(store,in);domain(copy,in);}const auto queue=coordinator_queue(cluster,data,copy,text(in,"domainId",100));for(const auto& action:queue.at("items")) if(action.at("actionId")==in.at("actionId")) action_guard=action;check(!action_guard.is_null(),"actionId is not currently pending; re-read team_next_action");}
         if (tool=="team_delegate" && in.value("role","")=="developer") {
             Json copy;{Store s(data);copy=project(s,in);domain(copy,in);}
             plan_guard=dispatch_readiness(cluster,copy);
@@ -1057,6 +1099,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         } else if (tool=="team_escalate") {
             Json decision={{"decisionId",id()},{"domainId",d.at("domainId")},{"state","open"},{"revision",0}};
             if (in.contains("jobId")) {const auto key=text(in,"jobId",100);authorize_job(p,d,key);decision["jobId"]=key;}
+            if(!action_guard.is_null()) {decision["actionId"]=action_guard.at("actionId");if(action_guard.contains("jobId")) decision["jobId"]=action_guard.at("jobId");if(action_guard.contains("workItemId")) decision["blockedWorkItemId"]=action_guard.at("workItemId");}
             for (const auto* k:{"question","reason","recommendation","alternatives","impact","blockedScope"}) decision[k]=text(in,k,2000);
             // Dedupe an unresolved question even when a small model changes requestId.
             for (const auto& old:p.at("decisions")) if (old.at("domainId")==d.at("domainId") && old.at("state")=="open" && old.at("question")==decision.at("question")) {return old;}
@@ -1116,6 +1159,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             }
         }
         args.erase("queueId");
+        if(tool=="team_domain_action" && operation=="cluster_update_work_item") validate_domain_update(args);
         if (tool=="team_domain_read") {
             check(operation=="cluster_get_session_status" || operation=="cluster_get_session_result" || operation=="cluster_get_work_item" || operation=="cluster_get_evidence_manifest","不支持该领域读取操作");
             if (operation=="cluster_get_session_result") args["limit"]=std::min(args.value("limit",4000),8000);
@@ -1129,7 +1173,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 const auto& details=args.at("details");bool matches=false;
                 for (const auto& j:pcopy.at("jobs")) if (j.at("domainId")==dcopy.at("domainId") && j.at("role")=="reviewer" &&
                     j.value("sessionId","")==details.value("sessionId","") && j.at("baseSha")==details.at("candidateSha") && j.value("workItemId","")==args.at("workItemId").get<std::string>()) matches=true;
-                check(matches,"审查记录必须匹配本领域独立 reviewer 的精确候选 SHA 和工作项");
+                if(!matches) {Json available=Json::array();for(const auto& j:pcopy.at("jobs")) if(j.at("role")=="reviewer" && j.at("domainId")==dcopy.at("domainId")) available.push_back({{"sessionId",j.value("sessionId","")},{"resultVersion",j.value("resultVersion","")},{"candidateSha",j.at("baseSha")},{"workItemId",j.value("workItemId","")}});throw DispatchError("Review identity mismatch; actual="+details.dump()+"; owned reviews="+available.dump(),{{"reason","review_identity_mismatch"},{"actualRequest",details},{"expectedOwnedReviews",available}});}
             }
             if (operation=="cluster_update_work_item") check(args.value("action","")!="attach_session","领域不能关联其他会话，请使用 sourceJobId 派发");
         }
@@ -1151,25 +1195,35 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         if (operation=="cluster_update_work_item" && args.value("action","")=="record_review" && args.at("details").value("verdict","")=="passed") {
             const auto& detail=args.at("details");
             const auto report=scoped.invoke("cluster_get_session_result",{{"sessionId",detail.at("sessionId")},{"resultVersion",detail.at("resultVersion")},{"limit",4}});
-            check(report.at("delivery").value("status","")=="passed" && report.at("delivery").value("candidateSha",Json())==detail.at("candidateSha"),"reviewer 的结构化结论不是该 SHA 的 passed，不能登记通过");
-            auto paths=report.at("delivery").value("evidencePaths",Json::array());
-            for(const auto& test:report.at("delivery").value("tests",Json::array())) if(test.contains("logPath") && std::ranges::find(paths,test.at("logPath"))==paths.end()) paths.push_back(test.at("logPath"));
-            if (!report.contains("evidence") || report.at("evidence").value("unavailableFiles",0)!=0 || report.at("evidence").value("state","")=="unavailable") {
-                try {if(report.contains("evidence") && report.at("evidence").contains("evidenceManifest")) {
-                    const auto manifest=read_evidence_manifest(data,queue,report.at("evidence").at("evidenceManifest").get<std::string>());
-                    for(const auto& file:manifest.at("files")) if(file.value("state","")!="captured" && std::ranges::find(paths,file.at("path"))==paths.end()) paths.push_back(file.at("path"));
-                }} catch(const std::exception&) { /* Preserve the original report paths when the manifest itself is unavailable. */ }
-                Json decision;{Store s(data);auto& p=project(s,in);auto& d=domain(p,in);std::string jid;
-                    for(const auto& job:p.at("jobs")) if(job.value("sessionId","")==detail.at("sessionId").get<std::string>()) jid=job.at("jobId");
-                    const auto key="evidence-"+sha256(detail.at("sessionId").get<std::string>()+detail.at("resultVersion").get<std::string>());
-                    if(!p["decisions"].contains(key)) {decision={{"decisionId",key},{"domainId",d.at("domainId")},{"jobId",jid},{"workItemId",args.at("workItemId")},{"state","open"},{"revision",0},{"question","审查证据需要补采集"},{"reason","声明路径在工作树外或文件缺失"},{"recommendation","主代理调用team_capture_evidence显式选择文件；工作树内可用team_domain_action operation=cluster_capture_evidence"},{"evidenceSessionId",detail.at("sessionId")},{"evidenceResultVersion",detail.at("resultVersion")},{"candidateSha",detail.at("candidateSha")},{"files",paths}};p["decisions"][key]=decision;event(p,"decision",decision);s.save();}else {auto& saved=p["decisions"][key];if(saved.at("state")!="open") {saved["state"]="open";saved["revision"]=saved.at("revision").get<int>()+1;event(p,"decision",saved);s.save();}decision=saved;}}
-                throw DispatchError("审查证据未采集；已登记具体决策并将此项移出可处理队列，继续其他任务或MCP等待。主代理使用team_capture_evidence；不可用布尔字段绕过。",{{"reason","review_evidence_pending"},{"decision",decision},{"principalTool","team_capture_evidence"}});
+            const Json expected={{"sessionId",detail.at("sessionId")},{"resultVersion",detail.at("resultVersion")},{"candidateSha",detail.at("candidateSha")},{"status","passed"}};
+            const Json actual={{"sessionId",report.value("sessionId",Json())},{"resultVersion",report.value("resultVersion",Json())},{"candidateSha",report.at("delivery").value("candidateSha",Json())},{"status",report.at("delivery").value("status",Json())}};
+            if(actual.at("status")!="passed" || actual.at("candidateSha")!=expected.at("candidateSha")) {
+                Json mismatches=Json::array();for(const auto* key:{"status","candidateSha"}) if(actual.at(key)!=expected.at(key)) mismatches.push_back(key);
+                Json facts={{"expected",expected},{"actual",actual},{"mismatches",mismatches}};const auto decision=block_review_result(data,in,args,facts);facts["reason"]="review_report_mismatch";facts["decision"]=decision;facts["nextAction"]="Record the actual failed/blocked conclusion, or commission a corrected independent review. Do not alter report SHA/verdict.";
+                throw DispatchError("Review report mismatch; expected="+expected.dump()+"; actual="+actual.dump(),facts);
             }
+            const auto evidence=report.value("evidence",Json::object());
+            if(!report.contains("evidence") || evidence.value("unavailableFiles",0)>0 || evidence.value("state","")=="unavailable") {
+                Json warnings=Json::array();
+                try {if(evidence.contains("evidenceManifest")) {const auto manifest=read_evidence_manifest(data,queue,evidence.at("evidenceManifest").get<std::string>());for(const auto& file:manifest.at("files")) if(file.value("state","")!="captured") warnings.push_back({{"path",file.at("path")},{"reason",file.value("reason","unavailable")}});}} catch(const std::exception&) { }
+                if(warnings.empty()) warnings.push_back({{"reason","Attachment collection unavailable; assess original review and acceptance evidence"}});
+                args["details"]["evidenceWarnings"]=warnings;args["details"]["attachmentPolicy"]="advisory";
+            }
+
+        }
+        std::string reviewOperation;
+        if(operation=="cluster_update_work_item" && args.value("action","")=="record_review") {
+            reviewOperation="review:"+args.at("workItemId").get<std::string>()+":"+text(args,"requestId",100);
+            Store store(data);auto& p=project(store,in);auto& ops=p["operations"];
+            if(ops.contains(reviewOperation)) {const auto& saved=ops.at(reviewOperation);check(saved.at("input")==in,"requestId already used with different review arguments");args=saved.at("arguments");if(saved.contains("result")) return saved.at("result");}
+            else {ops[reviewOperation]={{"input",in},{"arguments",args}};store.save();}
         }
         auto result=scoped.invoke(operation,args);
+        if(operation=="cluster_update_work_item" && args.value("action","")=="record_review" && args.at("details").contains("evidenceWarnings")) {result["warnings"]=args.at("details").at("evidenceWarnings");result["attachmentPolicy"]="advisory";}
         if(operation=="cluster_update_work_item" && args.value("action","")=="record_review") {
             Store s(data);auto& p=project(s,in);const auto& details=args.at("details");bool changed=false;
-            for(auto& dec:p["decisions"]) if(dec.at("state")=="open" && dec.contains("evidenceSessionId") && dec.value("workItemId","")==args.at("workItemId").get<std::string>() && (details.value("verdict","")=="passed" || dec.at("evidenceSessionId")==details.at("sessionId"))) {dec["state"]="resolved";dec["resolution"]="review_conclusion_updated";dec["revision"]=dec.at("revision").get<int>()+1;changed=true;}
+            for(auto& dec:p["decisions"]) if(dec.at("state")=="open" && (dec.contains("evidenceSessionId") || dec.contains("blockedSessionId")) && dec.value("workItemId","")==args.at("workItemId").get<std::string>() && (details.value("verdict","")=="passed" || dec.value("blockedSessionId",dec.value("evidenceSessionId",std::string()))==details.at("sessionId").get<std::string>())) {dec["state"]="resolved";dec["resolution"]="review_conclusion_updated";dec["revision"]=dec.at("revision").get<int>()+1;changed=true;}
+            if(!reviewOperation.empty()) {p["operations"][reviewOperation]["result"]=result;changed=true;}
             if(changed) s.save();
         }
         if(operation=="cluster_capture_evidence" && result.value("unavailableFiles",1)==0) {Store s(data);auto& p=project(s,in);for(auto& dec:p["decisions"]) if(dec.at("state")=="open" && dec.value("evidenceSessionId","")==args.value("sessionId","") && dec.value("evidenceResultVersion","")==args.value("resultVersion","")) {dec["state"]="resolved";dec["resolution"]="evidence_recaptured";}event(p,"evidence.captured",{{"sessionId",args.at("sessionId")}});s.save();}
@@ -1217,15 +1271,15 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
         for (const auto& old:p.at("jobs")) {
             if (!old.contains("sessionId") || old.value("observedTerminal",false)) continue;
             if (old.at("role")=="lead" && !terminal(old.at("state").get<std::string>()) &&
-                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<11 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
+                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<12 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
                 health.run("notify_policy",old.at("jobId"),[&] {
                     const auto version=p.at("charterVersion").get<int>();
                     const auto notice=scoped.invoke("cluster_send_message",{{"sessionId",old.at("sessionId")},
-                        {"requestId","team-policy11-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
-                        {"message","Policy v11: re-read team_get_prompt(role=lead), team_get_contract and team_domain_context. The principal owns decomposition. Queue all ready planned items with team_dispatch_ready before handling FIFO results and again after each acceptance. Stay in the same goal. Developers/repair workers must first build/test their candidates and supply successful logs; otherwise dispatch repair, never do their pre-review checks yourself. Dispatch independent review, then personally use team_verify_candidate only after review passes, then accept; failures require repair and fresh review. Retire obsolete terminal work through team_retire_work_item, never fake read-only repairs. Evidence blocks create scoped decisions: recapture in-worktree files through cluster_capture_evidence; the principal explicitly selects external files with team_capture_evidence. Wait only through team_wait_actions, up to 300000 ms, with immediate early feedback; never sleep. Finish all accepted planned items through team_finish_domain, then complete the real goal. No integrator or preliminary merge is required."}});
+                        {"requestId","team-policy12-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
+                        {"message","Policy v12: refresh team_get_prompt(role=lead), team_get_contract and team_domain_context. Ordinary evidence attachments are advisory: missing/wrong log paths produce warnings, not mandatory principal escalation or fresh review. Managers may use team_capture_evidence for declared/in-worktree files and corrections retaining original references and real hashes. Note limitations honestly. Exact reviewer identity, actual passing verdict/candidate SHA, developer build/test success and manager final verification remain hard gates. Errors now show expected/actual report values. Every ledger action has a template; add_issue requires details.message and details.acceptance. For genuinely blocked FIFO actions, team_escalate with actionId/jobId, continue independent work and MCP-wait. Keep the same goal and worker sessions. Never fabricate repairs or change report verdict/SHA."}});
                     if (notice.value("accepted",false)) {
                         Store s(data);auto& saved=s.value["projects"][pid]["jobs"][old.at("jobId").get<std::string>()];
-                        saved["notifiedPolicyVersion"]=11;saved["notifiedCharterVersion"]=version;s.save();
+                        saved["notifiedPolicyVersion"]=12;saved["notifiedCharterVersion"]=version;s.save();
                     }
                 });
             }
@@ -1292,7 +1346,7 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
                 if (exists) continue;
                 auto job=new_job(current,d,"lead","项目经理 · "+d.at("name").get<std::string>(),
                     "Read team_domain_context and the complete plan. Queue all ready tasks through team_dispatch_ready, then handle team_next_action FIFO. Developers must build/test first; dispatch independent review before personally running team_verify_candidate. Repairs require fresh review and tests. Repeat ready dispatch after each handled result. Wait only through team_wait_actions; never sleep. When all planned items are accepted, team_finish_domain, complete the goal and exit naturally.",current.at("baseSha").get<std::string>());
-                job["schedulerPolicyVersion"]=11;job["wake"]=d.at("wake");
+                job["schedulerPolicyVersion"]=12;job["wake"]=d.at("wake");
                 current["jobs"][job.at("jobId").get<std::string>()]=job;d["state"]="working";
             }
             s.save();p=current;
@@ -1404,7 +1458,8 @@ Json team_tools() {
     add("team_list_projects","Read compact project summaries for desktop display or recovery; do not repeatedly load all historical projects.",Json::object(),Json::array());
     add("team_get_queue","Find the team bound to a queue. Resume its existing project instead of creating another one.",{{"queueId",text}},{"queueId"});
     add("team_retire_work_item","Formally cancel obsolete work only after every session is terminal; retain audit records and dispose of old handoffs. Managers may retire adopted historical/old-round items. Current-round developer work requires explicit principal authorization.",{{"projectId",text},{"charterVersion",integer},{"workItemId",text},{"requestId",text},{"reason",text},{"domainId",text},{"token",text}},{"projectId","charterVersion","workItemId","requestId","reason"});
-    add("team_capture_evidence","Principal-only explicit capture of exact evidence files, including external paths, bound to project/session/resultVersion/candidateSha. Files must exist and be captured successfully; this is not a verification bypass.",{{"projectId",text},{"sessionId",text},{"resultVersion",text},{"candidateSha",text},{"files",array},{"reason",text}},{"projectId","sessionId","resultVersion","candidateSha","files","reason"});
+    const Json correction{{"type","object"},{"properties",{{"reportedPath",text},{"replacementPath",text},{"reason",text}}},{"required",Json::array({"reportedPath","replacementPath","reason"})},{"additionalProperties",false}};
+    add("team_capture_evidence","Optional collection/correction, available to managers with credentials. Select declared evidence or in-worktree files; fix mistaken references with corrections:[{reportedPath,replacementPath,reason}]. Keep original references and real replacement hashes. Attachment problems are warnings. Unrelated external files need principal authorization.",{{"projectId",text},{"domainId",text},{"token",text},{"sessionId",text},{"resultVersion",text},{"candidateSha",text},{"files",array},{"corrections",{{"type","array"},{"items",correction},{"maxItems",128}}},{"reason",text}},{"projectId","sessionId","resultVersion","candidateSha","files","reason"});
     add("team_get_project","Read one project status, deliverables and pending decisions without full execution logs.",{{"projectId",text},{"includeCharter",{{"type","boolean"}}}},{"projectId"});
     add("team_wait_decisions","The principal must wait through this MCP tool for up to 300000 ms. Manager completion, important decisions and failures return early. Never sleep or fill the remaining wait time.",{{"projectId",text},{"afterCursor",text},{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",300000},{"default",300000}}}},{"projectId"});
     add("team_resolve_decision","The principal resolves one decision using its current expectedRevision; the manager is notified to resume affected work.",{{"projectId",text},{"decisionId",text},{"expectedRevision",integer},{"requestId",text},{"resolution",text}},{"projectId","decisionId","expectedRevision","requestId","resolution"});
@@ -1431,7 +1486,7 @@ Json team_tools() {
     scoped("team_verify_candidate","After independent review passes, personally execute final tests in the exact candidate branch. The service records actual exit codes and logs. Acceptance requires its passing verificationId.",{{"requestId",text},{"workItemId",text},{"candidateSha",text},{"executable",text},{"arguments",array},{"timeoutMs",integer}},{"requestId","workItemId","candidateSha","executable","arguments"});
     scoped("team_cancel_job","Request cancellation of an owned queued or active job. The service confirms actual terminal state and retains commits/evidence.",{{"jobId",text},{"requestId",text},{"reason",text}},{"jobId","requestId","reason"});
     scoped("team_checkpoint","Persist progress in the same goal session. waiting does not end/recreate the manager; continue only records context for the next loop iteration.",{{"requestId",text},{"state",{{"type","string"},{"enum",Json::array({"working","waiting","decision","continue"})}}},{"checkpoint",object}},{"requestId","state","checkpoint"});
-    scoped("team_escalate","Create a concrete authorization/failure decision. Attach jobId when a result is blocked so independent work can continue. Do not escalate routine scheduling.",{{"requestId",text},{"question",text},{"reason",text},{"recommendation",text},{"alternatives",text},{"impact",text},{"blockedScope",text},{"jobId",text}},
+    scoped("team_escalate","Create a concrete authorization/failure decision. Attach actionId from team_next_action or jobId to pause a genuinely blocked FIFO item; other work continues and MCP can wait. Correct ordinary schema errors using the contract templates first.",{{"requestId",text},{"question",text},{"reason",text},{"recommendation",text},{"alternatives",text},{"impact",text},{"blockedScope",text},{"jobId",text},{"actionId",text}},
         {"requestId","question","reason","recommendation","alternatives","impact","blockedScope"});
     scoped("team_finish_domain","Submit the manager result only when no executors, decisions or pending actions remain and all current planned items have independently reviewed, tested acceptance.",{{"requestId",text},{"summary",text},{"evidence",array},{"acceptanceResults",{{"type","array"},{"items",object}}}},
         {"requestId","summary","evidence","acceptanceResults"});

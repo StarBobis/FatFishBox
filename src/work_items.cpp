@@ -11,7 +11,7 @@ namespace fatfish {
 namespace {
 void check(bool value,const char* message) {if (!value) throw std::runtime_error(message);}
 std::string text(const Json& input,const char* key,std::size_t max=4000) {
-    check(input.contains(key) && input.at(key).is_string(),"总账缺少字符串字段");
+    if(!input.contains(key) || !input.at(key).is_string()) throw DispatchError(std::string("Missing ledger string field: ")+key,{{"reason","missing_ledger_field"},{"field",key},{"expected","nonempty string"}});
     const auto value=input.at(key).get<std::string>();
     check(!value.empty() && value.size()<=max && value.find('\0')==value.npos,"总账字段为空或超过长度限制");
     return value;

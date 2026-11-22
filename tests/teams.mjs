@@ -139,7 +139,7 @@ try {
     const p=(await disk()).projects[pid],domain=Object.values(p.domains)[0];
     const authz={projectId:pid,domainId:domain.domainId,token:domain.token,charterVersion:1};
     const call=(name,args={},fail=false)=>tool(name,{...authz,...args},fail);
-    assert.equal((await call('team_get_contract')).version,11);
+    const managerContract=await call('team_get_contract');assert.equal(managerContract.version,12);assert.ok(managerContract.tools.some(t=>t.name==='team_capture_evidence'),'manager can discover capture/correction directly');assert.deepEqual(managerContract.domainAction.requiredDetails.add_issue,['acceptance','message']);assert.equal(managerContract.domainAction.examples.add_issue.arguments.action,'add_issue');
     const listed=(await rpc('tools/list')).tools;
     for(const role of ['principal','lead','worker']) assert.doesNotMatch((await tool('team_get_prompt',{role})).prompt,/\p{Script=Han}/u,'all role prompts are English');
     for(const t of listed) {assert.doesNotMatch(t.description,/\p{Script=Han}/u,'agent-facing tool descriptions are English');assert.doesNotMatch(JSON.stringify(t.inputSchema),/\p{Script=Han}/u,'tool schema guidance is English');}
@@ -188,9 +188,11 @@ try {
     const workerBindings=workerRows.map(j=>({id:j.id,dshId:j.dshId,poolId:j.poolId}));
     await close();
     const legacyTeam=await disk();legacyTeam.settings.leadPool='removed-role-model';legacyTeam.settings.developerConcurrency=1;legacyTeam.settings.reviewerConcurrency=1;
+    legacyTeam.projects[pid].decisions['old-attachment-block']={decisionId:'old-attachment-block',domainId:authz.domainId,jobId:running.jobId,state:'open',revision:0,evidenceSessionId:running.sessionId,evidenceResultVersion:'old',question:'Old attachment-only block'};
     await writeFile(join(data,'teams.json'),JSON.stringify(legacyTeam));
     ({tool,rpc}=await connect());
     assert.deepEqual(await tool('team_get_settings'),{revision:1,totalConcurrency:4},'legacy role settings no longer constrain dispatch; saved maximum retained');
+    assert.equal((await disk()).projects[pid].decisions['old-attachment-block'].state,'resolved','old attachment-only blocks become advisory without cancelling workers');
     const recoveredNative=await native();
     for(const j of workerBindings) assert.deepEqual({id:recoveredNative.sessions[j.id].id,dshId:recoveredNative.sessions[j.id].dshId,poolId:recoveredNative.sessions[j.id].poolId},j);
 
@@ -235,10 +237,16 @@ try {
     await call('team_delegate',{...reviewArgs,requestId:'wrong-sha',baseSha:'f'.repeat(40)},true);
     const review=await call('team_delegate',{...reviewArgs,requestId:'review1'});
     const reviewLive=await until(async()=>{const j=(await disk()).projects[pid].jobs[review.jobId];return j.sessionId&&j;},'first review');
-    const failedReview=await end(reviewLive,{status:'failed'});
+    const failedReview=await end(reviewLive,{status:'failed',candidateSha:'e'.repeat(40)});
     const item=()=>call('team_domain_read',{operation:'cluster_get_work_item',arguments:{workItemId:running.workItemId}});
     const action=async(name,details,id,fail=false)=>call('team_domain_action',{operation:'cluster_update_work_item',arguments:{workItemId:running.workItemId,expectedRevision:(await item()).revision,requestId:id,action:name,details}},fail);
+    const mismatch=await action('record_review',{sessionId:failedReview.sessionId,resultVersion:failedReview.resultVersion,candidateSha:base,verdict:'passed',notes:'Cannot claim actual failed report as passed'},'reject-report-mismatch',true);
+    assert.equal(mismatch.reason,'review_report_mismatch');assert.equal(mismatch.expected.candidateSha,base);assert.equal(mismatch.actual.status,'failed');assert.equal(mismatch.actual.candidateSha,'e'.repeat(40));assert.deepEqual(mismatch.mismatches,['status','candidateSha']);
+    const blockedWait=await call('team_wait_actions',{timeoutMs:100});assert.equal(blockedWait.timedOut,true);assert.equal(blockedWait.reason,'blocked_decisions');
     await action('record_review',{sessionId:failedReview.sessionId,resultVersion:failedReview.resultVersion,candidateSha:base,verdict:'failed',notes:'Adversarial fixture failure'},'review-failed');
+    const missingIssue=await action('add_issue',{title:'wrong field'},'invalid-issue-fields',true);assert.equal(missingIssue.reason,'invalid_action_arguments');assert.deepEqual(missingIssue.missingFields,['details.acceptance','details.message']);assert.ok(missingIssue.example.arguments.details.acceptance);
+    const issue=await action('add_issue',{message:'Actual failing behavior and reproduction',acceptance:'Repair then rerun independent review and tests'},'valid-issue');assert.ok(issue.issueId);await action('resolve_issue',{issueId:issue.issueId,notes:'Fixture issue tracked and resolved before final acceptance'},'resolve-fixture-issue');
+
     await call('team_verify_candidate',{requestId:'before-review',workItemId:running.workItemId,candidateSha:base,executable:process.execPath,arguments:['-e','process.exit(0)']},true);
     const repair=await call('team_delegate',{requestId:'repair',title:'Repair review failure',role:'repair',sourceJobId:completed.jobId,baseSha:base,task:'Fix the exact issue'});
     const repairLive=await until(async()=>{const j=(await disk()).projects[pid].jobs[repair.jobId];return j.sessionId&&j;},'repair');
@@ -250,19 +258,25 @@ try {
     const secondLive=await until(async()=>{const j=(await disk()).projects[pid].jobs[second.jobId];return j.sessionId&&j;},'new independent review');
     assert.notEqual(secondLive.workspace,repairLive.workspace);
     const outsideEvidence=join(root,'review-external-evidence.txt');
-    const passedReview=await end(secondLive,{evidencePaths:[outsideEvidence]});
-    const reviewDetails={sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,verdict:'passed',notes:'Repaired candidate independently checked'};
-    await action('record_review',{...reviewDetails,evidenceVerified:true,managerVerified:true},'review-reject-uncaptured',true);
-    assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true,'evidence-blocked result must not repeatedly wake action_ready');
-    await call('team_domain_action',{operation:'cluster_capture_evidence',arguments:{sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,files:[outsideEvidence]}},true);
-    const captureArgs={projectId:pid,sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,files:[outsideEvidence],reason:'Principal verified the exact external historical evidence path'};
-    assert.ok((await tool('team_capture_evidence',captureArgs)).unavailableFiles>0,'missing file remains blocked even after explicit selection');
-    assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true);
+    const reviewLogs=join(secondLive.workspace,'.fatfish-logs');await mkdir(reviewLogs,{recursive:true});
+    const missingLog=join(reviewLogs,'py_compile.log'),realExit=join(reviewLogs,'py_compile.exit');await writeFile(realExit,'0\n');
+    const passedReview=await end(secondLive,{evidencePaths:[outsideEvidence,missingLog]});
+    const pendingHead=(await call('team_next_action')).head;
+    const paused=await call('team_escalate',{requestId:'pause-exact-action',actionId:pendingHead.actionId,question:'Fixture unhandleable action',reason:'Verify exact action blocking',recommendation:'Resolve after inspection',alternatives:'Continue independent work',impact:'This action only',blockedScope:'One result'});
+    assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true,'a genuinely blocked action leaves FIFO without busy waiting');
+    await tool('team_resolve_decision',{projectId:pid,decisionId:paused.decisionId,expectedRevision:paused.revision,requestId:'resume-exact-action',resolution:'Fixture blocker resolved'});
+    const reviewDetails={sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,verdict:'passed',notes:'Independent review passed; attachment names unavailable, limitations recorded; manager still performs final real tests'};
+    const advisoryInput={operation:'cluster_update_work_item',arguments:{workItemId:running.workItemId,expectedRevision:(await item()).revision,requestId:'review-advisory',action:'record_review',details:reviewDetails}};
+    const advisory=await call('team_domain_action',advisoryInput);assert.equal(advisory.attachmentPolicy,'advisory');assert.equal(advisory.warnings.length,2,'missing attachments warn without forcing new review or principal intervention');
+    const captureArgs={sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,files:[],reason:'Correct typo using the actual existing exit evidence'};
+    await call('team_capture_evidence',{...captureArgs,files:[join(root,'unrelated-external-file.txt')]},true);
+    const corrected=await call('team_capture_evidence',{...captureArgs,corrections:[{reportedPath:missingLog,replacementPath:realExit,reason:'Reviewer referenced py_compile.log; actual evidence is py_compile.exit containing exit code 0'}]});
+    assert.equal(corrected.fileCorrections.length,1);assert.equal(corrected.unavailableFiles,1,'only unrelated missing external attachment remains, honestly unavailable');
     await writeFile(outsideEvidence,'Real historical evidence fixture');
-    const captured=await tool('team_capture_evidence',captureArgs);
-    assert.equal(captured.unavailableFiles,0);
-    assert.equal((await call('team_next_action')).head.reason,'review_result_unhandled');
-    await action('record_review',reviewDetails,'review-passed');
+    const captured=await call('team_capture_evidence',{...captureArgs,files:[outsideEvidence]});assert.equal(captured.unavailableFiles,0,'manager may capture an explicitly declared external evidence file');assert.equal(captured.fileCorrections.length,1,'filename corrections persist across later recapture');
+    const manifest=await call('team_domain_read',{operation:'cluster_get_evidence_manifest',arguments:{manifestId:captured.evidenceManifest}});const correctedFile=manifest.files.find(f=>f.reportedPath===missingLog);assert.equal(correctedFile.path,realExit);assert.equal(correctedFile.state,'captured');assert.ok(correctedFile.sha256);assert.ok(correctedFile.correctionReason);
+    const originalReview=await call('team_domain_read',{operation:'cluster_get_session_result',arguments:{sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion}});assert.ok(originalReview.delivery.evidencePaths.includes(missingLog),'original report is never rewritten');assert.equal(originalReview.delivery.candidateSha,candidate);
+    assert.deepEqual(await call('team_domain_action',advisoryInput),advisory,'review replay remains stable even after evidence availability changes');
     const verify={workItemId:running.workItemId,candidateSha:candidate,executable:process.execPath,arguments:['-e','process.exit(1)']};
     const failedTest=await call('team_verify_candidate',{...verify,requestId:'test-fail'});
     assert.equal(failedTest.passed,false);assert.equal(failedTest.exitCode,1);
