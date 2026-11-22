@@ -18,6 +18,9 @@ try {
         ['settings', 925, 650, 120],
         ['sessions', 1100, 720, 96],
         ['pools', 1100, 720, 96],
+        ['queues', 740, 520, 96],
+        ['onboarding', 740, 520, 96],
+        ['onboarding', 925, 650, 120],
         ['sessions', 740, 520, 96],
         ['sessions', 925, 650, 120],
     ]) {
@@ -53,14 +56,16 @@ try {
     state.sessions[workerId]={id:workerId,queueId,title:'修复列表页面布局',workspace:folder,role:'developer',teamProjectId:projectId,
         status:'running',created:1,updated:2,processed:false,model:'开发模型',provider:'fixture'};
     team.projects[projectId].jobs={lead:{jobId:'lead',domainId:'feature',role:'lead',state:'running',sessionId:managerId,created:1}};
+    state.settings.accounts={fixture:{name:'Google 账号',provider:'fixture'},peer:{name:'GitHub 账号',provider:'peer'}};
+    state.settings.pools={one:{id:'one',provider:'fixture',model:'hy4-flash-free',name:'Hy4 Flash Free',enabled:true,concurrency:10,effort:'high',efforts:['low','medium','high']},two:{id:'two',provider:'fixture',model:'other',name:'第二个可选模型',enabled:false,concurrency:10,effort:'',efforts:[]},three:{id:'three',provider:'peer',model:'hy4-flash-free',name:'Hy4 Flash Free',enabled:true,concurrency:10,effort:'high',efforts:['low','high']}};
     await writeFile(statePath,JSON.stringify(state));
     await writeFile(teamPath,JSON.stringify(team));
-    for(const [width,height,dpi] of [[740,520,96],[1100,720,96],[925,650,120]]) {
-        const preview=join(folder,`queue-team-${dpi}-${width}.png`);
-        await run(executable,['--render-offscreen','sessions',preview,...[width,height,dpi].map(String)],{env,windowsHide:true,timeout:15000});
+    for(const page of ['sessions','pools','queues','onboarding','onboarding-models','onboarding-queue','onboarding-start','settings']) for(const [width,height,dpi] of [[740,520,96],[1100,720,96],[925,650,120]]) {
+        const preview=join(folder,`${page}-${dpi}-${width}.png`);
+        await run(executable,['--render-offscreen',page,preview,...[width,height,dpi].map(String)],{env,windowsHide:true,timeout:15000});
         if(process.env.FATFISH_RENDER_EVIDENCE) {
             await mkdir(process.env.FATFISH_RENDER_EVIDENCE,{recursive:true});
-            await copyFile(preview,join(process.env.FATFISH_RENDER_EVIDENCE,`queue-team-${dpi}-${width}.png`));
+            await copyFile(preview,join(process.env.FATFISH_RENDER_EVIDENCE,`${page}-${dpi}-${width}.png`));
         }
     }
     const invalid = join(folder, 'invalid.png');

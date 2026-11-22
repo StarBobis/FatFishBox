@@ -22,8 +22,9 @@ const server=createServer(async(req,res)=>{
         case 'permissionPresets/catalog':value={defaultOptions:[{value:'local',name:'Local'}]};break;
         case 'agentPresets/list':value={presets:[]};break;
         case 'session/modelCatalog':value={groups:[{id:'fixture',name:'Fixture',models:['lead','dev','review','integrate'].map(id=>({id,name:id}))},{id:'fixture-peer',name:'Peer account',models:[{id:'dev',name:'dev'}]}]};break;
-        case 'session/create':value={sessionId:`team-session-${++number}`};states.set(value.sessionId,{cursor:1,running:false,queue:[],pendingInput:[]});break;
+        case 'session/create':assert.equal(a.agentPreset,'ptc','fixed agent preset');value={sessionId:`team-session-${++number}`};states.set(value.sessionId,{cursor:1,running:false,queue:[],pendingInput:[]});break;
         case 'commands/execute':{
+            if(a.line.startsWith('/permission '))assert.equal(a.line,'/permission danger-full-access','fixed permission preset');
             if(a.line.startsWith('/goal ')) {
                 if(a.line==='/goal pause') {const goal=goals.get(a.agentId);if(goal)goal.phase='paused';}
                 else {
@@ -32,11 +33,11 @@ const server=createServer(async(req,res)=>{
                     const objective=a.line.slice(6).trim();
                     // Model the real race: /goal starts a round before the RPC returns.
                     // The first round must already know the manager role and full startup file.
-                    assert.match(objective,/禁止自己修改产品代码或审计脚本/);
-                    const file=objective.match(/启动文档：([^\r\n]+)/u)?.[1];assert.ok(file,'bootstrap path must be part of first goal context');
+                    assert.match(objective,/Do not modify product code or write audit scripts/);
+                    const file=objective.match(/Bootstrap document: ([^\r\n]+)/u)?.[1];assert.ok(file,'bootstrap path must be part of first goal context');
                     const startup=await readFile(file,'utf8');
-                    assert.match(startup,/项目经理/);assert.match(startup,/team_delegate/);assert.match(startup,/凭据/);
-                    assert.match(startup,/完整项目授权与任务计划/);assert.match(startup,/"tasks"/);
+                    assert.match(startup,/project manager/i);assert.match(startup,/team_delegate/);assert.match(startup,/credentials/i);
+                    assert.doesNotMatch(startup,/\p{Script=Han}/u,'generated bootstrap instructions must be English');assert.match(startup,/Complete charter and task plan/);assert.match(startup,/"tasks"/);
                     bootstraps.set(a.agentId,{file,content:startup});
                     goals.set(a.agentId,{id:'goal-'+a.agentId,revision:1,phase:'active',objective});
                     states.set(a.agentId,{cursor:2,running:true,queue:[],pendingInput:[]});
@@ -55,7 +56,7 @@ const server=createServer(async(req,res)=>{
                 else if(mode==='paused') goal={...goal,phase:'paused'};
             }
             // Real DSH 0.2.2-rc.5 wire shape, confirmed by a read-only live probe.
-            value={kind:'session/projections',asOfSeq:7,values:{permissions:{currentValue:'local'},goal:{goal,roundsStarted:0,createdAt:1,updatedAt:1}}};break;
+            value={kind:'session/projections',asOfSeq:7,values:{permissions:{currentValue:'danger-full-access'},goal:{goal,roundsStarted:0,createdAt:1,updatedAt:1}}};break;
         }
         case 'session/selectModel':selected.set(a.sessionId,a.model);value={selected:a};break;
         case 'session/state':if(unavailableSessions.has(a.sessionId)){res.writeHead(503).end('fixture temporary failure');return;}value=states.get(a.sessionId);break;
@@ -91,6 +92,7 @@ const disk=async()=>JSON.parse(await readFile(join(data,'teams.json'),'utf8'));
 try {
     await run('git',['init','-b','main',repo],{windowsHide:true});
     await writeFile(join(repo,'feature.txt'),'baseline\n');
+    await writeFile(join(repo,'.gitignore'),'.fatfish-logs/\n');
     await run('git',['-C',repo,'add','.'],{windowsHide:true});
     const commit=async(work,msg)=>run('git',['-C',work,'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-am',msg],{windowsHide:true});
     await commit(repo,'baseline');
@@ -101,8 +103,8 @@ try {
     settings=await tool('cluster_configure',{revision:settings.revision,authPath:auth,permission:'local'});
     const pools=Object.fromEntries(Object.values(settings.pools).map(p=>[p.model,p.id]));
     for(const pool of Object.values(settings.pools))settings=await tool('cluster_update_pool',{revision:settings.revision,id:pool.id,enabled:true,concurrency:8});
-    const initial=await tool('team_get_settings');
-    const config={revision:initial.revision,leadPool:pools.lead,developerPool:pools.dev,reviewerPool:pools.review,totalConcurrency:4,developerConcurrency:2,reviewerConcurrency:2};
+    const initial=await tool('team_get_settings');assert.equal(initial.totalConcurrency,20);
+    const config={revision:initial.revision,totalConcurrency:4};
     await tool('team_update_settings',{...config,totalConcurrency:1},true);
     await tool('team_update_settings',config); // No integrator pool required.
     const charter={objective:'\u3000 Implement and independently verify the fixture \r\n',acceptance:'Review and actual branch tests',constraints:'Preserve data',architecture:'One manager',authority:'Local worktrees',escalation:'Real blocking failures'};
@@ -137,8 +139,10 @@ try {
     const p=(await disk()).projects[pid],domain=Object.values(p.domains)[0];
     const authz={projectId:pid,domainId:domain.domainId,token:domain.token,charterVersion:1};
     const call=(name,args={},fail=false)=>tool(name,{...authz,...args},fail);
-    assert.equal((await call('team_get_contract')).version,10);
+    assert.equal((await call('team_get_contract')).version,11);
     const listed=(await rpc('tools/list')).tools;
+    for(const role of ['principal','lead','worker']) assert.doesNotMatch((await tool('team_get_prompt',{role})).prompt,/\p{Script=Han}/u,'all role prompts are English');
+    for(const t of listed) {assert.doesNotMatch(t.description,/\p{Script=Han}/u,'agent-facing tool descriptions are English');assert.doesNotMatch(JSON.stringify(t.inputSchema),/\p{Script=Han}/u,'tool schema guidance is English');}
     const taskSchema=listed.find(t=>t.name==='team_start_project').inputSchema.properties.tasks.items;
     assert.equal(taskSchema.properties.steps.type,'string');
     assert.deepEqual(taskSchema.required,['name','steps','acceptance','files','dependsOn','startCondition','tests']);
@@ -176,12 +180,17 @@ try {
     assert.ok(running.workspace!==repo);
     const activeNative=await native();
     const workerRows=[activeNative.sessions[running.sessionId],activeNative.sessions[parallelLive.sessionId]];
-    assert.equal(new Set(workerRows.map(j=>j.provider)).size,2,'same-model team tasks must balance across accounts rather than pinning to developerPool');
-    assert.ok(workerRows.every(j=>j.model==='dev'),'load balancing must preserve the configured role model');
-    assert.equal((await tool('team_get_settings')).developerPool,pools.dev,'role configuration remains unchanged');
+    const accountLoads=new Map();for(const j of [...workerRows,activeNative.sessions[leader.sessionId]]) accountLoads.set(j.provider,(accountLoads.get(j.provider)||0)+1);
+    assert.equal(accountLoads.size,2,'team roles share all enabled accounts');assert.ok(Math.max(...accountLoads.values())-Math.min(...accountLoads.values())<=1,'global account occupancy remains balanced including the manager');
+    assert.ok(workerRows.every(j=>['lead','dev','review','integrate'].includes(j.model)),'all enabled models participate in automatic selection');
+    assert.deepEqual(Object.keys(await tool('team_get_settings')).sort(),['revision','totalConcurrency'],'only global concurrency is configured');
     // A restart must preserve the existing session and pool assignments.
     const workerBindings=workerRows.map(j=>({id:j.id,dshId:j.dshId,poolId:j.poolId}));
-    await close();({tool,rpc}=await connect());
+    await close();
+    const legacyTeam=await disk();legacyTeam.settings.leadPool='removed-role-model';legacyTeam.settings.developerConcurrency=1;legacyTeam.settings.reviewerConcurrency=1;
+    await writeFile(join(data,'teams.json'),JSON.stringify(legacyTeam));
+    ({tool,rpc}=await connect());
+    assert.deepEqual(await tool('team_get_settings'),{revision:1,totalConcurrency:4},'legacy role settings no longer constrain dispatch; saved maximum retained');
     const recoveredNative=await native();
     for(const j of workerBindings) assert.deepEqual({id:recoveredNative.sessions[j.id].id,dshId:recoveredNative.sessions[j.id].dshId,poolId:recoveredNative.sessions[j.id].poolId},j);
 
@@ -189,7 +198,14 @@ try {
     const finish={requestId:'finish',summary:'All tasks verified',evidence:['fixture'],acceptanceResults:[{criterion:'Independent review and actual test',outcome:'passed',evidence:'fixture'}]};
     await call('team_finish_domain',finish,true); // Empty result list but active developer.
     const end=async(job,report)=>{
-        const sid=await remote(job);reports.set(sid,{candidateSha:candidate,status:'passed',worktreeClean:true,tests:[],evidencePaths:[],...report});
+        const sid=await remote(job);let tests=[];
+        if(job.role==='developer' || job.role==='repair') {
+            const logs=join(job.workspace,'.fatfish-logs');await mkdir(logs,{recursive:true});
+            const logPath=join(logs,'development-check.log');
+            const checked=await run(process.execPath,['-e',"require('node:assert/strict').ok(require('node:fs').existsSync('feature.txt'));console.log('build/test fixture passed')"],{cwd:job.workspace});
+            await writeFile(logPath,checked.stdout);tests=[{command:'node fixture build and tests',exitCode:0,logPath}];
+        }
+        reports.set(sid,{candidateSha:candidate,status:'passed',worktreeClean:true,tests,evidencePaths:[],...report});
         states.set(sid,{cursor:7,running:false,queue:[],pendingInput:[]});
         return until(async()=>{const j=(await disk()).projects[pid].jobs[job.jobId];return j.observedTerminal&&j;},'terminal child');
     };
@@ -199,13 +215,18 @@ try {
     const waitStart=Date.now();
     const waiting=run(executable,['--team-call',waitInput,waitOutput],{env,windowsHide:true});
     await new Promise(r=>setTimeout(r,200));
-    const completed=await end(running);
+    let completed=await end(running,{tests:[]});
     await waiting;
     const feedback=JSON.parse(await readFile(waitOutput,'utf8'));
     assert.equal(feedback.ok,true);assert.equal(feedback.result.ready,true);assert.equal(feedback.result.timedOut,false);
-    assert.equal(feedback.result.workQueue.head.reason,'candidate_needs_review');
+    assert.equal(feedback.result.workQueue.head.reason,'development_checks_failed');
     assert.ok(Date.now()-waitStart<15000,'completion must wake MCP before the wait deadline');
     assert.equal(Object.values((await disk()).projects[pid].jobs).filter(j=>j.role==='lead').length,2,'child completion must not rebuild manager; historical failed round retained');
+    assert.equal((await call('team_next_action')).head.reason,'development_checks_failed','untested developer delivery is never sent to review');
+    await call('team_delegate',{requestId:'reject-untested',title:'Must not review untested candidate',role:'reviewer',sourceJobId:completed.jobId,baseSha:base,task:'Wrong preflight'},true);
+    const preflightRepair=await call('team_delegate',{requestId:'preflight-repair',title:'Developer runs missing checks',role:'repair',sourceJobId:completed.jobId,baseSha:base,task:'Run build/tests and provide success logs before review'});
+    const preflightLive=await until(async()=>{const j=(await disk()).projects[pid].jobs[preflightRepair.jobId];return j.sessionId&&j;},'preflight repair');
+    completed=await end(preflightLive);
     assert.equal((await call('team_next_action')).head.reason,'candidate_needs_review');
     await call('team_delegate',{requestId:'cannot-start-after-development-only',taskName:'After',title:'After',role:'developer',task:'Wrong early start'},true);
     assert.equal((await call('team_dispatch_ready',{requestId:'after-development-only'})).queuedCount,0,'development completion does not unlock dependencies');
@@ -228,8 +249,20 @@ try {
     const second=await call('team_delegate',{...reviewArgs,requestId:'review2',sourceJobId:repaired.jobId,baseSha:candidate});
     const secondLive=await until(async()=>{const j=(await disk()).projects[pid].jobs[second.jobId];return j.sessionId&&j;},'new independent review');
     assert.notEqual(secondLive.workspace,repairLive.workspace);
-    const passedReview=await end(secondLive);
-    await action('record_review',{sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,verdict:'passed',notes:'Repaired candidate independently checked'},'review-passed');
+    const outsideEvidence=join(root,'review-external-evidence.txt');
+    const passedReview=await end(secondLive,{evidencePaths:[outsideEvidence]});
+    const reviewDetails={sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,verdict:'passed',notes:'Repaired candidate independently checked'};
+    await action('record_review',{...reviewDetails,evidenceVerified:true,managerVerified:true},'review-reject-uncaptured',true);
+    assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true,'evidence-blocked result must not repeatedly wake action_ready');
+    await call('team_domain_action',{operation:'cluster_capture_evidence',arguments:{sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,files:[outsideEvidence]}},true);
+    const captureArgs={projectId:pid,sessionId:passedReview.sessionId,resultVersion:passedReview.resultVersion,candidateSha:candidate,files:[outsideEvidence],reason:'Principal verified the exact external historical evidence path'};
+    assert.ok((await tool('team_capture_evidence',captureArgs)).unavailableFiles>0,'missing file remains blocked even after explicit selection');
+    assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true);
+    await writeFile(outsideEvidence,'Real historical evidence fixture');
+    const captured=await tool('team_capture_evidence',captureArgs);
+    assert.equal(captured.unavailableFiles,0);
+    assert.equal((await call('team_next_action')).head.reason,'review_result_unhandled');
+    await action('record_review',reviewDetails,'review-passed');
     const verify={workItemId:running.workItemId,candidateSha:candidate,executable:process.execPath,arguments:['-e','process.exit(1)']};
     const failedTest=await call('team_verify_candidate',{...verify,requestId:'test-fail'});
     assert.equal(failedTest.passed,false);assert.equal(failedTest.exitCode,1);
@@ -261,6 +294,10 @@ try {
     await acceptOther(parallelLive,'parallel');await acceptOther(afterJob,'after');
 
     assert.equal((await call('team_priority_results')).count,0,'accepted requires no integration task');
+    const pendingDecision=await call('team_escalate',{requestId:'wait-decision-fixture',jobId:completed.jobId,question:'Fixture pending decision after workers end',reason:'Verify MCP wait does not spin when only a decision remains',recommendation:'Resolve fixture decision',alternatives:'None',impact:'Fixture only',blockedScope:'Fixture completion'});
+    assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true,'no active workers plus pending decision must wait rather than return completion_check');
+    await tool('team_resolve_decision',{projectId:pid,decisionId:pendingDecision.decisionId,expectedRevision:pendingDecision.revision,requestId:'resolve-wait-fixture',resolution:'Fixture decision resolved'});
+
     await call('team_checkpoint',{requestId:'checkpoint',state:'working',checkpoint:{verified:verified.verificationId}});
     assert.equal((await call('team_finish_domain',finish)).completed,true);
     assert.equal((await call('team_finish_domain',finish)).completed,true,'finish idempotent after completion');
@@ -295,6 +332,26 @@ try {
     const pinnedWorker=await tool('cluster_start_session',{queueId:defaultQueue,requestId:'direct-fixed-account',title:'Explicit account remains fixed',batch:'direct-fixed-account',role:'developer',workspace:repo,task:'Fixture only',baseSha:candidate,poolId:pools.dev});
     assert.equal((await native()).sessions[pinnedWorker.id].poolId,pools.dev,'non-team explicit pool selection stays pinned');
     await tool('cluster_cancel_session',{queueId:defaultQueue,sessionId:pinnedWorker.id});
+    const historyQueue=(await tool('cluster_create_queue',{name:'Obsolete history',requestId:'obsolete-history'})).queueId;
+    const oldWorkspace=join(root,'old-workspace');await mkdir(oldWorkspace);await writeFile(join(oldWorkspace,'marker.txt'),'old');
+    const oldSession=await tool('cluster_start_session',{queueId:historyQueue,requestId:'old-history-session',title:'Obsolete old-round work',batch:'old-history',role:'developer',workspace:oldWorkspace,task:'Fixture only',baseSha:candidate});
+    await tool('cluster_cancel_session',{queueId:historyQueue,sessionId:oldSession.id});
+    await tool('cluster_refresh_sessions',{queueId:historyQueue,limit:20});
+    await tool('cluster_cancel_session',{queueId:historyQueue,sessionId:oldSession.id},true);
+    const historyProject=await tool('team_start_project',{...input,requestId:'history-retirement',queueId:historyQueue,tasks:[contract('Current',['feature.txt'])]});
+    const historyLead=await until(async()=>Object.values((await disk()).projects[historyProject.projectId].jobs).find(j=>j.role==='lead'&&j.sessionId&&j.state==='running'),'history manager');
+    const historyDomain=Object.values((await disk()).projects[historyProject.projectId].domains)[0];
+    const historyAuth={projectId:historyProject.projectId,domainId:historyDomain.domainId,token:historyDomain.token,charterVersion:1};
+    await tool('team_claim_work_item',{...historyAuth,workItemId:oldSession.workItemId,requestId:'adopt-old'});
+    const oldClaim=await tool('team_next_handoff',historyAuth);assert.equal(oldClaim.workItemId,oldSession.workItemId,'fixture holds the obsolete handoff claim');
+    const retireArgs={...historyAuth,workItemId:oldSession.workItemId,requestId:'retire-old',reason:'Current charter explicitly discards obsolete old-round work'};
+    const retired=await tool('team_retire_work_item',retireArgs);assert.equal(retired.state,'cancelled');assert.equal(retired.pendingReceipts.length,0,'retirement closes any held claim without dispatching another task');assert.equal((await disk()).projects[historyProject.projectId].backlog.claim,undefined,'obsolete claim is released in team metadata too');
+    assert.deepEqual(await tool('team_retire_work_item',retireArgs),retired,'retirement replay is idempotent');
+    const historyLedger=await tool('team_domain_read',{...historyAuth,operation:'cluster_get_work_item',arguments:{workItemId:oldSession.workItemId}});
+    assert.equal(historyLedger.state,'cancelled');assert.equal(Object.values((await disk()).projects[historyProject.projectId].jobs).filter(j=>j.role==='repair').length,0,'retirement never dispatches fake history-repair jobs');
+    const afterRetirement=await tool('team_next_action',historyAuth);
+    assert.ok(afterRetirement.items.every(j=>j.workItemId!==oldSession.workItemId),'obsolete handoff leaves the FIFO without a fake repair');
+    await tool('team_control_project',{projectId:historyProject.projectId,requestId:'close-history-fixture',action:'cancel'});
     // A missing, wrong or paused goal cannot start a manager prompt.
     for(const mode of ['missing','mismatch','paused']) {
         nextGoalMode=mode;

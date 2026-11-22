@@ -200,6 +200,11 @@ public:
         redraw();
         sync_usage();
         reload();
+        try {
+            const auto intro=cluster_.invoke("cluster_desktop_onboarding");
+            if (!intro.value("completed",false) && !intro.value("dismissed",false) &&
+                settings_.value("authPath","").empty() && settings_.value("configPath","").empty()) {load_connection();page_="onboarding";redraw();}
+        } catch (const std::exception&) {fatfish::diagnostics::caught();}
         SetTimer(window,usage_timer,60000,nullptr);
         sessions_timer_ready_=SetTimer(window,sessions_timer,sessions_interval_ms,nullptr)!=0;
         refresh_sessions_automatically();
@@ -209,12 +214,14 @@ public:
         if (FAILED(renderer_.initialize())) throw std::runtime_error("离屏渲染器初始化失败");
         renderer_.set_dpi(dpi);
         page_=page=="settings"?"connection":page;
-        expanded_settings_={{"general",true},{"dsh",false},{"team",true},{"mcp",true}};
+        if (page.starts_with("onboarding")) {page_="onboarding";wizard_step_=page=="onboarding-models"?1:page=="onboarding-queue"?2:page=="onboarding-start"?3:0;}
+        expanded_settings_={{"general",true},{"dsh",true}};
         close_behavior_=cluster_.invoke("cluster_desktop_close_behavior").at("closeBehavior").get<std::string>();
         fields_["closeBehavior"]=widen(close_behavior_);
         local_snapshot();
         if (!notice_.empty()) throw std::runtime_error(narrow(notice_));
         http_error_=L"离屏预览";
+        if (page_=="connection" || page_=="onboarding") load_connection();
         const DpiScale scale(dpi);
         build_view(float(scale.dips(width)),float(scale.dips(height)),false);
         std::vector<unsigned char> png;
@@ -727,7 +734,8 @@ private:
     std::optional<List> drag_list_;
     bool busy_ = false;
     bool navigation_open_ = true;
-    Json presets_ = Json::object();
+    bool enabled_models_only_=false,pools_initialized_=false,wizard_copied_=false;
+    int wizard_step_=0;
 
     static bool interactive(const Widget* w) {
         return w && w->enabled && (w->kind==WidgetKind::textbox || w->kind==WidgetKind::button ||
@@ -864,7 +872,6 @@ private:
         }
         else if (change.key=="dshProfile") {
             select_dsh_profile(change.new_value);
-            refresh_presets();
             redraw();
         }
         else fields_[change.key]=widen(change.new_value);
@@ -910,12 +917,12 @@ private:
             std::move(after));
     }
     void set_dsh_draft(const Json& row) {
-        for (auto key : {"configPath","authPath","permission","preset"})
+        for (auto key : {"configPath","authPath"})
             fields_[key]=title(row,key);
         fields_["dshName"]=title(row,"name");
         automatic_auth_=row.value("automaticAuth",false);
         detected_auth_=fields_.at("authPath");
-        presets_=Json::object();
+        fields_["permission"]=L"danger-full-access";fields_["preset"]=L"ptc";
     }
     void select_dsh_profile(const std::string& choice) {
         fields_["dshProfile"]=widen(choice);
@@ -942,8 +949,7 @@ private:
                     (!fields_.at("configPath").empty() && saved.value("automaticAuth",false)))) {
                     draft_dsh_profile_=id;
                     if (saved.at("name")!="") fields_["dshName"]=title(saved,"name");
-                    for (const auto key:{"permission","preset"})
-                        if (saved.at(key)!="") fields_[key]=title(saved,key);
+
                     break;
                 }
             }
@@ -954,8 +960,7 @@ private:
         dsh_profiles_=std::move(list.at("profiles"));
         active_dsh_profile_=list.at("current").get<std::string>();
         select_dsh_profile(active_dsh_profile_);
-        if (expanded_settings_.value("dsh",false)) refresh_presets(std::move(success_notice));
-        else if (!success_notice.empty()) notice_=std::move(success_notice);
+        if (!success_notice.empty()) notice_=std::move(success_notice);
     }
     void show_dsh_detection(Json candidates,bool after_authorization=false) {
         detected_dsh_=std::move(candidates);
@@ -965,7 +970,7 @@ private:
         });
         if (after_authorization && desktop!=detected_dsh_.end()) {
             select_dsh_profile("detected:"+std::to_string(desktop-detected_dsh_.begin()));
-            refresh_presets(L"DSH 桌面版已授权。可选择预设，再保存或导入。");
+            notice_=L"DSH 桌面版已授权，可保存或导入模型。";
             return;
         }
         const bool selected=reachable==1 || detected_dsh_.size()==1;
@@ -977,7 +982,7 @@ private:
             std::to_wstring(reachable)+L" 份可连接。可从下拉列表选择。";
         if (std::ranges::any_of(detected_dsh_,[](const Json& row){return row.value("setupRequired",false);}))
             notice_=L"已找到 DSH 桌面版。点击「自动授权」即可安装接入插件并验证连接。";
-        if ((selected && reachable==1) || restored) refresh_presets(notice_);
+
     }
     void detect_dsh_profiles() {
         call("cluster_detect_dsh_connection",paths(),[this](Json candidates) {
@@ -997,17 +1002,6 @@ private:
         },[this](Json candidates) { show_dsh_detection(std::move(candidates),true); });
         notice_=L"正在授权。若 DSH 仍在运行，请从它的「应用」菜单退出，肥鱼重工会继续安装。";
         redraw();
-    }
-    void refresh_presets(std::wstring success_notice={}) {
-        const auto input=paths();
-        if ((draft_dsh_profile_=="new" && input.at("configPath")=="" && input.at("authPath")=="") ||
-            dsh_draft_needs_authorization()) return;
-        call("cluster_get_presets",input,[this,success_notice=std::move(success_notice)](Json data) {
-            presets_=std::move(data);
-            if (!presets_.value("connected",false)) notice_=L"设置 DSH 连接后可读取完整预设";
-            else if (!success_notice.empty()) notice_=success_notice;
-            else notice_=L"已刷新 DSH 预设";
-        });
     }
     bool copy_text(const std::wstring& value) {
         const auto bytes=(value.size()+1)*sizeof(wchar_t);
@@ -1029,23 +1023,22 @@ private:
         if (!copied) GlobalFree(buffer);
         return copied;
     }
-    void copy_agent_setup() {
+    bool copy_agent_setup() {
         if (current_queue_.empty()) throw std::runtime_error("请先选择工作队列");
-        copy_team_setup(true);
+        return copy_team_setup(true);
     }
     void load_team_settings() {
         team_settings_=cluster_.invoke("team_get_settings");
-        for (const auto* key:{"leadPool","developerPool","reviewerPool","integratorPool"}) fields_[std::string("team.")+key]=widen(team_settings_.at(key).get<std::string>());
-        for (const auto* key:{"totalConcurrency","developerConcurrency","reviewerConcurrency"}) fields_[std::string("team.")+key]=std::to_wstring(team_settings_.at(key).get<int>());
+        fields_["team.totalConcurrency"]=std::to_wstring(team_settings_.at("totalConcurrency").get<int>());
     }
-    void copy_team_setup(bool bind_queue=false) {
+    bool copy_team_setup(bool bind_queue=false) {
         auto setup=fatfish::team_prompt("principal");
-        if (bind_queue) setup="当前工作 queueId="+current_queue_+"。先用 team_get_queue 查找绑定记录；已有 project 则按 projectId 续接，无绑定时 team_start_project 必须携带此 queueId（允许接管历史队列）。不要另建队列。用户给出一次任务和授权后，你应启动负责人并持续跟进到最终验收，不再索要下一步指示。\n\n"+setup;
+        if (bind_queue) setup="Current work queueId="+current_queue_+"; first call team_get_queue. Resume an existing projectId, or include this queueId in team_start_project (historical queue takeover is supported). Do not create another queue. After the user supplies a task and authorization once, start the manager and continue through final acceptance without asking for another instruction.\n\n"+setup;
         if (http_) {
             const auto url=http_->url();const auto team_url=url.substr(0,url.size()-4)+"/team";
-            setup="肥鱼重工主代理专用 MCP："+team_url+"。请将此地址注册为团队连接；只暴露决策工具，避免携带完整集群工具目录。已有普通 /mcp 连接也能调用 team_*，但工具目录更大。\n\n"+setup;
-        } else setup="主代理专用 stdio 入口：FatFishBox.exe --team-mcp。\n\n"+setup;
-        notice_=copy_text(widen(setup))?L"已复制详细主代理提示词；粘贴后直接描述任务":L"剪贴板暂不可用";redraw();
+            setup="FatFishBox principal MCP: "+team_url+". Register this team endpoint for principal decision tools. An existing /mcp connection also supports team_* with a larger tool catalog.\n\n"+setup;
+        } else setup="Principal stdio entry point: FatFishBox.exe --team-mcp.\n\n"+setup;
+        const bool copied=copy_text(widen(setup));notice_=copied?L"已复制详细主代理提示词；粘贴后直接描述任务":L"剪贴板暂不可用";redraw();return copied;
     }
     void local_snapshot() {
         ++snapshot_generation_;
@@ -1119,6 +1112,10 @@ private:
         for (const auto& [id,pool]:settings_.at("pools").items())
             account_models_.at(pool.at("provider").get<std::string>()).push_back(id);
         std::erase_if(expanded_accounts_,[&](const auto& id){return !account_models_.contains(id);});
+        if (!pools_initialized_ && !account_models_.empty()) {
+            for (const auto& [account,models]:account_models_) if (std::ranges::any_of(models,[&](const auto& key){return settings_.at("pools").at(key).value("enabled",false);})) expanded_accounts_.insert(account);
+            pools_initialized_=true;
+        }
     }
     void reload() { local_snapshot(); redraw(); }
     void nav(std::string to) {
@@ -1127,6 +1124,7 @@ private:
         TextBox::cancel_editing(model_,model_.focused);
         model_.ui.editor_focus=none;
         surrogate_=0;
+        if (to=="onboarding") {wizard_step_=0;wizard_copied_=false;load_connection();}
         page_ = std::move(to);
         model_.focused = none;
         model_.hovered = none;
@@ -1134,6 +1132,7 @@ private:
         notice_.clear();
         if (page_ == "connection") {load_team_settings();load_connection();}
         redraw();
+        if (page_=="queues") local_snapshot();
         if (page_=="sessions") refresh_sessions_automatically();
     }
     void clear_result() {
@@ -1260,12 +1259,6 @@ private:
         if (std::ranges::find(options,value,&Choice::key)==options.end()) options.push_back({value,fields_[key]});
         auto& item=add(key,WidgetKind::select,L"",x,y+24,w,32,surface);
         ComboBox({std::move(name),std::move(options),fields_[key],!busy_,w}).apply(item);
-    }
-    std::vector<Choice> preset_options(const char* key,const wchar_t* placeholder) const {
-        std::vector<Choice> options{{"",placeholder}};
-        for (const auto& row:presets_.value(key,Json::array()))
-            options.push_back({row.at("id").get<std::string>(),title(row,"label")});
-        return options;
     }
     std::vector<Choice> dsh_profile_options() const {
         std::vector<Choice> options;
@@ -1497,17 +1490,15 @@ private:
         return bottom+8;
     }
     void connection_page(float x,float right,float h) {
-        constexpr float general_height=76,dsh_height=424,mcp_height=272,team_height=351;
+        constexpr float general_height=199,dsh_height=366;
         const float width=right-x;
         const float about_width=std::clamp(width*.30f,158.f,310.f);
         const float column_right=right-about_width-14;
         const float viewport_bottom=std::max(settings_top+1,h-29);
         const float viewport_height=viewport_bottom-settings_top;
-        const float content_height=4*Expander::header_height+24+
+        const float content_height=2*Expander::header_height+8+
             (expanded_settings_.value("general",false)?general_height:0)+
-            (expanded_settings_.value("dsh",false)?dsh_height:0)+
-            (expanded_settings_.value("team",false)?team_height:0)+
-            (expanded_settings_.value("mcp",false)?mcp_height:0);
+            (expanded_settings_.value("dsh",false)?dsh_height:0);
         auto& view=viewport(List::settings);
         view.bounds={x,settings_top+title_bar_.height(),column_right,viewport_bottom+title_bar_.height()};
         view.maximum=std::max(0.f,content_height-viewport_height)/row_height;
@@ -1525,56 +1516,13 @@ private:
         auto y=settings_expander("general",L"常规",x,settings_top,settings_right,general_height,[&](float body,const std::string& surface) {
             combo("closeBehavior",L"关闭窗口时",left,body+6,form,
                 {{"ask",L"每次询问"},{"tray",L"进入托盘"},{"exit",L"直接退出"}},surface);
+            field("team.totalConcurrency",L"最大并发数量",left,body+68,std::max(90.f,form-114),surface);
+            button("save_team",L"保存",edge-90,body+92,90,true,true,surface);
+            label(L"默认 20 · 含项目经理 · 不停止在途任务",left,body+129,form,12,surface,ColorToken::text_secondary);
+            button("nav.onboarding",L"重新进入使用引导",left,body+158,std::min(172.f,form),false,true,surface);
         });
-        y=settings_expander("dsh",L"DSH 连接",x,y,settings_right,dsh_height,[&](float body,const std::string& surface) {
-            const float half=(form-14)/2;
-            const bool ready=!dsh_draft_needs_authorization();
-            combo("dshProfile",L"连接配置",left,body+4,form-108,dsh_profile_options(),surface);
-            button("detect_dsh",L"自动识别",edge-100,body+28,100,false,true,surface);
-            field("dshName",L"配置名称",left,body+62,form,surface);
-            field("configPath",L"DSH 配置文件",left,body+120,form,surface);
-            field("authPath",L"本机授权文件（留空时跟随配置）",left,body+178,form,surface);
-            combo("permission",L"权限预设",left,body+236,half,preset_options("permissions",L"请选择权限预设"),surface);
-            combo("preset",L"Agent 预设",left+half+14,body+236,half,preset_options("agents",L"DSH 默认"),surface);
-            button("test_dsh",L"测试连接",left,body+298,84,false,ready,surface);
-            button("refresh_presets",L"刷新预设",left+92,body+298,84,false,ready,surface);
-            if (std::ranges::any_of(detected_dsh_,[](const Json& row){return row.value("setupRequired",false);}))
-                button("authorize_dsh_desktop",L"自动授权",edge-114,body+298,114,true,true,surface);
-            label(L"支持的 DSH 版本  "+widen(fatfish::supported_dsh_version),left,body+349,form-128,13,
-                surface,ColorToken::text_secondary);
-            button("check_dsh_version",L"检测 DSH 版本",edge-120,body+340,120,false,ready,surface);
-            button("import",L"导入并启用",left,body+382,100,false,ready,surface);
-            button("save_connection",L"保存并启用",edge-104,body+382,104,true,ready,surface);
-        });
-        y=settings_expander("team",L"团队执行",x,y,settings_right,team_height,[&](float body,const std::string& surface) {
-            std::vector<Choice> options{{"",L"请选择已启用的模型"}};
-            for (const auto& [key,pool]:settings_.at("pools").items()) if (pool.value("enabled",false))
-                options.push_back({key,title(pool,"model")+L" · "+title(pool,"provider")});
-            const float half=(form-14)/2;
-            combo("team.leadPool",L"项目经理模型",left,body+4,form,options,surface);
-            combo("team.developerPool",L"开发与返修模型",left,body+63,form,options,surface);
-            combo("team.reviewerPool",L"独立审查模型",left,body+122,form,options,surface);
-            field("team.totalConcurrency",L"全团队总并发",left,body+181,half,surface);
-            field("team.developerConcurrency",L"开发并发上限",left+half+14,body+181,half,surface);
-            field("team.reviewerConcurrency",L"审查并发上限",left,body+240,half,surface);
-            label(L"模型用于新项目；并发立即约束后续派发。",left,body+300,form,12,surface,ColorToken::text_secondary);
-            button("save_team",L"保存团队方案",left,body+320,116,true,true,surface);
-            button("copy_team_setup",L"复制主代理提示词",edge-144,body+320,144,false,true,surface);
-        });
-        settings_expander("mcp",L"队列与 MCP",x,y,settings_right,mcp_height,[&](float body,const std::string& surface) {
-            queue_picker(left,body+4,form,surface);
-            field("newQueueName",L"新队列名称",left,body+63,form-116,surface);
-            button("create_queue",L"新建队列",edge-100,body+87,100,true,true,surface);
-            const bool can_delete=std::ranges::any_of(queues_,[&](const Json& queue){
-                return queue.at("queueId")==current_queue_ && !queue.value("legacy",false);
-            });
-            field("queueName",L"队列名称",left,body+122,form-194,surface);
-            button("rename_queue",L"重命名",edge-184,body+146,88,false,!current_queue_.empty(),surface);
-            button("delete_queue",L"删除队列",edge-88,body+146,88,false,can_delete,surface);
-            label(http_?L"本机 MCP 正在监听":http_error_,left,body+190,form,12,surface,
-                http_?ColorToken::status_success:ColorToken::status_error);
-            label(http_?widen(http_->url()):L"stdio · FatFishBox.exe --mcp",left,body+210,form,13,surface);
-            button("copy_agent_setup",L"复制主代理提示词",edge-128,body+231,128,true,!current_queue_.empty(),surface);
+        settings_expander("dsh",L"DSH 连接",x,y,settings_right,dsh_height,[&](float body,const std::string& surface) {
+            connection_fields(left,edge,body,surface);
         });
 
         const float about_left=right-about_width;
@@ -1593,96 +1541,146 @@ private:
             .font_role=FontRole::body,.font_size=13,.wrap=true,.max_lines=narrow_about?8u:5u,.width=text_width,.height=description_height,
             .foreground=ColorToken::text_secondary}).apply(description);
     }
-    void pools_section(List list,float x,float top,float right,float bottom) {
-        const bool enabled_only=list==List::enabled_pools;
-        const std::string surface=enabled_only?"enabled_pools":"all_pools";
-        const auto& accounts=settings_.at("accounts");
+    void connection_fields(float left,float edge,float body,const std::string& surface="root") {
+        const float form=edge-left;
+        const bool ready=!dsh_draft_needs_authorization();
+        combo("dshProfile",L"连接配置",left,body+4,form-108,dsh_profile_options(),surface);
+        button("detect_dsh",L"自动识别",edge-100,body+28,100,false,true,surface);
+        field("dshName",L"配置名称",left,body+62,form,surface);
+        field("configPath",L"DSH 配置文件",left,body+120,form,surface);
+        field("authPath",L"本机授权文件（留空时跟随配置）",left,body+178,form,surface);
+        button("test_dsh",L"测试连接",left,body+242,90,false,ready,surface);
+        if (std::ranges::any_of(detected_dsh_,[](const Json& row){return row.value("setupRequired",false);}))
+            button("authorize_dsh_desktop",L"自动授权",edge-100,body+242,100,true,true,surface);
+        label(L"支持 DSH "+widen(fatfish::supported_dsh_version),left,body+283,form-130,12,surface,ColorToken::text_secondary);
+        button("check_dsh_version",L"检测 DSH 版本",edge-120,body+279,120,false,ready,surface);
+        button("import",page_=="onboarding"?L"导入并继续":L"导入并启用",left,body+324,104,true,ready,surface);
+        button("save_connection",L"保存并启用",edge-104,body+324,104,false,ready,surface);
+    }
+    void queues_page(float x,float right,float) {
+        const float left=x+20,edge=right-20,form=edge-left;
+        if (fields_["queueName"].empty()) for (const auto& queue:queues_) if (queue.at("queueId")==current_queue_) fields_["queueName"]=title(queue,"name");
+        panel("queue.selection",{x,64,right,153});
+        queue_picker(left,77,form,"queue.selection");
+        panel("queue.create",{x,165,right,262});
+        field("newQueueName",L"创建队列",left,181,form-116,"queue.create");
+        button("create_queue",L"创建",edge-100,205,100,true,true,"queue.create");
+        const bool legacy=std::ranges::any_of(queues_,[&](const Json& q){return q.at("queueId")==current_queue_ && q.value("legacy",false);});
+        const auto project=queue_team_.value("project",Json());
+        const bool active_team=project.is_object() && (project.value("status","")=="running" || project.value("status","")=="starting" || project.value("status","")=="finishing");
+        panel("queue.edit",{x,274,right,397});
+        field("queueName",L"修改当前队列名称",left,288,form-116,"queue.edit");
+        button("rename_queue",L"保存名称",edge-100,312,100,false,!current_queue_.empty(),"queue.edit");
+        button("delete_queue",L"删除队列",left,353,100,false,!legacy && !active_team && running_.empty(),"queue.edit");
+        label(legacy?L"历史队列保留原有记录。":active_team || !running_.empty()?L"执行中的队列暂不能删除。":L"删除只移除队列入口，历史记录仍会保留。",left+114,358,form-114,12,"queue.edit",ColorToken::text_secondary);
+        label(L"共 "+std::to_wstring(queues_.size())+L" 个队列 · 切换队列不会停止正在执行的任务",x+4,412,right-x-8,12,"root",ColorToken::text_secondary);
+    }
+    void pools_section(List,float x,float top,float right,float bottom) {
         const auto& pools=settings_.at("pools");
-        const float left=x+16;
-        const float effort_width=std::clamp((right-x)*.23f,134.f,200.f), effort=right-32-effort_width;
-        const float limit=effort-128, state=right-100;
-        const float name_end=enabled_only?limit:state;
-        const auto heading=enabled_only?L"已启用":L"完整列表";
-        std::vector<std::pair<bool,std::string>> rows;
-        int model_count=0;
+        struct AccountCard {std::string id;std::vector<std::string> models;float height;};
+        std::vector<AccountCard> cards;float extent=0;
         for (const auto& [account,models]:account_models_) {
-            const auto enabled=[&](const std::string& id){return pools.at(id).at("enabled").get<bool>();};
-            const auto active=std::ranges::count_if(models,enabled);
-            if (enabled_only && !active) continue;
-            model_count+=enabled_only?int(active):int(models.size());
-            rows.emplace_back(false,account);
-            for (const auto& id:models)
-                if (enabled(id) || (!enabled_only && expanded_accounts_.contains(account)))
-                    rows.emplace_back(true,id);
+            std::vector<std::string> visible;
+            for (const auto& id:models) if (!enabled_models_only_ || pools.at(id).value("enabled",false)) visible.push_back(id);
+            if (enabled_models_only_ && visible.empty()) continue;
+            const float height=74.f+(expanded_accounts_.contains(account)?96.f*float(visible.size()):0.f);
+            cards.push_back({account,std::move(visible),height});extent+=height+10;
         }
-        panel(surface,{x,top,right,bottom});
-        label(heading,left,top+8,right-left-32,16,surface,ColorToken::text_primary,true);
-        label(std::to_wstring(model_count)+L" 个模型",right-115,top+10,83,12,surface,ColorToken::text_secondary);
-        const float first=top+57;
-        const int total=int(rows.size()), capacity=std::max(1,int((bottom-first-7)/pool_row_height));
-        const int start=list_start(list,surface,{x+8,first,right-7,bottom-8},total,capacity,L"滚动"+std::wstring(heading));
-        label(L"账号 / 模型",left,top+33,name_end-left-12,12,surface,ColorToken::text_tertiary);
-        if (enabled_only) {
-            label(L"并发",limit,top+33,112,12,surface,ColorToken::text_tertiary);
-            label(L"思考强度",effort,top+33,effort_width,12,surface,ColorToken::text_tertiary);
-        } else label(L"启用",state,top+33,64,12,surface,ColorToken::text_tertiary);
-        for (int position=start;position<std::min(start+capacity,total);++position) {
-            const auto& [is_model,id]=rows[position];
-            const float row_top=first+float(position-start)*pool_row_height;
-            const float y=row_top+10;
-            if (!is_model) {
-                auto name=title(accounts.at(id),"name");
-                const auto& children=account_models_.at(id);
-                const auto active=std::ranges::count_if(children,[&](const auto& model){return pools.at(model).at("enabled").get<bool>();});
-                if (enabled_only || static_cast<std::size_t>(active)==children.size()) {
-                    label(std::move(name),left+26,y+7,name_end-left-38,14,surface,ColorToken::text_primary,true);
-                } else {
-                    name+=L"  ·  "+std::to_wstring(active)+L" / "+std::to_wstring(children.size())+L" 已启用";
-                    auto& header=add("expand."+id,WidgetKind::button,std::move(name),left,y,name_end-left-12,32,surface);
-                    header.visual=WidgetVisual::tree_item;
-                    header.hierarchy=HierarchyInfo{0,expanded_accounts_.contains(id),true,false};
-                    header.enabled=!busy_;
+        auto& view=viewport(List::all_pools);
+        view.bounds={x,top+title_bar_.height(),right,bottom+title_bar_.height()};
+        view.maximum=std::max(0.f,extent-(bottom-top))/row_height;view.offset=std::clamp(view.offset,0.0,view.maximum);
+        const float edge=right-(view.maximum>0?18.f:0.f),width=edge-x;
+        panel("pools.viewport",{x,top,edge,bottom},SurfaceVisual::transparent);
+        model_.ui.surfaces.back().scroll=float(view.offset)*row_height;
+        if (view.maximum>0) {
+            auto& bar=ScrollBar({.label=L"滚动账号与模型",.maximum=view.maximum,.value=view.offset,.viewport=(bottom-top)/row_height,.length=bottom-top}).append(model_,"root",view.key);
+            bar.area=WidgetArea::absolute;bar.bounds={right-14,view.bounds.top,right,view.bounds.bottom};
+        }
+        float y=top;
+        for (const auto& card:cards) {
+            const auto surface="account."+card.id;
+            panel(surface,{x,y,edge,y+card.height});auto& card_surface=model_.ui.surfaces.back();card_surface.parent="pools.viewport";card_surface.bounds={0,y-top,width,y-top+card.height};
+            const auto first=model_.ui.widgets.size();
+            const auto& models=account_models_.at(card.id);
+            const auto enabled=std::ranges::count_if(models,[&](const auto& id){return pools.at(id).value("enabled",false);});
+            auto& header=add("expand."+card.id,WidgetKind::disclosure,L"",x,y,width,48,surface);
+            Expander({.title=title(settings_.at("accounts").at(card.id),"name"),.expanded=expanded_accounts_.contains(card.id),.enabled=!busy_,.width=width}).apply(header);
+            label(std::to_wstring(enabled)+L" 个已启用 / "+std::to_wstring(models.size())+L" 个模型",x+20,y+47,width-40,12,surface,ColorToken::text_secondary);
+            if (expanded_accounts_.contains(card.id)) {
+                float line=y+74;
+                for (const auto& id:card.models) {
+                    const auto& row=pools.at(id);const auto on=row.value("enabled",false);
+                    const auto row_surface=surface+".model."+id;
+                    panel(row_surface,{x+10,line+2,edge-10,line+90});
+                    auto& model_card=model_.ui.surfaces.back();model_card.parent=surface;model_card.bounds={10,line-y+2,width-10,line-y+90};
+                    const auto row_first=model_.ui.widgets.size();
+                    label(title(row,"name"),x+20,line+9,width-110,14,row_surface,ColorToken::text_primary,true);
+                    auto& toggle=ToggleSwitch({.on=on,.enabled=!busy_}).append(model_,row_surface,"schedule.enabled."+id);
+                    toggle.action=toggle.key;toggle.area=WidgetArea::absolute;toggle.bounds={edge-74,line-21+title_bar_.height(),edge-22,line+35+title_bar_.height()};
+                    label(on?L"已启用 · 自动分配":L"已停用",x+20,line+52,std::max(80.f,width-226),12,row_surface,on?ColorToken::status_success:ColorToken::text_tertiary);
+                    std::vector<Choice> options{{"",L"默认思考强度"}};const auto saved=row.value("effort","");
+                    for (const auto& option:row.value("efforts",Json::array())) options.push_back({option.get<std::string>(),widen(option.get<std::string>())});
+                    if (std::ranges::find(options,saved,&Choice::key)==options.end()) options.push_back({saved,widen(saved)+L"（已下架）",false});
+                    auto& choice=add("schedule.effort."+id,WidgetKind::select,L"",edge-194,line+45,174,32,row_surface);
+                    ComboBox({L"思考强度",std::move(options),widen(saved),!busy_,174}).apply(choice);
+                    for (std::size_t i=row_first;i<model_.ui.widgets.size();++i) {auto& r=model_.ui.widgets[i].bounds;r.left-=x+10;r.right-=x+10;r.top-=line+2+title_bar_.height();r.bottom-=line+2+title_bar_.height();}
+                    line+=96;
                 }
-                continue;
             }
-            const auto& row=pools.at(id);
-            label(title(row,"name"),left+44,y+7,name_end-left-56,14,surface,ColorToken::text_secondary);
-            if (!enabled_only) {
-                auto& toggle=ToggleSwitch({.on=row.at("enabled").get<bool>(),.enabled=!busy_})
-                    .append(model_,surface,"schedule.enabled."+id);
-                toggle.action=toggle.key;
-                toggle.area=WidgetArea::absolute;
-                const float toggle_top=row_top-14+title_bar_.height();
-                toggle.bounds={state,toggle_top,state+52,toggle_top+pool_row_height};
-                continue;
-            }
-            const auto concurrency=row.at("concurrency").get<int>();
-            const auto binding="schedule.concurrency."+id;
-            const auto draft=fields_.find(binding);
-            const auto value=draft==fields_.end()?std::to_wstring(concurrency):draft->second;
-            button("lower."+id,L"−",limit,y,26,false,concurrency>1,surface);
-            auto& number_box=add(binding,WidgetKind::textbox,L"",limit+30,y,52,32,surface);
-            TextBox({.text=value,.enabled=!busy_,.max_length=4}).apply(number_box);
-            number_box.binding=binding;
-            button("raise."+id,L"+",limit+86,y,26,false,concurrency<1000,surface);
-            std::vector<Choice> options{{"",L"DSH 默认"}};
-            const auto saved=row.at("effort").get<std::string>();
-            for (const auto& option:row.at("efforts")) options.push_back({option.get<std::string>(),widen(option.get<std::string>())});
-            if (std::ranges::find(options,saved,&Choice::key)==options.end())
-                options.push_back({saved,widen(saved)+L"（已下架）",false});
-            auto& choice=add("schedule.effort."+id,WidgetKind::select,L"",effort,y,effort_width,32,surface);
-            ComboBox({L"思考强度",std::move(options),widen(saved),!busy_,effort_width}).apply(choice);
+            for (std::size_t i=first;i<model_.ui.widgets.size();++i) if (model_.ui.widgets[i].surface==surface) {auto& r=model_.ui.widgets[i].bounds;r.left-=x;r.right-=x;r.top-=y+title_bar_.height();r.bottom-=y+title_bar_.height();}
+            y+=card.height+10;
         }
-        if (!total) label(enabled_only?L"在下方完整列表启用模型后，可在这里编辑配置。":L"从 DSH 导入模型后可在这里启用。",
-            left,first+8,right-left-32,13,surface,ColorToken::text_secondary);
+        if (cards.empty()) label(enabled_models_only_?L"暂无已启用模型，切换到全部模型进行启用。":L"还没有模型。连接 DSH 后导入账号与模型。",x+16,top+22,right-x-32,13,"pools.viewport",ColorToken::text_secondary);
     }
     void pools_page(float x,float right,float h) {
         button("import",L"从 DSH 导入模型",right-154,20,154,true);
-        constexpr float top=65,gap=12;
-        const float bottom=h-30;
-        const float split=top+std::floor((bottom-top-gap)*.49f);
-        pools_section(List::enabled_pools,x,top,right,split);
-        pools_section(List::all_pools,x,split+gap,right,bottom);
+        const auto enabled=std::ranges::count_if(settings_.at("pools"),[](const Json& pool){return pool.value("enabled",false);});
+        label(std::to_wstring(account_models_.size())+L" 个账号 · "+std::to_wstring(enabled)+L" 个模型已启用",x,72,right-x-135,13,"root",ColorToken::text_secondary);
+        button("pools.filter",enabled_models_only_?L"显示全部":L"仅已启用",right-116,65,116,enabled_models_only_);
+        pools_section(List::all_pools,x,111,right,h-30);
+    }
+    void onboarding_page(float x,float right,float h) {
+        const float width=right-x;
+        const std::array<std::wstring,4> steps{L"连接 DSH",L"启用模型",L"创建队列",L"开始任务"};
+        for (int i=0;i<4;++i) {
+            const auto cell=width/4;label((i<wizard_step_?std::wstring(L"✓"):std::to_wstring(i+1))+L"  "+steps[i],x+i*cell,68,cell-6,13,"root",i==wizard_step_?ColorToken::accent_primary:ColorToken::text_tertiary,i==wizard_step_);
+        }
+        const float bottom=h-85;
+        if (wizard_step_==0) {
+            auto& view=viewport(List::settings);const float top=104;
+            view.bounds={x,top+title_bar_.height(),right,bottom+title_bar_.height()};
+            view.maximum=std::max(0.f,366.f-(bottom-top))/row_height;view.offset=std::clamp(view.offset,0.0,view.maximum);
+            const float edge=right-(view.maximum>0?18.f:0.f);
+            panel("wizard.connection",{x,top,edge,bottom},SurfaceVisual::transparent);
+            auto& host=model_.ui.surfaces.back();host.parent="root";host.scroll=float(view.offset)*row_height;
+            const auto first=model_.ui.widgets.size();connection_fields(x+16,edge-16,top,"wizard.connection");
+            for (std::size_t i=first;i<model_.ui.widgets.size();++i) {auto& r=model_.ui.widgets[i].bounds;r.left-=x;r.right-=x;r.top-=top+title_bar_.height();r.bottom-=top+title_bar_.height();}
+            if (view.maximum>0) {
+                auto& bar=ScrollBar({.label=L"滚动连接设置",.maximum=view.maximum,.value=view.offset,.viewport=(bottom-top)/row_height,.length=bottom-top}).append(model_,"root",view.key);
+                bar.area=WidgetArea::absolute;bar.bounds={right-14,view.bounds.top,right,view.bounds.bottom};
+            }
+        } else if (wizard_step_==1) {
+            label(L"打开账号卡片，启用至少一个模型；任务将自动按负载分配。",x,107,width,13,"root",ColorToken::text_secondary);
+            pools_section(List::all_pools,x,141,right,bottom);
+        } else if (wizard_step_==2) {
+            panel("wizard.queue",{x,112,right,std::min(bottom,330.f)});
+            field("newQueueName",L"为任务创建一个队列",x+20,131,width-156,"wizard.queue");
+            button("create_queue",L"创建",right-120,155,100,true,true,"wizard.queue");
+            queue_picker(x+20,208,width-40,"wizard.queue");
+            label(L"每个队列独立保存任务和执行结果。",x+20,279,width-40,13,"wizard.queue",ColorToken::text_secondary);
+        } else {
+            panel("wizard.start",{x,112,right,std::min(bottom,365.f)});
+            label(L"准备就绪",x+24,134,width-48,23,"wizard.start",ColorToken::text_primary,true);
+            label(L"1. 复制主代理提示词，粘贴到主代理会话。",x+24,185,width-48,14,"wizard.start");
+            label(L"2. 描述需求，项目经理会自动派发与验收。",x+24,221,width-48,14,"wizard.start");
+            button("wizard.copy",wizard_copied_?L"已复制 · 再次复制":L"复制主代理提示词",x+24,278,174,true,!current_queue_.empty(),"wizard.start");
+        }
+        button("wizard.dismiss",L"稍后设置",x,h-58,100);
+        if (wizard_step_>0) button("wizard.back",L"上一步",right-216,h-58,96);
+        bool can_next=wizard_step_==0?(!settings_.value("authPath","").empty() || !settings_.value("configPath","").empty()):wizard_step_==1?
+            std::ranges::any_of(settings_.at("pools"),[](const Json& p){return p.value("enabled",false);}):wizard_step_==2?
+            std::ranges::any_of(queues_,[&](const Json& q){return q.at("queueId")==current_queue_ && !q.value("legacy",false);}):wizard_copied_;
+        button("wizard.next",wizard_step_==3?L"完成":L"下一步",right-108,h-58,108,true,can_next);
     }
     void redraw() {
         if (!window) return;
@@ -1719,14 +1717,15 @@ private:
                 Image({.source=logo_,.width=20,.height=20,.description=L"肥鱼重工"}).apply(*icon);
             }
         }
-        const auto selected_page=page_=="pools" ? "pools" :
+        const auto selected_page=page_=="queues"?"queues":page_=="onboarding"?"connection":page_=="pools" ? "pools" :
             page_=="connection" ? "connection" : "sessions";
         NavigationViewOptions navigation;
         navigation.id="sidebar";
         navigation.pane_expanded=navigation_open_ && w>=minimum_width;
         navigation.selected_id=selected_page;
         navigation.items={{"sessions",L"会话",L"\uE8BD",!busy_,{}},
-                          {"pools",L"账号与模型池",L"\uE716",!busy_,{}}};
+                          {"pools",L"账号与模型池",L"\uE716",!busy_,{}},
+                          {"queues",L"队列管理",L"\uE8F1",!busy_,{}}};
         navigation.settings={"connection",L"设置",L"\uE713",!busy_,{}};
         navigation.expanded_width=w<900?166.f:196.f;
         navigation.pane_toggle_visible=false;
@@ -1737,13 +1736,19 @@ private:
         const float content=w-navigation_.width()-2*inset;
         const float width=std::min(content,1440.f), x=navigation_.width()+inset+(content-width)/2, right=x+width;
         const std::map<std::string,std::wstring> names{{"sessions",L"会话"},{"pools",L"账号与模型池"},
-            {"connection",L"设置"},{"detail",L"会话详情"}};
-        label(names.at(page_),x,19,width-246,25);
+            {"connection",L"设置"},{"queues",L"队列管理"},{"onboarding",L"开始使用"},{"detail",L"会话详情"}};
+        auto& mcp_status=add("copy_mcp",WidgetKind::button,L"",std::max(210.f,w-438),-title_bar_.height(),280,32,"titlebar.titlebar");
+        Button({.text=http_?L"MCP · "+widen(http_->url()).substr(7):L"MCP · stdio",.width=280}).apply(mcp_status);
+        label(names.at(page_),x,19,width-166,25);
         if (!notice_.empty()) label(notice_,x,h-24,width,12,"root",ColorToken::text_secondary);
         if (page_=="sessions") {
             session_page(x,right,h);
         } else if (page_=="connection") {
             connection_page(x,right,h);
+        } else if (page_=="queues") {
+            queues_page(x,right,h);
+        } else if (page_=="onboarding") {
+            onboarding_page(x,right,h);
         } else if (page_=="pools") {
             pools_page(x,right,h);
         } else if (page_=="detail" && selected_.is_object()) {
@@ -1807,8 +1812,8 @@ private:
     Json dsh_profile_input() const {
         auto input=paths();
         input.update(Json{{"revision",settings_.at("revision")},{"profileId",draft_dsh_profile_},
-            {"dshName",narrow(fields_.at("dshName"))},{"permission",narrow(fields_.at("permission"))},
-            {"preset",narrow(fields_.at("preset"))}});
+            {"dshName",narrow(fields_.at("dshName"))},{"permission","danger-full-access"},
+            {"preset","ptc"}});
         return input;
     }
     void test_dsh_connection() {
@@ -1896,6 +1901,9 @@ private:
             redraw();
             return;
         }
+        if (Expander::is_header(*w) && w->key.starts_with("expand.")) {
+            const auto id=w->key.substr(7);if (!expanded_accounts_.erase(id)) expanded_accounts_.insert(id);redraw();return;
+        }
         if (Expander::is_header(*w)) {
             std::string_view section=w->key;
             section.remove_prefix(std::string_view("settings.").size());
@@ -1904,7 +1912,6 @@ private:
             const bool expanding=!expanded_settings_.value(key,false);
             try {
                 expanded_settings_=cluster_.invoke("cluster_desktop_settings_expanders",{{"section",key},{"expanded",expanding}});
-                if (key=="dsh" && expanding && !busy_ && presets_.empty()) {refresh_presets();return;}
             } catch (const std::exception& error) { fatfish::diagnostics::caught();
                 notice_=L"展开状态保存失败 · "+widen(error.what());
             }
@@ -1940,18 +1947,23 @@ private:
                 redraw();
                 return;
             }
-            if (name=="refresh_presets") {refresh_presets();return;}
+            if (name=="copy_mcp") {notice_=copy_text(http_?widen(http_->url()):L"FatFishBox.exe --mcp")?L"已复制 MCP 地址":L"剪贴板暂不可用";redraw();return;}
+            if (name=="pools.filter") {enabled_models_only_=!enabled_models_only_;viewport(List::all_pools).offset=0;redraw();return;}
+            if (name=="wizard.back") {wizard_step_=std::max(0,wizard_step_-1);viewport(List::all_pools).offset=0;viewport(List::settings).offset=0;redraw();return;}
+            if (name=="wizard.copy") {wizard_copied_=copy_agent_setup();redraw();return;}
+            if (name=="wizard.dismiss") {cluster_.invoke("cluster_desktop_onboarding",{{"dismissed",true}});nav("sessions");return;}
+            if (name=="wizard.next") {
+                if (wizard_step_==3) {cluster_.invoke("cluster_desktop_onboarding",{{"completed",true},{"dismissed",false}});nav("sessions");}
+                else {++wizard_step_;viewport(List::all_pools).offset=0;redraw();}return;
+            }
             if (name=="copy_agent_setup") {copy_agent_setup();return;}
             if (name=="copy_team_setup") {copy_team_setup();return;}
             if (name=="sessions.active" || name=="sessions.completed") {compact_completed_=name=="sessions.completed";redraw();return;}
             if (name=="save_team") {
                 Json input={{"revision",team_settings_.at("revision")}};
-                for (const auto* key:{"leadPool","developerPool","reviewerPool"}) input[key]=narrow(fields_[std::string("team.")+key]);
-                for (const auto* key:{"totalConcurrency","developerConcurrency","reviewerConcurrency"}) {
-                    const auto value=fields_[std::string("team.")+key];std::size_t end=0;const auto count=std::stoi(value,&end);
-                    if (end!=value.size()) throw std::runtime_error("并发须为 1–64 的整数");input[key]=count;
-                }
-                call("team_update_settings",input,[this](Json value){team_settings_=std::move(value);notice_=L"团队方案已保存，复制提示词后即可开始";});return;
+                const auto value=fields_["team.totalConcurrency"];std::size_t end=0;const auto count=std::stoi(value,&end);
+                if (end!=value.size()) throw std::runtime_error("最大并发须为2–64的整数");input["totalConcurrency"]=count;
+                call("team_update_settings",input,[this](Json value){team_settings_=std::move(value);notice_=L"最大并发已保存，在途任务继续运行";});return;
             }
             if (name=="create_queue") {
                 call("cluster_create_queue",{{"name",narrow(fields_["newQueueName"])},{"requestId",fatfish::id()}},[this](Json queue) {
@@ -2016,9 +2028,9 @@ private:
             } else if (name=="check_dsh_version") {
                 check_dsh_version();
             } else if (name=="import") {
-                call("cluster_import_models",page_=="connection"?dsh_profile_input():Json::object(),[this](Json value) {
+                call("cluster_import_models",(page_=="connection" || page_=="onboarding")?dsh_profile_input():Json::object(),[this](Json value) {
                     std::erase_if(fields_,[](const auto& entry){return entry.first.starts_with("schedule.");});
-                    local_snapshot();nav("pools");notice_=L"已导入 "+std::to_wstring(value.value("accounts",0))+L" 个账号、"+std::to_wstring(value.value("models",0))+L" 个模型";
+                    const bool onboarding=page_=="onboarding";local_snapshot();if (onboarding) {wizard_step_=1;redraw();} else nav("pools");notice_=L"已导入 "+std::to_wstring(value.value("accounts",0))+L" 个账号、"+std::to_wstring(value.value("models",0))+L" 个模型";
                     if (const auto configured=value.value("configuredModels",0);configured)
                         notice_+=L" · "+std::to_wstring(configured)+L" 个模型等待 DSH 确认可用";
                     if (const auto failures=value.value("failedProviders",0);failures)
@@ -2165,9 +2177,9 @@ int render_offscreen(std::vector<std::wstring> arguments) {
     int result=0;
     try {
         if (arguments.size()!=2 && arguments.size()!=5)
-            throw std::runtime_error("用法：--render-offscreen <settings|sessions|pools> <output.png> [width height dpi]");
+            throw std::runtime_error("用法：--render-offscreen <settings|sessions|pools|queues|onboarding> <output.png> [width height dpi]");
         const auto page=narrow(arguments[0]);
-        if (page!="settings" && page!="sessions" && page!="pools") throw std::runtime_error("未知离屏页面");
+        if (page!="settings" && page!="sessions" && page!="pools" && page!="queues" && page!="onboarding" && page!="onboarding-models" && page!="onboarding-queue" && page!="onboarding-start") throw std::runtime_error("未知离屏页面");
         const auto number=[&](std::size_t index,UINT maximum) {
             const auto& value=arguments[index];
             std::size_t end{};

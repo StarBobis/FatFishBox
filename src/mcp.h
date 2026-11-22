@@ -5,11 +5,11 @@
 namespace fatfish {
 inline constexpr std::size_t mcp_max_request_size=1024*1024;
 inline constexpr char mcp_handoff_instructions[]=
-    "两层循环：先读team_get_prompt(principal)。主代理拆分不超过可用并发数的独立任务，写逐步计划与验收门禁，启动唯一设有goal的项目经理。"
-    "主代理每次等待60秒后读team_get_project，running继续等；不处理日常开发队列。"
-    "项目经理先team_dispatch_ready派发主代理计划中全部就绪事项，再循环team_next_action：开发完成派独立审查，审查通过亲自team_verify_candidate运行候选分支测试，通过才accept；失败修复后重新审查测试。"
-    "空队列仍有在途不可完成。全部验收后team_finish_domain并完成goal。主代理再逐项验收、合入main并team_record_merge；不通过则team_update_charter提交新的完整计划返工。"
-    "工具的domainId/token仅用于经理身份兼容，不代表多领域。开发在自动创建的隔离分支执行。用户仅粘贴接入说明时等待任务。";
+    "Read team_get_prompt(principal). The principal commits a complete executable plan, splits independent tasks within capacity, and starts one project manager with a real persistent goal. "
+    "The principal must wait through team_wait_decisions (up to 300000 ms), handle early feedback immediately, and read team_get_project. Never sleep or consume the development queue. "
+    "The manager dispatches all ready planned work with team_dispatch_ready and handles team_next_action FIFO. Developers build/test first and supply successful logs before independent review. Only after review passes does the manager use team_verify_candidate and accept with a passing verificationId. Repairs require fresh review. "
+    "The manager waits exclusively through team_wait_actions (up to 300000 ms); an empty queue with active workers or decisions is not completion. When every planned item is accepted, team_finish_domain and complete the goal. The principal then independently accepts and actually merges main before team_record_merge, or supplies a complete replacement plan through team_update_charter. "
+    "Use team_retire_work_item for obsolete terminal work instead of fake repairs. Evidence blocks require real recapture; the principal selects external files with team_capture_evidence. domainId/token identify one manager, not multiple domains. Preserve existing sessions and exact SHA/resultVersion bindings. When the user only pastes connection instructions, wait for a task. ";
 
 bool mcp_protocol_supported(std::string_view version);
 Json dispatch_mcp(const Cluster& cluster, std::string_view line, bool* initialized=nullptr,bool principal_only=false);

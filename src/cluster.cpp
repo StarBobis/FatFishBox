@@ -86,7 +86,7 @@ bool active(const Json& row) {
     return state != "succeeded" && state != "failed" && state != "cancelled" && state != "interrupted";
 }
 Json settings_template() {
-    return {{"revision",0},{"configPath",""},{"authPath",""},{"permission",""},{"preset",""},
+    return {{"revision",0},{"configPath",""},{"authPath",""},{"permission","danger-full-access"},{"preset","ptc"},
         {"accounts",Json::object()},{"pools",Json::object()}};
 }
 std::string dsh_profile_id(const Json& settings) {
@@ -435,7 +435,7 @@ struct PoolSelection {
 };
 PoolSelection choose_pool(const Json& settings,const Json& sessions,const CatalogModels& models,
     const std::set<std::string>& allowed,const std::string& pinned,const Json& cooldowns,
-    const std::map<std::string,std::string>& rejected,const Json& role_model=Json()) {
+    const std::map<std::string,std::string>& rejected,bool automatic_team=false) {
     std::vector<std::tuple<int,int,std::string>> scores;
     Json diagnostics{{"pools",Json::array()},{"availablePools",Json::array()}};
     for (const auto& [key, pool] : settings.at("pools").items()) {
@@ -443,8 +443,6 @@ PoolSelection choose_pool(const Json& settings,const Json& sessions,const Catalo
         const auto model=pool.at("model").get<std::string>();
         const auto enabled=pool.at("enabled").get<bool>();
         const bool in_batch=allowed.empty() || allowed.contains(key);
-        const bool role_matches=role_model.is_null() ||
-            (model==role_model.at("model").get<std::string>() && pool.value("effort","")==role_model.value("effort",""));
         if (!enabled && key!=pinned && !allowed.contains(key)) continue;
         int account_count=0,pool_count=0,unverified=0;
         for (const auto& row : sessions) {
@@ -457,10 +455,10 @@ PoolSelection choose_pool(const Json& settings,const Json& sessions,const Catalo
                 if (row.value("stale",false)) ++unverified;
             }
         }
-        const auto cap = pool.at("concurrency").get<int>();
+        const auto cap = automatic_team?64:pool.at("concurrency").get<int>();
         const auto cooldown=cooldowns.value(provider,std::int64_t(0));
         const auto refusal=rejected.find(key);
-        const std::string_view reason=!in_batch?"batch_restricted":!role_matches?"role_model_mismatch":!enabled?"disabled":
+        const std::string_view reason=!in_batch?"batch_restricted":!enabled?"disabled":
             cooldown>now()?"account_cooldown":!models.contains({provider,model})?"model_unavailable":
             refusal!=rejected.end()?std::string_view(refusal->second):pool_count>=cap?"slots_full":"available";
         Json diagnostic{{"poolId",key},{"account",settings.at("accounts").at(provider).value("name",provider)},
@@ -1291,6 +1289,8 @@ void Cluster::require_open_queue() const {
 void Cluster::delete_desktop_queue(std::string_view queue_id) const {
     const auto deleting=for_queue(queue_id);
     const auto& key=deleting.queue_id_;
+    const auto team=invoke("team_get_queue",{{"queueId",key}}).value("project",Json());
+    require(!team.is_object() || (team.value("status","")!="running" && team.value("status","")!="starting" && team.value("status","")!="finishing"),"执行中的团队队列不能删除，请等待任务结束");
     require(key!=legacy_queue_id_,"原有队列保存历史任务，不能删除");
     const ExclusiveStateLock lock(deleting.handoff_file(true));
     Database db(data_,true);
@@ -1724,12 +1724,9 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
     auto resolved=settings;
     resolved["authPath"]=utf8(auth);
     require_ready_dsh(resolved);
-    require(settings.at("permission")!="","派发前需要设置并验证 DSH 权限预设");
-    // For a team, poolId identifies the role's model/effort template, not a fixed account.
+    // Team roles share all enabled models; ignore legacy role pool references.
     // Dispatch replay above is intentionally unchanged: never move an existing session.
-    const auto configured_pool=input.contains("poolId")?field(input,"poolId",100):"";
-    const auto role_pool=input.contains("teamProjectId")?configured_pool:std::string();
-    const auto pinned=role_pool.empty()?configured_pool:std::string();
+    const auto pinned=!input.contains("teamProjectId") && input.contains("poolId")?field(input,"poolId",100):std::string();
     const auto requested=batch_allowlist(input);
     const Dsh dsh(auth,3500,12000);
     CatalogModels models;
@@ -1787,14 +1784,7 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
             cooldowns[cooling_account]=now()+60000;
             db.save();
         }
-        Json role_model;
-        if (!role_pool.empty()) {
-            require(current.at("pools").contains(role_pool),"团队角色的模型参考池不存在");
-            role_model=current.at("pools").at(role_pool);
-        }
-        // Reuse the atomic global load/capacity/cooldown selection across accounts,
-        // restricted to the exact configured model and effort for this team role.
-        auto choice=choose_pool(current,occupied,models,allowed,pinned,cooldowns,rejected,role_model);
+        auto choice=choose_pool(current,occupied,models,allowed,pinned,cooldowns,rejected,input.contains("teamProjectId"));
         diagnostics=std::move(choice.diagnostics);
         if (choice.key.empty()) throw DispatchError(pool_failure(diagnostics,pinned),diagnostics);
         if (!allowed.empty()) batches[batch]=allowed;
@@ -1838,15 +1828,15 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
     std::string stage="create_session";
     try {
         Json create{{"cwd",utf8(workspace)}};
-        if (settings.at("preset") != "") create["agentPreset"] = settings.at("preset");
+        create["agentPreset"]="ptc";
         const auto created = dsh.request("session/create", create);
         const auto sid = field(created, "sessionId", 200);
         row["dshId"] = sid;
         row["owner"] = dsh.owner();
-        if (created.contains("agentPreset") && settings.at("preset") != "")
-            require(created.at("agentPreset") == settings.at("preset"), "DSH 未保留 Agent 预设");
+        if (created.contains("agentPreset"))
+            require(created.at("agentPreset") == "ptc", "DSH 未保留 Agent 预设");
         stage="permission_preset";
-        const auto permission = settings.at("permission").get<std::string>();
+        const std::string permission="danger-full-access";
         const auto applied = dsh.call("commands/execute", {{"agentId",sid},{"line","/permission " + permission},
             {"submittedAttachments",Json::array()}});
         require(applied.value("result", applied).value("kind","") == "success", "DSH 没有应用权限预设");
@@ -1894,13 +1884,13 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
             require(!user_objective.empty(),"项目经理goal目标不可为空");
             stage="prepare_manager_bootstrap";
             const auto bootstrap=workspace/L"manager-bootstrap.md";
-            const auto content=task+"\n\n完整项目授权与任务计划\n"+input.value("teamBootstrapContext",Json::object()).dump(2);
+            const auto content=task+"\n\nComplete charter and task plan\n"+input.value("teamBootstrapContext",Json::object()).dump(2);
             std::ofstream document(bootstrap,std::ios::binary|std::ios::trunc);
             document.write(content.data(),static_cast<std::streamsize>(content.size()));document.close();
             require(bool(document),"无法保存完整项目经理启动文档，禁止激活goal");
-            const auto objective=std::string("你是唯一项目经理，只负责派发开发、独立审查、亲自验收及修复调度，禁止自己修改产品代码或审计脚本。\n")+
-                "第一步必须读取以下启动文档，取得完整规程、当前授权、任务计划和派发凭据；读取前不要执行产品工作。\n启动文档："+
-                utf8(bootstrap)+"\n随后立即调用team_domain_context，再team_dispatch_ready一次排队主代理计划中全部已就绪任务；不要重新拆分、只派一个就等待或自行开发。\n项目目标："+user_objective;
+            const auto objective=std::string("You are the only project manager: dispatch developers, arrange independent review, perform final acceptance and coordinate repairs. Do not modify product code or write audit scripts.\n")+
+                "First read the bootstrap document below for the complete instructions, current charter, task plan and credentials. Do not begin product work before reading it.\nBootstrap document: "+
+                utf8(bootstrap)+"\nImmediately call team_domain_context, then team_dispatch_ready to queue every ready task from the principal's plan. Do not re-split the plan, dispatch just one independent item and wait, or implement changes yourself. Developers must build/test before review; you test only after review passes. Use MCP waits exclusively.\nProject objective: "+user_objective;
             // The first goal round may start before commands/execute returns.
             // Persist everything it needs and capture the cursor BEFORE activation.
             const auto before=rpc_state(dsh,row);
@@ -2634,6 +2624,13 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
         const auto& overview=snapshot.at("overview");
         for (const auto field:{"active","unprocessed","processed","claimed"}) info[field]=overview.at(field);
         return info;
+    }
+    if (tool=="cluster_desktop_onboarding") {
+        const bool updating=input.contains("completed") || input.contains("dismissed");
+        Database db(data_,updating);
+        auto value=db.state.value("desktopOnboarding",Json{{"completed",false},{"dismissed",false}});
+        if (updating) {for (const auto* key:{"completed","dismissed"}) if (input.contains(key)) value[key]=input.at(key).get<bool>();db.state["desktopOnboarding"]=value;db.save();}
+        return value;
     }
     if (tool=="cluster_desktop_settings_expanders") {
         const bool updating=input.contains("section");
@@ -3444,7 +3441,9 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
         Database db(data_, true);
         auto& row = db.state["sessions"].at(key);
         require(result_visible(row),"该结果尚未通过对抗审查");
-        require(!replaced_versions(db.state.at("sessions")).contains(handoff_version(row)),"请验收排队中的返修交接");
+        const auto work=row.value("workItemId","");
+        const bool retired=db.state.value("workItems",Json::object()).contains(work) && db.state.at("workItems").at(work).at("state")=="cancelled";
+        require(retired || !replaced_versions(db.state.at("sessions")).contains(handoff_version(row)),"请验收排队中的返修交接");
         require(!active(row) && row.at("resultVersion") == field(input,"resultVersion",100), "结果版本已变化，无法确认");
         row["read"] = true;
         row["processed"] = row.at("processed").get<bool>() || input.value("processed", false);
@@ -3585,93 +3584,93 @@ Json Cluster::tools() {
         path_list{{"type","array"},{"items",text},{"maxItems",16}};
     auto add = [&](const char* name, const char* description, Json fields = Json::object(), Json required = Json::array()) {
         if (queue_scoped_tool(name)) {
-            fields["queueId"]={{"type","string"},{"description","队列 UUID。"}};
+            fields["queueId"]={{"type","string"},{"description","Queue UUID."}};
             required.push_back("queueId");
         }
         tools.push_back({{"name",name},{"description",description},
             {"inputSchema",{{"type","object"},{"properties",fields},{"required",required},{"additionalProperties",false}}}});
     };
-    add("cluster_create_queue","为独立工作创建新队列，重试复用 requestId。workKey 用于跨聊天查找同一工作。",
+    add("cluster_create_queue","Create a queue for independent work. Reuse requestId on uncertain retries; workKey locates the same work across chats.",
         {{"name",text},{"requestId",text},{"workKey",text},{"workspace",text}},{"name","requestId"});
-    add("cluster_rename_queue","修改指定队列的显示名称。",{{"queueId",text},{"name",text}},{"queueId","name"});
-    add("cluster_find_queues","查找本机队列。可按稳定的 clientKey、workKey 或绝对工作区查找。lastQueueId 表示该客户端上次绑定的队列。多条匹配时先核对队列归属。",
+    add("cluster_rename_queue","Change the display name of the specified queue.",{{"queueId",text},{"name",text}},{"queueId","name"});
+    add("cluster_find_queues","Find local queues by stable clientKey, workKey or absolute workspace. lastQueueId is the previous client binding. Verify ownership when multiple queues match.",
         {{"clientKey",text},{"workKey",text},{"workspace",text}});
-    add("cluster_get_queue","查看指定队列的名称、工作区、最近活动和待处理数量。",{{"queueId",text}},{"queueId"});
-    add("cluster_bind_queue","将稳定的客户端或聊天标识 clientKey 绑定到指定队列，便于下次查回。每次队列操作仍要提供 queueId。",
+    add("cluster_get_queue","Read a queue name, workspace, recent activity and pending counts.",{{"queueId",text}},{"queueId"});
+    add("cluster_bind_queue","Bind a stable client/chat key to a queue for recovery. Every queue operation still requires queueId.",
         {{"queueId",text},{"clientKey",text}},{"queueId","clientKey"});
-    add("cluster_assign_legacy_session","将未领取且没有返修关联的原 Codex 会话明确登记到新队列。sessionId 使用原有队列中的 codex: ID。",
+    add("cluster_assign_legacy_session","Assign an unclaimed legacy Codex session without repair links to a queue, using its original codex: ID.",
         {{"queueId",text},{"sessionId",text}},{"queueId","sessionId"});
-    add("cluster_overview","查看指定队列的活动会话、待交接、未读和全局模型账号汇总。");
-    add("cluster_get_settings","读取当前连接配置、账号、模型池与 revision。");
-    add("cluster_get_presets","读取 DSH 权限预设和可用 Agent 预设。",
+    add("cluster_overview","Read queue activity, handoffs, unread counts and global account/model summaries.");
+    add("cluster_get_settings","Read the current DSH connection, accounts, model pools and configuration revision.");
+    add("cluster_get_presets","Read available DSH permission and agent presets for legacy callers; new sessions use danger-full-access and ptc.",
         {{"authPath",text},{"configPath",text}});
-    add("cluster_import_models","从 DSH 实时目录和已配置的模型列表导入账号与模型。",
+    add("cluster_import_models","Import accounts and models from the live DSH catalog and configured model roster.",
         {{"authPath",text},{"configPath",text}});
-    add("cluster_configure","更新 DSH 连接与预设。",
+    add("cluster_configure","Update DSH connection configuration with revision protection. New sessions use fixed danger-full-access and ptc defaults.",
         {{"revision",integer},{"configPath",text},{"authPath",text},{"permission",text},{"preset",text}}, {"revision"});
-    add("cluster_update_pool","设置模型启用状态、总并发和思考强度。",
+    add("cluster_update_pool","Update enabled state, legacy pool capacity or reasoning effort. Team roles share the global maximum concurrency.",
         {{"revision",integer},{"id",text},{"enabled",boolean},{"concurrency",integer},{"effort",text}}, {"revision","id"});
     const Json nullable_text{{"type",Json::array({"string","null"})}},
         nullable_boolean{{"type",Json::array({"boolean","null"})}};
-    add("cluster_create_work_item","创建稳定事项，requestId 去重；task 保存原任务，后续开发、返修和审查引用同一 workItemId。",
+    add("cluster_create_work_item","Create a durable work item with requestId deduplication. task stores the original assignment; development, repair and review reference the same workItemId.",
         {{"title",text},{"requestId",text},{"task",text},{"workspace",text},{"baseSha",text}},{"title","requestId"});
-    add("cluster_get_work_item","读取事项、缺陷、审查、验收与集成记录；includeTask=true 才返回原任务。",
+    add("cluster_get_work_item","Read work, issues, reviews, acceptance and integration records. includeTask=true includes the original assignment.",
         {{"workItemId",text},{"includeTask",boolean}},{"workItemId"});
-    add("cluster_list_work_items","分页列总账和完整计数。remaining 包含已验收待集成项；旧记录须核对集成状态。",
+    add("cluster_list_work_items","Page the ledger with complete counts. Remaining includes accepted candidates awaiting integration; reconcile historical merge state.",
         {{"offset",integer},{"limit",integer},{"state",text},{"remainingOnly",boolean}});
-    add("cluster_update_work_item","按 revision 更新事项；requestId 去重。验收须登记独立审查通过，integrate 只登记提交而不执行合并。",
+    add("cluster_update_work_item","Update the ledger with revision protection and stable requestId. Acceptance requires an independent passing review; integrate records a real commit without performing a merge.",
         {{"workItemId",text},{"requestId",text},{"expectedRevision",integer},
          {"action",{{"type","string"},{"enum",Json::array({"add_issue","resolve_issue","record_review","accept","integrate","reopen","block","cancel","attach_session"})}}},
          {"details",{{"type","object"}}}},{"workItemId","requestId","expectedRevision","action","details"});
-    add("cluster_next_handoff","领取最早完成的结果摘要；claimToken 重读，附 outcome 提交回执。claimNext=false 仅确认本条。",
+    add("cluster_next_handoff","Claim the oldest completed handoff summary. Reuse claimToken to read it; provide outcome to acknowledge it. claimNext=false only acknowledges the current claim.",
         {{"claimToken",nullable_text},{"outcome",nullable_text},{"claimNext",nullable_boolean}});
     tools.back()["title"]="获取下一个需处理对话";
-    add("cluster_resume_handoff","恢复已有领取凭据和摘要，不续期。no_active_claim 表示需重新领取。");
+    add("cluster_resume_handoff","Resume an existing claim without extending it. no_active_claim means a new claim is needed.");
     const Json event_target{{"type","object"},{"properties",{{"queueId",text},{"afterCursor",text}}},
         {"required",Json::array({"queueId"})},{"additionalProperties",false}};
-    add("cluster_wait_events","批量等待游标后的变化，不领取结果。首次省略 afterCursor 建立基线；resetRequired 时重新核对摘要。",
+    add("cluster_wait_events","Wait for batched cursor changes without claiming results. Omit afterCursor initially to establish a baseline; resetRequired means re-read current summaries.",
         {{"targets",{{"type","array"},{"minItems",1},{"maxItems",8},{"items",event_target}}},
          {"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",30000},{"default",25000}}},
          {"limit",{{"type","integer"},{"minimum",1},{"maximum",100},{"default",32}}}},{"targets"});
-    add("cluster_wait_handoff","等待可领取的交接；ready 后领取，timedOut 表示超时。timeoutMs=0 仅检查。",
+    add("cluster_wait_handoff","Wait for an available handoff, then claim when ready. timedOut means only that this wait expired; timeoutMs=0 checks immediately.",
         {{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",30000},{"default",25000}}}});
     const Json evidence_file{{"type","object"},{"properties",{{"path",text},{"kind",{{"type","string"},
         {"enum",Json::array({"screenshot","executable","test_log","build_config","other"})}}}}},{"required",Json::array({"path"})},{"additionalProperties",false}};
     const Json reported_test{{"type","object"},{"properties",{{"command",text},{"exitCode",integer},{"logPath",text}}},
         {"required",Json::array({"command","exitCode"})},{"additionalProperties",false}};
-    add("cluster_capture_evidence","采集源码身份、构建配置、EXE/截图/日志哈希及测试声明，返回可复用清单引用。不会执行测试。",
+    add("cluster_capture_evidence","Capture source identity, build metadata, file hashes and reported checks into reusable manifests. Explicit files may be external. This does not execute tests.",
         {{"sessionId",text},{"resultVersion",text},{"candidateSha",text},{"configuration",text},
          {"files",{{"type","array"},{"items",evidence_file},{"maxItems",128}}},
          {"tests",{{"type","array"},{"items",reported_test},{"maxItems",64}}}},{"sessionId"});
-    add("cluster_get_evidence_manifest","按清单引用分页读取证据元数据，校验内容哈希和队列归属。",
+    add("cluster_get_evidence_manifest","Page evidence metadata by manifest reference, verifying content hash and queue ownership.",
         {{"manifestId",text},{"offset",integer},{"limit",integer}},{"manifestId"});
-    add("cluster_send_message","向本机派发的活动会话追加约束、基线或缺陷。默认 steer；requestId 持久去重。accepted 仅表示入队。",
+    add("cluster_send_message","Append constraints, baselines or defects to a locally dispatched active session. Default mode=steer. Stable requestId deduplicates persistently; accepted means queued only.",
         {{"sessionId",text},{"requestId",text},{"message",text},{"baseSha",text},
          {"issueIds",{{"type","array"},{"items",text},{"maxItems",32}}},
          {"mode",{{"type","string"},{"enum",Json::array({"steer","queue"})},{"default","steer"}}}},{"sessionId","requestId"});
-    add("cluster_get_message","查询追加消息入队状态；includeMessage=true 才返回原消息参数。",
+    add("cluster_get_message","Read message enqueue state; includeMessage=true includes the original message arguments.",
         {{"sessionId",text},{"requestId",text},{"includeMessage",boolean}},{"sessionId","requestId"});
-    add("cluster_start_session","派发会话。requestId 用于原参数重试去重；allowedPoolIds 限定批次模型池。",
+    add("cluster_start_session","Dispatch a session. Reuse requestId and exact arguments after uncertain responses; allowedPoolIds restricts a batch. Team jobs automatically balance all enabled models.",
         {{"title",text},{"batch",text},{"role",text},{"workspace",text},{"task",text},{"poolId",text},{"allowedPoolIds",pool_list},{"requestId",text},{"workItemId",text},{"baseSha",text}},
         {"title","batch","workspace","task"});
-    add("cluster_repair_handoff","派发返修并关联原交接。claimReleased 表示已释放原领取；unconfirmed 时保留原领取。",
+    add("cluster_repair_handoff","Dispatch a repair linked to the original handoff. claimReleased confirms claim release; unconfirmed retains the original claim.",
         {{"claimToken",text},{"originalVersion",text},{"requestId",text},{"candidateSha",text},{"screenshotPaths",path_list},
          {"acceptance",text},{"title",text},{"workspace",text},{"task",text},
          {"issueIds",{{"type","array"},{"items",text},{"maxItems",32}}},{"poolId",text},{"allowedPoolIds",pool_list}},
         {"claimToken","originalVersion","requestId","candidateSha","acceptance","title","workspace"});
-    add("cluster_refresh_sessions","同步本地登记的最早活动会话，每次最多 20 个。",{{"limit",integer}});
-    add("cluster_get_session_status","用派发返回的 id 或 dshId 查询会话状态、标题和返修关联。dshId 有歧义时用 id。stale 为 true 时返回最近一次已知状态。",
+    add("cluster_refresh_sessions","Synchronize the oldest locally registered active sessions, up to 20 per call.",{{"limit",integer}});
+    add("cluster_get_session_status","Read status, title and repair links using returned id or dshId. Use id for ambiguous dshId; stale=true returns the last known status.",
         {{"sessionId",text}},{"sessionId"});
-    add("cluster_get_session_result","按结果版本读取归档交付与日志片段。用 nextOffset 翻页，不变更领取。",
+    add("cluster_get_session_result","Read archived delivery and log excerpts for an exact resultVersion. Page with nextOffset; this does not change claims.",
         {{"sessionId",text},{"resultVersion",text},{"offset",{{"type","integer"},{"minimum",0}}},
          {"limit",{{"type","integer"},{"minimum",4},{"maximum",24000}}}},{"sessionId"});
-    add("cluster_review_issues","列出旧版自动审查留下的缺陷和受阻状态。这些是历史记录。先读取交付和已有 reviewer 结果，再决定是否派复审。");
-    add("cluster_attach_handoff_repair","关联同批次、覆盖当前缺陷的已有返修。关联前用 cluster_get_session_status 核对返修会话和已有交接。返回 claimReleased: true 后立即领取下一条。",
+    add("cluster_review_issues","Read historical automatic-review issues and blockers. Inspect delivery and existing reviewer results before deciding whether a fresh review is needed.");
+    add("cluster_attach_handoff_repair","Link an existing same-batch repair covering current issues. Check its status and handoff first. After claimReleased=true, immediately claim the next item.",
         {{"claimToken",text},{"originalVersion",text},{"sessionId",text}},{"claimToken","originalVersion","sessionId"});
-    add("cluster_detach_handoff_repair","从尚未确认的返修中解绑一条误挂交接。sessionId 是返修 ID，originalSessionId 和 originalVersion 须对应 repairLinks 中的同一条。返修已被领取时须附该返修的当前 claimToken。解绑后返回剩余关联，原交接符合待处理条件时恢复排队。",
+    add("cluster_detach_handoff_repair","Detach an incorrect, unacknowledged repair link using the exact originalSessionId/originalVersion. If claimed, supply the repair claimToken. Eligible original handoffs return to the queue.",
         {{"sessionId",text},{"originalSessionId",text},{"originalVersion",text},{"claimToken",text}},
         {"sessionId","originalSessionId","originalVersion"});
-    add("cluster_cancel_session","取消已知的活动会话。",{{"sessionId",text}},{"sessionId"});
+    add("cluster_cancel_session","Cancel a known active session. Already terminal sessions do not need cancellation; close obsolete ledger items explicitly instead.",{{"sessionId",text}},{"sessionId"});
     for (auto& entry:team_tools()) tools.push_back(std::move(entry));
     return tools;
 }

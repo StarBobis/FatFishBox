@@ -78,7 +78,7 @@ const server = createServer(async (req,res) => {
         if (reviewFixture) fixedStates.set(value.sessionId,{cursor:1,running:false,queue:[],pendingInput:[]});
         break;
     case 'commands/execute': value = {result:{kind:'success'}}; break;
-    case 'session/projections': value = {values:{permissions:{currentValue:'prompt-on-risk'},
+    case 'session/projections': value = {values:{permissions:{currentValue:'danger-full-access'},
         tokenUsage:{uncachedInputTokens:100,outputTokens:20,cacheReadTokens:40,cacheWriteTokens:5}}}; break;
     case 'session/selectModel':
         if (args.request.provider===rejectProvider) {

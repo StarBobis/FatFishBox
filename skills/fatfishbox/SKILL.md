@@ -1,24 +1,24 @@
 ---
 name: fatfishbox
-description: 使用肥鱼重工 MCP 按两层循环管理 DSH 派发、审查与任务总账；用于已有接入或用户明确请求的肥鱼重工任务。
+description: Coordinate authorized FatFishBox tasks through one principal and one persistent-goal project manager using MCP, independent reviews and the durable task ledger.
 ---
 
-两层循环（单项目经理 + 持久 goal）：用户给出任务与授权后，主代理按并发上限拆分独立任务、写完整可审阅操作计划、启动唯一项目经理；随后必须调用team_wait_decisions等待（最长300000毫秒，有反馈立即返回），再用 team_get_project 读取经理状态，running 就继续，不消费开发队列、不代调度，不因一次工具超时结束任务。项目经理循环消费待处理列表，派开发、为每个候选派独立审查、亲自在候选分支测试、失败则派修复并复审，全部 accepted 且证据绑定同一候选后结束 goal；不要求独立 integrator、不预先合并全部候选。经理完成后主代理逐项最终验收，通过才合入 main，失败则给出新的完整计划启动下一轮。用户只粘贴接入说明而无任务时，简短确认并等待，不自行编造任务，也不要求用户决定如何派发。
+Use this skill for an existing FatFishBox connection or an explicit user request. If the user provides connection instructions without a task, acknowledge briefly and wait for the requirement. Do not invent work or ask the user to schedule agents.
 
-首次使用读取一次 `fatfish://workflow`。参数、特例与准确 schema 看工具目录、team-tools.json 与 team_get_contract，不反复加载整套流程。
+The principal reads `fatfish://workflow` once and then `team_get_prompt(role=principal)`. It commits a complete plan, decomposes independent tasks within totalConcurrency minus one manager slot, starts or resumes one manager, and waits through `team_wait_decisions` for up to 300000 ms per call. It does not consume the development queue or perform daily scheduling. After status=completed it independently accepts each candidate, actually merges main, and calls team_record_merge. Failed acceptance requires a complete replacement charter/tasks plan and another manager round.
 
-续接先核对 queueId 与绑定的团队记录，独立事项使用稳定 workItemId；默认交接是摘要，完整交付与日志按需分页读取；进度用事件游标批量等待。domains/domainId保留为唯一项目经理身份字段；priorityResults等旧摘要仅作兼容，新默认流程只使用待处理队首；不要把实现字段暴露成用户流程步骤。
+The manager reads `team_get_contract`, `team-tools.json` and `team_domain_context`. All tasks require name/steps/acceptance/files/dependsOn/startCondition/tests. steps is one string. Dispatch every ready item with team_dispatch_ready; repeat after each handled FIFO result. Dependencies unlock only on accepted/integrated ledger state. The manager does not re-split the principal's work or serialize independent files because of array order. Missing structured plans require a complete principal update.
 
-派发、返修、追加消息和总账更新都保存原参数与 requestId，响应不明原样核对，不换 ID 重复提交；expectedRevision 从当前状态读取。追加消息 accepted 只表示入队。代理自报测试、采集时 HEAD、文件哈希分别表示不同证据，不能相互替代；历史回执不证明已合入 main，未完历史项不静默丢失或误标通过。
+All roles share one saved maximum concurrency (default 20). Enabled account/model pools are selected automatically by global account load; preserve user settings and existing session bindings. The service creates an isolated worktree for every team worker. Legacy cluster_start_session callers must prepare isolated workspaces themselves. Never allow concurrent writers or builds to share main.
 
-派发前按任务是否写文件选择工作区：只读分析、日志查询可不写文件；并行修改、返修或写文件的构建测试须由项目经理在独立 Git worktree 中进行，核对路径、分支、基线后再派发；团队team_delegate由程序自动创建独立分支和worktree；旧cluster_start_session仍需调用方准备工作区，不让并行写入共享主工作区或 main。
+Developers and repair workers must first run their own builds and tests and return successful command/exitCode/logPath evidence for their exact clean candidate. The manager rejects untested candidates and dispatches repair rather than doing their pre-review work. Each valid candidate gets its own independent reviewer immediately, without waiting for a full batch. Failed review requires repair and a fresh review. Only after review passes does the manager use team_verify_candidate to execute final tests; acceptance requires its passing verificationId. No integrator or preliminary merge is required.
 
-每个开发或返修子会话一旦交付候选，项目经理应及时为该候选完整 SHA 单独派 role: reviewer 的独立对抗审查，不等整批结束才总审。审查任务写明原 sessionId、workItemId、候选完整 SHA、验收条件；审查通过后项目经理亲自在候选分支执行真实测试，不能把测试又派给执行者代替自己核验。失败则派修复，新候选 SHA 必须重新独立审查，旧版本通过不沿用。修复 → 复审 → 测试循环直到通过；空待处理列表且有在途不算完成，无须 integrator 门禁即可在全部 accepted 后结束。
+When no actions remain, the manager waits through team_wait_actions for up to 300000 ms. Neither principal nor manager may sleep, use shell timers or poll scripts instead. Handle early completion/action/decision feedback immediately without filling the remaining time. Timeout is not completion or failure and does not justify ending the turn. Stay in the same goal session through waiting and compaction. Finish only after all current planned work is accepted, then team_finish_domain and the actual DSH goal complete.
 
-主代理通过team_wait_decisions等待通知后读取经理状态直到完成，逐项验收合并并提供完整返工计划；断线按持久游标与 requestId 恢复，不以一次工具超时结束任务。详细规程见 prompts/principal.md、prompts/lead.md、prompts/worker.md。
+Use stable requestId and original arguments across uncertain dispatch, repair, message and ledger updates. Read expectedRevision from current state. Message accepted means queued, not executed. Keep queueId, projectId, workItemId, candidate SHA and resultVersion bindings exact. Read compact summaries first and page detailed logs/evidence only when needed. domainId is one manager's compatibility identity; legacy priorityResults does not imply preemption. Keep protocol fields out of user-facing steps.
 
-项目经理使用team_verify_candidate真实执行候选测试，accept引用通过的verificationId。全部通过后team_finish_domain，再完成DSH goal；主代理等status=completed后逐项实际合并main并team_record_merge，失败team_update_charter提交完整返工计划。准确参数见schema。
+Retire obsolete terminal historical work with team_retire_work_item; never dispatch fake read-only repairs to link handoffs. Retain audit records and do not call cancellation acceptance. Current-round retirement needs explicit principal authorization.
 
-任务契约v9：主代理必须提交name/steps/acceptance/files/dependsOn/startCondition/tests。新项目拒绝缺字段、循环依赖、未知依赖及并行写入重叠。项目经理第一步team_dispatch_ready派全就绪项，每处理结果后再调用；空闲等待前仍有就绪项会被门禁拒绝。依赖以真实工作项accepted/integrated解锁；经理不重新拆分计划、不凭任务排列串行等待。旧计划缺字段时由主代理team_update_charter提交完整tasks替换，不从自然语言猜依赖。
+Evidence failures return review_evidence_pending and a decision bound to the affected job. They leave the actionable FIFO so MCP waiting does not spin. Managers can recapture in-worktree evidence through team_domain_action(operation=cluster_capture_evidence). The principal explicitly selects exact external paths with team_capture_evidence. Files must exist and be successfully captured; boolean flags cannot bypass collection. A reported test, a capture-time HEAD and a file hash prove different facts. Historical receipts never prove a merge to main.
 
-等待规程v10：主代理只用team_wait_decisions，项目经理只用team_wait_actions。单次最长300000毫秒；完成、异常或待处理事项出现即返回反馈，不补时、不自行sleep。经理使用team_get_contract刷新新增工具schema。
+Read prompts/principal.md, prompts/lead.md and prompts/worker.md for the full role instructions. Obey explicit user requests to stop team work or implement personally.

@@ -15,12 +15,14 @@
 namespace {
 using fatfish::Json;
 using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
-constexpr auto workflow=R"workflow(# 肥鱼重工两层循环
-主代理先读 fatfish://team/principal 或 team_get_prompt(principal)，理解需求，拆分任务并写完整步骤、审查标准、测试命令、验收证据和失败处置。team_start_project只启动一个设有真实goal的项目经理。
-主代理随后必须调用team_wait_decisions等待（最长300000毫秒），有通知立即读team_get_project。running继续MCP等待，禁止自行sleep或补足等待时间，不消费开发交接或插手日常调度。
-主代理tasks须含name/steps/acceptance/files/dependsOn/startCondition/tests。项目经理先读team_domain_context，调用team_dispatch_ready派全就绪事项，再循环team_next_action；每处理结果后重新派就绪项。开发/修复结果派独立reviewer；审查通过后调用team_verify_candidate在精确候选分支真实执行测试。只有passed=true才可用verificationId验收。失败派repair，新SHA重新审查测试。空列表仍有在途时留在同一goal session，必须调用team_wait_actions等待；最长300000毫秒，完成立即返回，禁止自行sleep。
-全部工作项accepted后team_finish_domain并完成DSH goal。无需integrator或预先合并。主代理逐项复核并实际合入main后team_record_merge；失败以team_update_charter提供新的完整返工计划，继续MCP等待。
-兼容旧直接模式的cluster工具仍可用，详情以其schema为准。新团队路径由项目经理使用带凭据team工具；稳定requestId防重复，精确SHA和结果版本绑定审查及测试，旧记录不自动变成通过。
+constexpr auto workflow=R"workflow(# FatFishBox two-loop workflow
+Read fatfish://team/principal or team_get_prompt(principal). The principal understands the requirement, commits a complete plan with task scope, steps, review attacks, build/test commands, acceptance evidence and repair handling, and starts one manager with a real persistent goal.
+The principal must call team_wait_decisions for up to 300000 ms. Handle early events immediately and read team_get_project. Do not sleep, fill unused wait time, consume developer handoffs or take over daily scheduling.
+Tasks require name/steps/acceptance/files/dependsOn/startCondition/tests. The manager reads team_domain_context, queues all ready work with team_dispatch_ready, and handles team_next_action FIFO. Developers and repair workers must first build and test their candidates and provide successful logs. Then dispatch independent review. After review passes, the manager personally runs team_verify_candidate in the exact candidate branch and accepts only with passed=true and its verificationId. Failed checks require repair and fresh review.
+While workers or decisions remain, the manager stays in the same goal and waits exclusively through team_wait_actions for up to 300000 ms. Actionable results wake MCP immediately; do not sleep or fill the remaining time.
+Retire obsolete terminal items through team_retire_work_item, retaining history without fake repair jobs. review_evidence_pending creates a scoped decision instead of spinning on the FIFO head. Managers recapture in-worktree evidence through team_domain_action operation=cluster_capture_evidence; the principal explicitly collects external paths through team_capture_evidence. Missing files and boolean assertions cannot bypass collection.
+After all current planned items are accepted, team_finish_domain and complete the DSH goal. No integrator or preliminary merge is required. After the manager exits, the principal independently accepts, actually merges main and calls team_record_merge. Failed final acceptance requires a new complete charter/tasks plan through team_update_charter, then MCP waiting resumes.
+Legacy cluster tools remain compatible. Manager tools require project credentials; stable requestId, exact candidate SHA and resultVersion prevent duplicate dispatch and stale acceptance. Old records are never automatically converted into passing evidence.
 )workflow";
 
 File open_stream(DWORD standard_handle, const char* mode, int flags) {
@@ -93,7 +95,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
         const auto available_tools=[&] {
             auto result=principal_only?team_tools():Cluster::tools();
             if (principal_only) {
-                const std::set<std::string> allowed{"team_get_settings","team_get_prompt","team_start_project","team_get_project","team_list_projects","team_get_queue","team_wait_decisions","team_resolve_decision","team_update_charter","team_control_project","team_record_merge"};
+                const std::set<std::string> allowed{"team_get_settings","team_get_prompt","team_start_project","team_get_project","team_list_projects","team_get_queue","team_wait_decisions","team_resolve_decision","team_update_charter","team_control_project","team_record_merge","team_capture_evidence","team_retire_work_item"};
                 auto filtered=Json::array();for (auto& entry:result) if (allowed.contains(entry.at("name").get<std::string>())) filtered.push_back(std::move(entry));return filtered;
             }
             return result;
@@ -104,7 +106,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"protocolVersion",mcp_protocol_supported(version)?version:"2025-11-25"},
                 {"capabilities",{{"tools",Json::object()},{"resources",Json::object()}}},
                 {"serverInfo",{{"name","fatfishbox"},{"title","肥鱼重工"},{"version",FATFISHBOX_VERSION}}},
-                {"instructions",principal_only?"主代理先读team_get_prompt(principal)，写详细计划、启动唯一goal项目经理，调用team_wait_decisions最长五分钟，有通知立即读状态；经理完成后逐项验收合并，失败更新完整计划返工。":mcp_handoff_instructions}};
+                {"instructions",principal_only?"Read team_get_prompt(principal), commit a complete task plan, and start one persistent-goal manager. Wait only through team_wait_decisions for up to 300000 ms; handle early feedback immediately. After manager completion, independently accept and merge each item, or provide a complete repair plan.":mcp_handoff_instructions}};
             if (initialized) *initialized=true;
         } else if (method=="ping") {
             value=Json::object();
