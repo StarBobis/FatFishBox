@@ -47,7 +47,7 @@ try {
     const initialized=await call('initialize',{protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'test',version:'1'}});
     const initialization=(await initialized.json()).result;
     assert.equal(initialization.protocolVersion,'2025-11-25');
-    assert.match(initialization.instructions,/只粘贴接入说明时.*等用户给出任务/);
+    assert.match(initialization.instructions,/仅粘贴接入说明时等待任务/);
     assert.equal((await call('notifications/initialized',{},null)).status,202);
     const missingQueue=await call('tools/call',{name:'cluster_overview'},7).then(response=>response.json());
     assert.equal(missingQueue.result.structuredContent.reason,'queue_id_required');

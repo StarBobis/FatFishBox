@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(FatFishBox VERSION 0.1.3 LANGUAGES CXX RC)
+project(FatFishBox VERSION 0.1.4 LANGUAGES CXX RC)
 
 set(NATIVE_WIN_UI_SOURCE "C:/Dev/NativeWinUI" CACHE PATH "NativeWinUI source checkout")
 include(CTest)
@@ -73,6 +73,7 @@ install(TARGETS FatFishBox RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(DIRECTORY skills DESTINATION .)
 install(DIRECTORY prompts DESTINATION .)
+install(DIRECTORY docs DESTINATION .)
 
 if(BUILD_TESTING)
     add_executable(fatfish_scheduler_test tests/scheduler-test.cpp)

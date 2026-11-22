@@ -1,4 +1,4 @@
-﻿#include "diagnostics.h"
+#include "diagnostics.h"
 #include "cluster.h"
 #include "dsh.h"
 #include "dsh_history.h"
@@ -927,6 +927,14 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
         if (!local_history || local_history->cursor<prior.value("cursor",start)) throw;
         live={{"cursor",local_history->cursor},{"running",false},{"pendingInput",Json::array()},{"queue",Json::array()}};
     }
+    Json manager_goal;
+    if (prior.value("role","")=="lead" && prior.contains("goal") && !local_history) {
+        const auto view=connection->request("session/projections",{{"sessionId",prior.at("dshId")}});
+        const auto path="/values/goal"_json_pointer;
+        require(view.contains(path) && view.at(path).is_object(),"项目经理 goal 投影缺失，不能推断会话完成");
+        manager_goal=view.at(path);
+        if (manager_goal.value("phase","")=="active") live["running"]=true;
+    }
     auto cursor = live.at("cursor").get<std::int64_t>();
     const auto start = prior.at("startCursor").get<std::int64_t>();
     const auto today=midnight();
@@ -993,6 +1001,7 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
             failure.update({{"retryable",true},{"retryAfterMs",0},{"retryMode","new_request"},{"stage","submit_prompt"}});
             row.erase("startCursor");
         }
+        if (!manager_goal.is_null()) row["goal"]=manager_goal;
         row["status"] = status;
         row["cursor"] = cursor;
         if (observed && !archive) clear_dispatch_diagnostics(row);
@@ -1866,6 +1875,18 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
                 reserve(reason=="account_cooldown"?provider:"");
             }
         }
+        if (role=="lead" && input.contains("teamGoal")) {
+            stage="set_goal";
+            const auto objective=field(input,"teamGoal",12000);
+            const auto set=dsh.call("commands/execute",{{"agentId",sid},{"line","/goal "+objective},{"submittedAttachments",Json::array()}});
+            require(set.value("result",set).value("kind","")=="success","DSH 未创建项目经理 goal");
+            const auto projection=dsh.request("session/projections",{{"sessionId",sid}});
+            const auto path="/values/goal"_json_pointer;
+            require(projection.contains(path) && projection.at(path).is_object() &&
+                projection.at(path).value("phase","")=="active" && projection.at(path).value("objective","")==objective,
+                "DSH 项目经理 goal 回读校验失败");
+            row["goal"]=projection.at(path);
+        }
         stage="session_state";
         const auto live = rpc_state(dsh, row);
         row["startCursor"] = live.at("cursor");
@@ -2671,7 +2692,7 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
         if (row.contains("dispatchState")) result["dispatchState"]=dispatch_pending(row)?"unconfirmed":row.value("dispatchState","");
         if (row.contains("dispatchRetryAt")) result["dispatchRetryAt"]=row.at("dispatchRetryAt");
         if (row.contains("requestId")) result["requestId"]=row.at("requestId");
-        for (const auto* member:{"retryable","retryAfterMs","retryMode","failureStage","failure","workItemId","baseSha","resultVersion","lastMessageAt","checksManifest","evidenceManifest"})
+        for (const auto* member:{"retryable","retryAfterMs","retryMode","failureStage","failure","workItemId","baseSha","resultVersion","lastMessageAt","checksManifest","evidenceManifest","goal"})
             if (row.contains(member)) result[member]=row.at(member);
         if (row.contains("resultSource")) result["resultSource"]=row.at("resultSource");
         if (row.contains("reviewState")) result["reviewState"]=row.at("reviewState");
@@ -3412,6 +3433,10 @@ Json Cluster::invoke_impl(std::string_view tool, const Json& input,bool internal
             row=db.state.at("sessions").at(key);
         }
         require(active(row) && row.contains("startCursor"), "只能取消已派发的活动会话");
+        if (row.contains("goal")) {
+            const auto paused=dsh.call("commands/execute",{{"agentId",row.at("dshId")},{"line","/goal pause"},{"submittedAttachments",Json::array()}});
+            require(paused.value("result",paused).value("kind","")=="success","停止项目经理前暂停goal失败");
+        }
         dsh.request("session/cancel", {{"sessionId",row.at("dshId")}});
         if (row.contains("pendingPrompt")) {
             Database db(data_,true);

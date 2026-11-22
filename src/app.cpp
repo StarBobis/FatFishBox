@@ -1,4 +1,5 @@
-﻿#include "diagnostics.h"
+#include "diagnostics.h"
+#include "result_preview.h"
 #include "cluster.h"
 #include "dsh.h"
 #include "legacy.h"
@@ -1582,7 +1583,7 @@ private:
         return bottom+8;
     }
     void connection_page(float x,float right,float h) {
-        constexpr float general_height=76,dsh_height=424,mcp_height=272,team_height=410;
+        constexpr float general_height=76,dsh_height=424,mcp_height=272,team_height=351;
         const float width=right-x;
         const float about_width=std::clamp(width*.30f,158.f,310.f);
         const float column_right=right-about_width-14;
@@ -1636,16 +1637,15 @@ private:
             for (const auto& [key,pool]:settings_.at("pools").items()) if (pool.value("enabled",false))
                 options.push_back({key,title(pool,"model")+L" · "+title(pool,"provider")});
             const float half=(form-14)/2;
-            combo("team.leadPool",L"领域负责人模型",left,body+4,form,options,surface);
+            combo("team.leadPool",L"项目经理模型",left,body+4,form,options,surface);
             combo("team.developerPool",L"开发与返修模型",left,body+63,form,options,surface);
             combo("team.reviewerPool",L"独立审查模型",left,body+122,form,options,surface);
-            combo("team.integratorPool",L"集成模型",left,body+181,form,options,surface);
-            field("team.totalConcurrency",L"全团队总并发",left,body+240,half,surface);
-            field("team.developerConcurrency",L"开发并发上限",left+half+14,body+240,half,surface);
-            field("team.reviewerConcurrency",L"审查并发上限",left,body+299,half,surface);
-            label(L"模型用于新项目；并发立即约束后续派发。",left,body+359,form,12,surface,ColorToken::text_secondary);
-            button("save_team",L"保存团队方案",left,body+379,116,true,true,surface);
-            button("copy_team_setup",L"复制主代理提示词",edge-144,body+379,144,false,true,surface);
+            field("team.totalConcurrency",L"全团队总并发",left,body+181,half,surface);
+            field("team.developerConcurrency",L"开发并发上限",left+half+14,body+181,half,surface);
+            field("team.reviewerConcurrency",L"审查并发上限",left,body+240,half,surface);
+            label(L"模型用于新项目；并发立即约束后续派发。",left,body+300,form,12,surface,ColorToken::text_secondary);
+            button("save_team",L"保存团队方案",left,body+320,116,true,true,surface);
+            button("copy_team_setup",L"复制主代理提示词",edge-144,body+320,144,false,true,surface);
         });
         settings_expander("mcp",L"队列与 MCP",x,y,settings_right,mcp_height,[&](float body,const std::string& surface) {
             queue_picker(left,body+4,form,surface);
@@ -1864,7 +1864,7 @@ private:
                 label(L"失败原因",left,result_top+11,inner,17,"failure",ColorToken::status_error,true);
                 button("copy_failure",L"复制原因",right-104,result_top+6,88,false,true,"failure");
                 auto& box=add("failure_text",WidgetKind::textbox,L"",left,result_top+42,inner,height-52,"failure");
-                TextBox(TextBoxOptions{.text=failure,.read_only=true,.multiline=true,.height=height-52}).apply(box);
+                TextBox(TextBoxOptions{.text=fatfish::result_preview(failure),.read_only=true,.multiline=true,.height=height-52}).apply(box);
                 result_top+=height+12;
             }
             panel("result",{x,result_top,right,h-30});
@@ -1874,7 +1874,7 @@ private:
             if (!text.empty()) {
                 const float height=std::max(35.f,h-result_top-87);
                 auto& box=add("output",WidgetKind::textbox,L"",left,result_top+42,inner,height,"result");
-                TextBox(TextBoxOptions{.text=text,.read_only=true,.multiline=true,.height=height}).apply(box);
+                TextBox(TextBoxOptions{.text=fatfish::result_preview(text),.read_only=true,.multiline=true,.height=height}).apply(box);
             } else label(!can_read_result() && selected_.contains("reviewState")?L"对抗审查通过后可查看开发结果":
                 result_loading_?L"正在读取结果…":result_loaded_?L"当前结果没有可显示的文本":L"尚无可读取的结果",
                 left,result_top+47,inner,13,"result",ColorToken::text_secondary);
@@ -2038,7 +2038,7 @@ private:
             }
             if (name=="save_team") {
                 Json input={{"revision",team_settings_.at("revision")}};
-                for (const auto* key:{"leadPool","developerPool","reviewerPool","integratorPool"}) input[key]=narrow(fields_[std::string("team.")+key]);
+                for (const auto* key:{"leadPool","developerPool","reviewerPool"}) input[key]=narrow(fields_[std::string("team.")+key]);
                 for (const auto* key:{"totalConcurrency","developerConcurrency","reviewerConcurrency"}) {
                     const auto value=fields_[std::string("team.")+key];std::size_t end=0;const auto count=std::stoi(value,&end);
                     if (end!=value.size()) throw std::runtime_error("并发须为 1–64 的整数");input[key]=count;
