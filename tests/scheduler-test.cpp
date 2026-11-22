@@ -1,5 +1,6 @@
 #include "team_scheduler.h"
 #include "result_preview.h"
+#include "goal_projection.h"
 #include <iostream>
 #include <stdexcept>
 using fatfish::Json;
@@ -23,5 +24,14 @@ int main() {
     text[cut-1]=0xD83D;text[cut]=0xDE00;
     const auto unicode=fatfish::result_preview(text);
     require(unicode[cut-2]==L'x' && unicode[cut-1]==L'\r',"do not split a UTF16 surrogate pair");
+    const Json goal={{"id","real-goal"},{"phase","active"},{"objective"," 任务\r\n"}};
+    const Json nested={{"values",{{"goal",{{"goal",goal},{"roundsStarted",1}}}}}};
+    require(fatfish::goal_matches(fatfish::goal_snapshot(nested),"\xE3\x80\x80任务 "),"real nested wire and JavaScript trim");
+    require(fatfish::goal_matches(fatfish::goal_snapshot({{"values",{{"goal",goal}}}}),"任务"),"legacy flat host compatibility");
+    require(fatfish::goal_snapshot({{"values",{{"goal",{{"goal",nullptr}}}}}}).is_null(),"pending nested goal is not active");
+    require(!fatfish::goal_matches(fatfish::goal_snapshot(nested),"其他任务"),"never accept a different objective");
+    auto paused=goal;paused["phase"]="paused";
+    require(!fatfish::goal_matches(paused,"任务"),"paused is not a running goal");
+    require(fatfish::normalized_goal_objective("a  b")!="a b","internal whitespace remains significant");
     std::cout<<"FIFO dispatch and long Unicode result preview passed.\n";
 }

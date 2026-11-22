@@ -457,16 +457,11 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         const auto queue=text(in,"queueId",100);cluster.for_queue(queue);
         Store s(data);Json bound=nullptr;
         for (const auto& p:s.value.at("projects")) if (p.value("queueId","")==queue) {bound=project_summary(p);break;}
-        auto& modes=s.value["queueModes"];if (modes.is_null()) modes=Json::object();
-        if (in.contains("mode")) {
-            check(tool=="team_desktop_queue","队列模式只能从桌面修改");
-            const auto mode=text(in,"mode",20);check(mode=="direct" || mode=="team","未知队列执行方式");
-            check(bound.is_null() || mode=="team","此队列已有团队运行记录，不能切回直接管理");modes[queue]=mode;s.save();
-        }
-        return {{"queueId",queue},{"mode",bound.is_null()?modes.value(queue,"direct"):"team"},{"project",bound},
-            {"principalPromptVersion",4},{"historyTakeoverSupported",true},
+        // The desktop has one execution path. Old saved direct preferences no longer select a mode.
+        return {{"queueId",queue},{"mode","team"},{"project",bound},
+            {"principalPromptVersion",8},{"historyTakeoverSupported",true},
             {"nextAction",bound.is_null()?"task_authorized_then_team_start_project_same_queue":"resume_bound_project"},
-            {"guidance","请使用 team_get_prompt({role:principal}) 的 v7 规程。负责人通过 team_next_action 机械循环处理统一FIFO；结果排队，不抢占，处理本条后继续下一条。项目经理在同一goal会话持续循环，主代理每60秒读取状态。"}};
+            {"guidance","请使用 team_get_prompt({role:principal}) 的 v8 规程。负责人通过 team_next_action 机械循环处理统一FIFO；结果排队，不抢占，处理本条后继续下一条。项目经理在同一goal会话持续循环，主代理每60秒读取状态。"}};
     }
     if (tool=="team_start_project") {
         const auto request=text(in,"requestId",100),title=text(in,"title",200);
@@ -1230,7 +1225,11 @@ Json team_tools() {
         {"required",Json::array({"objective","acceptance","constraints","architecture","authority","escalation"})},{"additionalProperties",false}};
     const Json domain_spec{{"type","object"},{"properties",{{"name",text},{"mission",text},{"acceptance",text},{"dependencies",array}}},
         {"required",Json::array({"name","mission","acceptance","dependencies"})},{"additionalProperties",false}};
-    add("team_start_project","主代理提交详细计划、独立tasks和唯一项目经理定义；后台创建真实goal会话。重试复用原 requestId。",{{"requestId",text},{"queueId",text},{"title",text},{"workspace",text},{"charter",charter},{"tasks",{{"type","array"},{"items",object}}},{"domains",{{"type","array"},{"items",domain_spec},{"minItems",1},{"maxItems",1}}}},
+    const Json task_spec{{"type","object"},{"properties",{{"name",{{"type","string"},{"minLength",1},{"maxLength",200}}},
+        {"steps",{{"type","string"},{"minLength",1},{"maxLength",12000},{"description","完整操作步骤，使用一个字符串；多步用换行分隔，不传数组。"}}},
+        {"acceptance",{{"type","string"},{"minLength",1},{"maxLength",6000}}}}},
+        {"required",Json::array({"name","steps","acceptance"})},{"additionalProperties",false}};
+    add("team_start_project","主代理提交详细计划、独立tasks和唯一项目经理定义；后台创建真实goal会话。重试复用原 requestId。",{{"requestId",text},{"queueId",text},{"title",text},{"workspace",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"domains",{{"type","array"},{"items",domain_spec},{"minItems",1},{"maxItems",1}}}},
         {"requestId","title","workspace","charter","domains"});
     add("team_list_projects","桌面与续接用团队项目摘要；不要周期性读取全部历史。",Json::object(),Json::array());
     add("team_get_queue","按当前队列查执行方式与绑定的团队运行摘要；已有团队时续接，不再创建项目。",{{"queueId",text}},{"queueId"});

@@ -11,7 +11,8 @@ import {join,resolve} from 'node:path';
 const run=promisify(execFile),executable=resolve(process.argv[2]||'build/Release/FatFishBox.exe');
 const root=await mkdtemp(join(tmpdir(),'fatfish-teams-')),data=join(root,'data'),repo=join(root,'repository with spaces');
 await Promise.all([mkdir(data),mkdir(repo)]);
-const goals=new Map(),reports=new Map();
+const goals=new Map(),reports=new Map(),goalModes=new Map(),goalReads=new Map(),goalWrites=new Map();
+let nextGoalMode="delayed";
 const states=new Map(),prompts=new Map(),selected=new Map(),unavailableSessions=new Set(),failedCancellations=new Set();let number=0,child,candidate;
 const server=createServer(async(req,res)=>{
     try {
@@ -25,11 +26,27 @@ const server=createServer(async(req,res)=>{
         case 'commands/execute':{
             if(a.line.startsWith('/goal ')) {
                 if(a.line==='/goal pause') {const goal=goals.get(a.agentId);if(goal)goal.phase='paused';}
-                else goals.set(a.agentId,{id:'goal-'+a.agentId,revision:1,phase:'active',objective:a.line.slice(6)});
+                else {
+                    goalWrites.set(a.agentId,(goalWrites.get(a.agentId)||0)+1);
+                    goalModes.set(a.agentId,nextGoalMode);nextGoalMode='normal';
+                    goals.set(a.agentId,{id:'goal-'+a.agentId,revision:1,phase:'active',objective:a.line.slice(6).trim()});
+                }
             }
             value={result:{kind:'success'}};break;
         }
-        case 'session/projections':value={values:{permissions:{currentValue:'local'},goal:goals.get(a.sessionId)||null}};break;
+        case 'session/projections':{
+            let goal=goals.get(a.sessionId)||null;
+            if(goal) {
+                const reads=(goalReads.get(a.sessionId)||0)+1;goalReads.set(a.sessionId,reads);
+                const mode=goalModes.get(a.sessionId);
+                if(mode==='delayed' && reads===1) {res.writeHead(503).end('projection not ready');return;}
+                if((mode==='delayed' && reads<4)||mode==='missing') goal=null;
+                else if(mode==='mismatch') goal={...goal,objective:'A different task'};
+                else if(mode==='paused') goal={...goal,phase:'paused'};
+            }
+            // Real DSH 0.2.2-rc.5 wire shape, confirmed by a read-only live probe.
+            value={kind:'session/projections',asOfSeq:7,values:{permissions:{currentValue:'local'},goal:{goal,roundsStarted:0,createdAt:1,updatedAt:1}}};break;
+        }
         case 'session/selectModel':selected.set(a.sessionId,a.model);value={selected:a};break;
         case 'session/state':if(unavailableSessions.has(a.sessionId)){res.writeHead(503).end('fixture temporary failure');return;}value=states.get(a.sessionId);break;
         case 'session/prompt':if(!prompts.has(a.sessionId)){prompts.set(a.sessionId,a.content[0].text);states.set(a.sessionId,{cursor:2,running:true,queue:[],pendingInput:[]});}value={accepted:true};break;
@@ -78,10 +95,12 @@ try {
     const config={revision:initial.revision,leadPool:pools.lead,developerPool:pools.dev,reviewerPool:pools.review,totalConcurrency:4,developerConcurrency:2,reviewerConcurrency:2};
     await tool('team_update_settings',{...config,totalConcurrency:1},true);
     await tool('team_update_settings',config); // No integrator pool required.
-    const charter={objective:'Implement and independently verify the fixture',acceptance:'Review and actual branch tests',constraints:'Preserve data',architecture:'One manager',authority:'Local worktrees',escalation:'Real blocking failures'};
+    const charter={objective:'\u3000 Implement and independently verify the fixture \r\n',acceptance:'Review and actual branch tests',constraints:'Preserve data',architecture:'One manager',authority:'Local worktrees',escalation:'Real blocking failures'};
     const input={requestId:'loop-project',title:'Two-loop fixture',workspace:repo,charter,tasks:[{name:'Feature',steps:'Change file, review, run branch tests',acceptance:'Tests pass'}],domains:[{name:'Manager',mission:'Run the plan',acceptance:'Every task accepted',dependencies:[]}]};
     await tool('team_start_project',{...input,requestId:'multi',domains:[...input.domains,{...input.domains[0],name:'Other'}]},true);
     await tool('team_start_project',{...input,requestId:'over-plan',tasks:Array.from({length:4},()=>input.tasks[0])},true);
+    const defaultQueue=(await tool('cluster_create_queue',{name:'Default team queue',requestId:'default-team'})).queueId;
+    assert.equal((await tool('team_get_queue',{queueId:defaultQueue})).mode,'team','unbound queues default to team collaboration');
     const started=await tool('team_start_project',input),pid=started.projectId;
     assert.equal((await tool('team_start_project',input)).projectId,pid);
     const leader=await until(async()=>Object.values((await disk()).projects[pid].jobs).find(j=>j.role==='lead'&&j.sessionId&&j.state==='running'),'single manager');
@@ -93,6 +112,12 @@ try {
     const call=(name,args={},fail=false)=>tool(name,{...authz,...args},fail);
     assert.equal((await call('team_get_contract')).version,8);
     const listed=(await rpc('tools/list')).tools;
+    const taskSchema=listed.find(t=>t.name==='team_start_project').inputSchema.properties.tasks.items;
+    assert.equal(taskSchema.properties.steps.type,'string');
+    assert.deepEqual(taskSchema.required,['name','steps','acceptance']);
+    assert.equal(goalWrites.get(await remote(leader)),1,'projection retries never replay /goal creation');
+    assert.ok(goalReads.get(await remote(leader))>=4,'delayed nested projection was polled');
+    assert.equal(p.jobs[leader.jobId].goal.objective,charter.objective.trim(),'only edge whitespace normalization');
     const waitSchema=listed.find(t=>t.name==='team_wait_decisions').inputSchema;
     assert.equal(waitSchema.properties.timeoutMs.maximum,60000);
     assert.equal(waitSchema.properties.timeoutMs.default,60000);
@@ -171,6 +196,21 @@ try {
     assert.equal((await tool('team_get_project',{projectId:pid})).charterVersion,2);
     await tool('team_control_project',{projectId:pid,requestId:'cancel',action:'cancel'});
     await until(async()=>Object.values((await disk()).projects[pid].jobs).every(j=>['succeeded','failed','cancelled','interrupted'].includes(j.state)),'cancel all sessions');
+    // A missing, wrong or paused goal cannot start a manager prompt.
+    for(const mode of ['missing','mismatch','paused']) {
+        nextGoalMode=mode;
+        const failedProject=await tool('team_start_project',{...input,requestId:`goal-${mode}`});
+        const failedManager=await until(async()=>Object.values((await disk()).projects[failedProject.projectId].jobs).find(j=>j.role==='lead'&&j.state==='failed'&&j.sessionId),`goal ${mode} bounded failure`);
+        const failedNative=(await native()).sessions[failedManager.sessionId];
+        assert.equal(failedNative.failureStage,'set_goal');
+        assert.equal(failedNative.dispatch.goalCleanup.pauseConfirmed,true);
+        assert.equal(failedNative.dispatch.goalCleanup.cancelConfirmed,true);
+        assert.equal(goals.get(failedNative.dshId).phase,'paused','failed setup must not orphan an armed goal');
+        assert.equal(prompts.has(failedNative.dshId),false,'unverified goal never receives task prompt');
+        assert.equal(goalWrites.get(failedNative.dshId),1,'never duplicate goal command');
+        assert.equal(goalReads.get(failedNative.dshId),20,'verification stops after bounded reads');
+        await tool('team_control_project',{projectId:failedProject.projectId,requestId:`cancel-${mode}`,action:'cancel'});
+    }
     console.log('Two-loop behavior passed: one real goal, isolated branches, failed review/repair/new review, actual failed/passed tests, acceptance without integrator, principal merge, durable rework and cancellation.');
 } finally {
     await close();await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true});

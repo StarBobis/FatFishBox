@@ -115,3 +115,9 @@ node tests/mcp-http-smoke.mjs "out/肥鱼重工/FatFishBox.exe"
 `team_verify_candidate`由经理调用，在独立候选分支启动真实测试进程，记录退出码、日志、超时和源码变化，返回verificationId；accept必须引用同一SHA的通过验证。`team_record_merge`只在经理completed后供主代理登记实际main合并，核对候选祖先关系。新项目`domains`恰好一项；`tasks`提供name/steps/acceptance，数量不超过总并发减一个经理。
 
 长结果详情安全显示前段，保留原文供“复制结果/复制原因”完整复制；不会再触发多行文本框65536 UTF16单元上限。
+
+## 0.1.5：goal 投影兼容修复
+
+实际 DSH 投影路径为 `values.goal.goal`；FatFishBox 统一解析该嵌套快照，并兼容旧扁平投影。创建 goal 只发送一次命令，最多20次只读回查、间隔100毫秒，总连接期限5秒；瞬时可重试传输失败计入期限。只按 DSH 的 JavaScript trim 规则忽略目标首尾空白，目标内容不一致或非active仍拒绝派发，并记录观察到的phase及匹配状态。运行中状态刷新使用相同解析器。`team_start_project.tasks` schema明确要求name、steps、acceptance，steps是单个字符串，多步用换行分隔。
+
+会话页默认团队协作，不再显示执行方式选择器。项目经理任务直接显示在团队协作状态区域；暂停执行、领域进度、负责人显隐及手动同步入口已移除，定时同步机制保持不变。

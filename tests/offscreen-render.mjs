@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, mkdtemp, readFile, rm,writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm,writeFile,mkdir,copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -47,9 +47,21 @@ try {
         runtimeErrors:{fixture:{operation:'observe_session',scope:'fixture-session',message:'DSH 暂时不可用，正在自动重试',lastFailureAt:Date.now(),retryAt:Date.now()+2000}},
         domains:{feature:{domainId:'feature',name:'功能实现',mission:'按验收条件完成开发与独立审查',state:'waiting'}},jobs:{},
         decisions:{question:{decisionId:'question',state:'open',question:'公共接口如何保持兼容？',recommendation:'保留旧格式读取'}}};
+    const managerId='render-manager',workerId='render-worker';
+    state.sessions[managerId]={id:managerId,queueId,title:'项目经理 · 完成页面修复计划',workspace:folder,role:'lead',teamProjectId:projectId,
+        status:'running',created:1,updated:2,processed:false,model:'经理模型',provider:'fixture'};
+    state.sessions[workerId]={id:workerId,queueId,title:'修复列表页面布局',workspace:folder,role:'developer',teamProjectId:projectId,
+        status:'running',created:1,updated:2,processed:false,model:'开发模型',provider:'fixture'};
+    team.projects[projectId].jobs={lead:{jobId:'lead',domainId:'feature',role:'lead',state:'running',sessionId:managerId,created:1}};
+    await writeFile(statePath,JSON.stringify(state));
     await writeFile(teamPath,JSON.stringify(team));
     for(const [width,height,dpi] of [[740,520,96],[1100,720,96],[925,650,120]]) {
-        await run(executable,['--render-offscreen','sessions',join(folder,`queue-team-${dpi}-${width}.png`),...[width,height,dpi].map(String)],{env,windowsHide:true,timeout:15000});
+        const preview=join(folder,`queue-team-${dpi}-${width}.png`);
+        await run(executable,['--render-offscreen','sessions',preview,...[width,height,dpi].map(String)],{env,windowsHide:true,timeout:15000});
+        if(process.env.FATFISH_RENDER_EVIDENCE) {
+            await mkdir(process.env.FATFISH_RENDER_EVIDENCE,{recursive:true});
+            await copyFile(preview,join(process.env.FATFISH_RENDER_EVIDENCE,`queue-team-${dpi}-${width}.png`));
+        }
     }
     const invalid = join(folder, 'invalid.png');
     await assert.rejects(run(executable, ['--render-offscreen', 'unknown', invalid],

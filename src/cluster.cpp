@@ -1,6 +1,7 @@
 #include "diagnostics.h"
 #include "cluster.h"
 #include "dsh.h"
+#include "goal_projection.h"
 #include "dsh_history.h"
 #include "legacy.h"
 #include "state_file.h"
@@ -930,9 +931,8 @@ Json refresh(const fs::path& data,const std::string& key,int timeout_ms=15000,bo
     Json manager_goal;
     if (prior.value("role","")=="lead" && prior.contains("goal") && !local_history) {
         const auto view=connection->request("session/projections",{{"sessionId",prior.at("dshId")}});
-        const auto path="/values/goal"_json_pointer;
-        require(view.contains(path) && view.at(path).is_object(),"项目经理 goal 投影缺失，不能推断会话完成");
-        manager_goal=view.at(path);
+        manager_goal=goal_snapshot(view);
+        require(!manager_goal.is_null(),"项目经理 goal 投影缺失，不能推断会话完成");
         if (manager_goal.value("phase","")=="active") live["running"]=true;
     }
     auto cursor = live.at("cursor").get<std::int64_t>();
@@ -1877,15 +1877,33 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
         }
         if (role=="lead" && input.contains("teamGoal")) {
             stage="set_goal";
-            const auto objective=field(input,"teamGoal",12000);
-            const auto set=dsh.call("commands/execute",{{"agentId",sid},{"line","/goal "+objective},{"submittedAttachments",Json::array()}});
+            const auto objective=normalized_goal_objective(field(input,"teamGoal",12000));
+            require(!objective.empty(),"项目经理goal目标不可为空");
+            // One mutation only. Projection propagation is allowed a bounded read-only wait.
+            const Dsh goal_connection(auth,1000,5000);
+            const auto set=goal_connection.call("commands/execute",{{"agentId",sid},{"line","/goal "+objective},{"submittedAttachments",Json::array()}});
             require(set.value("result",set).value("kind","")=="success","DSH 未创建项目经理 goal");
-            const auto projection=dsh.request("session/projections",{{"sessionId",sid}});
-            const auto path="/values/goal"_json_pointer;
-            require(projection.contains(path) && projection.at(path).is_object() &&
-                projection.at(path).value("phase","")=="active" && projection.at(path).value("objective","")==objective,
-                "DSH 项目经理 goal 回读校验失败");
-            row["goal"]=projection.at(path);
+            Json observed;std::string transient;
+            int attempts=0;
+            for (;attempts<20;++attempts) {
+                try {
+                    observed=goal_snapshot(goal_connection.request("session/projections",{{"sessionId",sid}}));
+                    transient.clear();
+                    if (goal_matches(observed,objective)) break;
+                } catch (const DshError& error) {
+                    if (!dsh_error_diagnostics(error).value("retryable",false)) throw;
+                    transient=error.code;
+                    if (error.code=="deadline") break;
+                }
+                if (attempts<19) Sleep(100);
+            }
+            if (!goal_matches(observed,objective)) {
+                const auto phase=observed.is_null()?"missing":observed.value("phase","missing");
+                const bool matches=!observed.is_null() && normalized_goal_objective(observed.at("objective").get<std::string>())==objective;
+                throw std::runtime_error("DSH 项目经理 goal 回读校验失败（已有限轮询；phase="+phase+
+                    ", objectiveMatches="+(matches?std::string("true"):std::string("false"))+", transport="+(transient.empty()?"none":transient)+"）");
+            }
+            row["goal"]=observed;
         }
         stage="session_state";
         const auto live = rpc_state(dsh, row);
@@ -1921,10 +1939,31 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
         row.erase("pendingPrompt");
         if (!rejected.empty()) row["poolFallbacks"]=rejected;
     } catch (const std::exception& e) {
+        // /goal may arm a round before the task prompt. A rejected setup must
+        // not leave an orphan manager running in its newly created session.
+        Json goal_cleanup;
+        if (stage=="set_goal" && row.contains("dshId")) {
+            goal_cleanup={{"pauseConfirmed",false},{"cancelConfirmed",false}};
+            const Dsh cleanup(auth,1000,3500);
+            try {
+                const auto paused=cleanup.call("commands/execute",{{"agentId",row.at("dshId")},{"line","/goal pause"},{"submittedAttachments",Json::array()}});
+                goal_cleanup["pauseConfirmed"]=paused.value("result",paused).value("kind","")=="success";
+            } catch (const std::exception&) {}
+            try {
+                cleanup.request("session/cancel",{{"sessionId",row.at("dshId")}});
+                const auto state=cleanup.request("session/state",{{"sessionId",row.at("dshId")}});
+                goal_cleanup["cancelConfirmed"]=!state.value("running",true) && state.value("queue",Json::array()).empty() && state.value("pendingInput",Json::array()).empty();
+            } catch (const std::exception&) {}
+        }
         row["status"] = may_have_dispatched ? "unknown" : "failed";
         row["dispatchState"] = may_have_dispatched ? "unconfirmed" : "failed";
         row["error"] = e.what();
         row["dispatch"]={{"stage",stage},{"diagnostics",diagnostics},{"mayHaveDispatched",may_have_dispatched}};
+        if (!goal_cleanup.is_null()) {
+            row["dispatch"]["goalCleanup"]=goal_cleanup;
+            if (goal_cleanup.at("pauseConfirmed")!=true || goal_cleanup.at("cancelConfirmed")!=true)
+                row["error"]=row.at("error").get<std::string>()+"；新建goal的停止状态未完全确认，须核对该DSH会话";
+        }
         row["failureStage"]=stage;
         row["retryMode"]=may_have_dispatched?"same_request":"new_request";
         row["retryable"]=may_have_dispatched;

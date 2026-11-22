@@ -688,7 +688,7 @@ private:
     Json running_=Json::array(), pending_=Json::array(), processed_=Json::array();
     Json settings_=Json::object(), overview_=Json::object(), selected_;
     Json team_settings_=Json::object(),queue_team_=Json::object();
-    bool queue_progress_expanded_=false,show_leads_=false,compact_completed_=false;
+    bool compact_completed_=false;
     Json dsh_profiles_=Json::object(), detected_dsh_=Json::array();
     std::string active_dsh_profile_, draft_dsh_profile_;
     std::wstring detected_auth_;
@@ -778,11 +778,10 @@ private:
     void show_tray_menu(POINT point) {
         const auto menu=CreatePopupMenu();
         if (!menu) return;
-        enum Command { open=1, sync, copy, settings, hide, exit };
+        enum Command { open=1, copy, settings, hide, exit };
         const auto ready=MF_STRING|(busy_?MF_GRAYED:MF_ENABLED);
         AppendMenuW(menu,MF_STRING,open,L"打开肥鱼重工");
         SetMenuDefaultItem(menu,open,FALSE);
-        AppendMenuW(menu,ready,sync,L"同步会话");
         AppendMenuW(menu,MF_STRING|(current_queue_.empty()?MF_GRAYED:MF_ENABLED),copy,L"复制接入说明");
         AppendMenuW(menu,ready,settings,L"设置");
         AppendMenuW(menu,MF_STRING|(in_tray_?MF_GRAYED:MF_ENABLED),hide,L"进入托盘");
@@ -794,7 +793,6 @@ private:
         PostMessageW(window,WM_NULL,0,0);
         switch (selected) {
         case open: restore_window(); break;
-        case sync: restore_window(); nav("sessions"); refresh_sessions_automatically(true); break;
         case copy:
             try { copy_agent_setup(); }
             catch (const std::exception& error) { fatfish::diagnostics::caught(); restore_window(); notice_=widen(error.what()); redraw(); }
@@ -867,11 +865,6 @@ private:
         else if (change.key=="dshProfile") {
             select_dsh_profile(change.new_value);
             refresh_presets();
-            redraw();
-        }
-        else if (change.key=="queueMode") {
-            try {queue_team_=cluster_.invoke("team_desktop_queue",{{"queueId",current_queue_},{"mode",change.new_value}});fields_[change.key]=widen(queue_team_.at("mode").get<std::string>());}
-            catch (const std::exception& error) {fatfish::diagnostics::caught();notice_=widen(error.what());fields_[change.key]=widen(queue_team_.value("mode","direct"));}
             redraw();
         }
         else fields_[change.key]=widen(change.new_value);
@@ -1037,27 +1030,8 @@ private:
         return copied;
     }
     void copy_agent_setup() {
-        queue_team_=cluster_.invoke("team_get_queue",{{"queueId",current_queue_}});
-        if (queue_team_.value("mode","direct")=="team") {copy_team_setup(true);return;}
-        const auto queue=std::ranges::find_if(queues_,[&](const Json& row){return row.at("queueId")==current_queue_;});
-        if (queue==queues_.end()) throw std::runtime_error("请先选择工作队列");
-        std::wstring setup=L"肥鱼重工已启动。请直接使用客户端里的 fatfishbox MCP 工具。";
-        if (http_) {
-            setup+=L"如果工具列表还没有 fatfishbox，请通过 Streamable HTTP 连接 "+
-                widen(http_->url())+L"，无需认证。";
-        } else {
-            std::wstring executable(32768,L'\0');
-            const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
-            if (!length || length>=executable.size()) throw std::runtime_error("无法获取肥鱼重工程序路径");
-            executable.resize(length);
-            setup+=L"本机 HTTP 未启动。可将「"+executable+L"」以 --mcp 参数注册为 stdio 服务。";
-        }
-        const auto queue_id=widen(current_queue_);
-        setup+=L"\n\n当前工作队列："+title(*queue,"name")+L"\nqueueId: "+queue_id+
-            L"\n用户指示在这个队列中工作时，派发和后续交接都使用此 queueId。\n\n";
-        setup+=widen(fatfish::mcp_handoff_instructions);
-        notice_=copy_text(setup)?L"已复制接入说明，粘贴给 Agent 即可":L"剪贴板暂不可用";
-        redraw();
+        if (current_queue_.empty()) throw std::runtime_error("请先选择工作队列");
+        copy_team_setup(true);
     }
     void load_team_settings() {
         team_settings_=cluster_.invoke("team_get_settings");
@@ -1093,7 +1067,7 @@ private:
         if (current_queue_==queue) return;
         current_queue_=cluster_.invoke("cluster_desktop_queue",{{"queueId",queue}}).at("queueId").get<std::string>();
         fields_["queueId"]=widen(current_queue_);
-        queue_progress_expanded_=false;viewport(List::teams).offset=0;
+        viewport(List::teams).offset=0;
         viewport(List::running).offset=0;
         viewport(List::pending).offset=0;
         viewport(List::processed).offset=0;
@@ -1110,7 +1084,6 @@ private:
     void apply_sessions(Json& snapshot) {
         if (snapshot.at("queueId")!=current_queue_) return;
         queue_team_=snapshot.value("teamQueue",Json::object());
-        fields_["queueMode"]=widen(queue_team_.value("mode","direct"));
         queues_=std::move(snapshot.at("queues"));
         const auto replace=[&](List list,Json& rows,const char* key) {
             auto& next=snapshot.at(key);
@@ -1355,10 +1328,10 @@ private:
         }
         return widen(provider);
     }
-    void session_section(List list,const Json& rows,float x,float y,float right,float bottom) {
-        const bool running=list==List::running;
+    void session_section(List list,const Json& rows,float x,float y,float right,float bottom,const std::wstring& heading=L"进行中") {
+        const bool running=list==List::running || list==List::teams;
         const bool processed=list==List::processed;
-        const std::string surface=running?"running":"completed";
+        const std::string surface=list==List::teams?"queue_team":running?"running":"completed";
         const float left=x+16, table_right=right-32;
         const float width=table_right-left;
         const bool time_column=width>=650;
@@ -1374,7 +1347,7 @@ private:
         panel(surface,{x,y,right,bottom});
         const int start=list_start(list,surface,{x+8,y+61,right-7,bottom-8},total,capacity,
             running?L"滚动进行中的会话":processed?L"滚动已确认的会话":L"滚动待处理的会话");
-        if (running) label(L"进行中",left,y+11,width-125,17,surface,ColorToken::text_primary,true);
+        if (running) label(heading,left,y+11,width-125,17,surface,ColorToken::text_primary,true);
         else {
             const auto headers=completed_tabs_.measure_headers(width-125,[](std::wstring_view name){return 15.f*float(name.size());});
             const auto first=model_.ui.widgets.size();
@@ -1424,21 +1397,9 @@ private:
     void session_page(float x,float right,float h) {
         const auto queue_width=std::min(350.f,(right-x)*.40f);
         queue_picker(x,57,queue_width);
-        combo("queueMode",L"执行方式",x+queue_width+12,57,140,{{"direct",L"直接管理"},{"team",L"团队协作"}});
-        button("copy_agent_setup",queue_team_.value("mode","direct")=="team"?L"复制主代理提示词":L"复制接入说明",right-144,81,144,false,!current_queue_.empty());
-        std::wstring sync_state;
-        auto color=ColorToken::text_secondary;
-        if (sessions_worker_.joinable()) sync_state=L"正在同步会话…";
-        else if (!sessions_error_.empty()) {sync_state=L"同步失败 · "+sessions_error_;color=ColorToken::status_warning;}
-        else if (!sessions_timer_ready_) {sync_state=L"自动同步不可用";color=ColorToken::status_warning;}
-        else if (!session_sync_at_) sync_state=L"等待首次同步";
-        else {
-            sync_state=L"最近同步 "+local_stamp(session_sync_at_,L"%H:%M:%S");
-            if (session_live_stale_) {sync_state+=L" · "+std::to_wstring(session_live_stale_)+L" 条实时状态未确认";color=ColorToken::status_warning;}
-            else if (session_live_checked_) sync_state+=L" · 已校验实时状态";
-        }
-        label(std::move(sync_state),right-418,27,302,12,"root",color);
-        button("sync",L"同步会话",right-104,20,104);
+        button("copy_agent_setup",L"复制主代理提示词",right-144,81,144,false,!current_queue_.empty());
+        if (!sessions_error_.empty()) label(L"同步失败 · "+sessions_error_,right-340,27,340,12,"root",ColorToken::status_warning);
+        visible_sessions_.clear();
         const auto usage=overview_.value("usage",Json::object());
         const auto total=usage.value("today",Json::object());
         const auto input=total.value("uncachedInputTokens",0.0), read=total.value("cacheReadTokens",0.0);
@@ -1453,43 +1414,31 @@ private:
             {L"今日未缓存输入",amount(input)},{L"今日输出",amount(output)},
             {L"今日缓存读取",amount(read)},{L"今日缓存命中",billed>0?fixed3(read*100/billed)+L"%":L"—"}
         }};
-        const bool team_mode=queue_team_.value("mode","direct")=="team";
-        panel("usage",{x,121,right,team_mode?185.f:221.f});
+        panel("usage",{x,121,right,185.f});
         const float usable=right-x-32, first=usable*.29f, cell=(usable-first)/4;
-        const std::array<std::pair<const wchar_t*,std::size_t>,2> counts{{
-            {L"进行中",running_.size()},{L"已完成",pending_.size()+processed_.size()}
-        }};
-        const float count_width=usable/4;
-        for (std::size_t i=0;!team_mode && i<counts.size();++i) {
-            const auto& [name,count]=counts[i];
-            const float left=x+16+float(i)*count_width;
-            label(name,left,129,count_width-8,12,"usage",ColorToken::text_secondary);
-            label(std::to_wstring(count),left,146,count_width-8,15,"usage",ColorToken::text_primary,true);
-        }
         for (std::size_t i=0;i<values.size();++i) {
             const float left=x+16+(i?first+float(i-1)*cell:0);
             const float width=(i?cell:first)-8;
-            label(values[i].first,left,team_mode?133.f:174.f,width,12,"usage",ColorToken::text_secondary);
-            label(values[i].second,left,team_mode?155.f:193.f,width,15,"usage",i?ColorToken::text_primary:ColorToken::accent_primary,true);
+            label(values[i].first,left,133.f,width,12,"usage",ColorToken::text_secondary);
+            label(values[i].second,left,155.f,width,15,"usage",i?ColorToken::text_primary:ColorToken::accent_primary,true);
         }
-        float start=team_mode?198.f:234.f;
+        float start=198.f;
         constexpr float gap=12;
         const auto team=queue_team_.value("project",Json());
         if (team.is_object()) {
-            const float panel_height=queue_progress_expanded_?std::clamp((h-264)*.45f,96.f,260.f):80.f;
+            const float panel_height=std::clamp((h-264)*.28f,110.f,170.f);
             queue_team_panel(team,x,start,right,start+panel_height);
             start+=panel_height+gap;
-        } else if (queue_team_.value("mode","direct")=="team") {
+        } else {
             panel("queue_team_hint",{x,start,right,start+54});
             label(L"已选择团队协作。复制主代理提示词并描述任务，团队将在此队列中启动。",x+16,start+15,right-x-32,13,"queue_team_hint",ColorToken::text_secondary);
             start+=66;
         }
-        const auto visible=[&](const Json& rows) {Json out=Json::array();for (const auto& row:rows) if (show_leads_ || row.value("role","")!="lead") out.push_back(row);return out;};
+        const auto visible=[&](const Json& rows) {Json out=Json::array();for (const auto& row:rows) if (row.value("role","")!="lead") out.push_back(row);return out;};
         const auto active_rows=visible(running_),pending_rows=visible(pending_),processed_rows=visible(processed_);
         const float tail=h-30, available=tail-start-gap;
         const float ideal=71+row_height*static_cast<float>(std::clamp(active_rows.size(),std::size_t{1},std::size_t{5}));
         const float active_height=std::min(ideal,std::floor(available*.47f));
-        visible_sessions_.clear();
         const bool show_processed=completed_tabs_.selected()=="processed";
         if (available<210) {
             button("sessions.active",L"进行中",x,start,92,!compact_completed_);
@@ -1512,51 +1461,16 @@ private:
         }
     }
     void queue_team_panel(const Json& p,float x,float top,float right,float bottom) {
-        const auto& progress=p.at("progress");
-        panel("queue_team",{x,top,right,bottom});
-        const std::map<std::string,std::wstring> states{{"starting",L"启动中"},{"running",L"执行中"},{"paused",L"已暂停"},{"cancelled",L"已取消"},{"completed",L"成果待主代理验收"}};
+        const std::map<std::string,std::wstring> states{{"starting",L"启动中"},{"running",L"执行中"},{"finishing",L"等待经理结束"},
+            {"paused",L"已暂停"},{"cancelled",L"已取消"},{"completed",L"成果待主代理验收"}};
         const auto state=p.at("status").get<std::string>();
-        const auto runtime_errors=p.value("runtimeErrors",Json::object());
-        label(L"团队协作 · "+(states.contains(state)?states.at(state):widen(state))+
-            (runtime_errors.empty()?L"":L" · 后台异常 "+std::to_wstring(runtime_errors.size())),x+16,top+8,right-x-212,15,"queue_team");
-        label(L"领域 "+std::to_wstring(progress.at("completedDomains").get<int>())+L" / "+std::to_wstring(progress.at("totalDomains").get<int>())+
-            L"    执行 "+std::to_wstring(progress.at("runningJobs").get<int>())+L"    排队 "+std::to_wstring(progress.at("queuedJobs").get<int>())+
-            L"    待决策 "+std::to_wstring(p.at("decisions").size())+
-            (p.contains("backlog")?L"    交接余 "+std::to_wstring(p.at("backlog").value("pending",0)):L""),x+16,top+40,right-x-140,12,"queue_team");
-        button("team.pause",state=="paused"?L"恢复执行":L"暂停执行",right-192,top+7,88,false,state=="running" || state=="paused","queue_team");
-        button("team.expand",queue_progress_expanded_?L"收起进度":L"领域进度",right-96,top+7,80,false,true,"queue_team");
-        button("team.leads",show_leads_?L"隐藏负责人":L"显示负责人",right-112,top+41,96,false,true,"queue_team");
-        if (!queue_progress_expanded_) return;
-        const float body=top+80,content=static_cast<float>(p.at("domains").size())*66+static_cast<float>(p.at("decisions").size())*66+static_cast<float>(runtime_errors.size())*88+8;
-        auto& view=viewport(List::teams);view.bounds={x,body+title_bar_.height(),right,bottom+title_bar_.height()};
-        view.maximum=std::max(0.f,content-(bottom-body))/row_height;view.offset=std::clamp(view.offset,0.0,view.maximum);
-        panel("teams.viewport",{x,body,right-16,bottom},SurfaceVisual::transparent);model_.ui.surfaces.back().scroll=static_cast<float>(view.offset)*row_height;
-        if (view.maximum>0) {
-            auto& bar=ScrollBar({.label=L"滚动领域进度",.maximum=view.maximum,.value=view.offset,.viewport=(bottom-body)/row_height,.length=bottom-body}).append(model_,"root",view.key);
-            bar.area=WidgetArea::absolute;bar.bounds={right-14,view.bounds.top,right,view.bounds.bottom};
-        }
-        float y=body+2;const auto width=right-x-40;
-        for (const auto& failure:runtime_errors) {
-            const std::map<std::string,std::wstring> operations{{"create_queue",L"创建队列"},{"refresh_sessions",L"同步会话"},
-                {"notify_policy",L"通知负责人"},{"observe_session",L"核对会话"},{"cancel_session",L"取消会话"},
-                {"mark_receipt",L"登记回执"},{"backlog_snapshot",L"核对积压"},{"priority_results",L"读取结果"},{"domain_worklist",L"更新领域待办"}};
-            const auto operation=failure.value("operation","");
-            label(L"后台重试 · "+(operations.contains(operation)?operations.at(operation):widen(operation))+L" · "+local_stamp(failure.value("lastFailureAt",0LL)),x+16,y,width,13,"teams.viewport",ColorToken::status_warning);
-            label(title(failure,"message"),x+16,y+25,width,12,"teams.viewport",ColorToken::text_secondary);
-            label(L"关联："+title(failure,"scope")+L"    重试时间："+local_stamp(failure.value("retryAt",0LL)),x+16,y+49,width,11,"teams.viewport",ColorToken::text_tertiary);
-            y+=88;
-        }
-        for (const auto& d:p.at("domains")) {
-            const std::map<std::string,std::wstring> phases{{"pending",L"等待依赖"},{"working",L"处理中"},{"waiting",L"等待执行结果"},{"decision",L"等待主代理决策"},{"completed",L"已完成"}};
-            const auto phase=d.at("state").get<std::string>();
-            label(title(d,"name")+L" · "+(phases.contains(phase)?phases.at(phase):widen(phase)),x+16,y,width,14,"teams.viewport");
-            label(d.contains("summary")?title(d,"summary"):title(d,"mission"),x+16,y+25,width,12,"teams.viewport",ColorToken::text_secondary);
-            y+=66;
-        }
-        for (const auto& decision:p.at("decisions")) {
-            label(L"待决策 · "+title(decision,"question"),x+16,y,width,14,"teams.viewport",ColorToken::status_warning);
-            label(L"推荐："+title(decision,"recommendation"),x+16,y+25,width,12,"teams.viewport",ColorToken::text_secondary);y+=66;
-        }
+        const auto errors=p.value("runtimeErrors",Json::object());
+        auto heading=L"团队协作 · "+(states.contains(state)?states.at(state):widen(state));
+        if (!errors.empty()) heading+=L" · 后台异常 "+std::to_wstring(errors.size());
+        Json managers=Json::array();std::set<std::string> seen;
+        for (const auto* rows:{&running_,&pending_,&processed_}) for (const auto& row:*rows)
+            if (row.value("role","")=="lead" && seen.insert(row.at("id").get<std::string>()).second) managers.push_back(row);
+        session_section(List::teams,managers,x,top,right,bottom,heading);
     }
     static constexpr float settings_top=64;
     float settings_expander(const std::string& section,std::wstring name,float x,float y,float right,float content_height,
@@ -1660,7 +1574,7 @@ private:
             label(http_?L"本机 MCP 正在监听":http_error_,left,body+190,form,12,surface,
                 http_?ColorToken::status_success:ColorToken::status_error);
             label(http_?widen(http_->url()):L"stdio · FatFishBox.exe --mcp",left,body+210,form,13,surface);
-            button("copy_agent_setup",L"复制接入说明",edge-128,body+231,128,true,!current_queue_.empty(),surface);
+            button("copy_agent_setup",L"复制主代理提示词",edge-128,body+231,128,true,!current_queue_.empty(),surface);
         });
 
         const float about_left=right-about_width;
@@ -2029,13 +1943,7 @@ private:
             if (name=="refresh_presets") {refresh_presets();return;}
             if (name=="copy_agent_setup") {copy_agent_setup();return;}
             if (name=="copy_team_setup") {copy_team_setup();return;}
-            if (name=="team.expand") {queue_progress_expanded_=!queue_progress_expanded_;redraw();return;}
-            if (name=="team.leads") {show_leads_=!show_leads_;redraw();return;}
             if (name=="sessions.active" || name=="sessions.completed") {compact_completed_=name=="sessions.completed";redraw();return;}
-            if (name=="team.pause") {
-                const auto p=queue_team_.value("project",Json());if (!p.is_object()) return;
-                call("team_control_project",{{"projectId",p.at("projectId")},{"requestId",fatfish::id()},{"action",p.at("status")=="paused"?"resume":"pause"}},[this](Json){queue_team_=cluster_.invoke("team_get_queue",{{"queueId",current_queue_}});});return;
-            }
             if (name=="save_team") {
                 Json input={{"revision",team_settings_.at("revision")}};
                 for (const auto* key:{"leadPool","developerPool","reviewerPool"}) input[key]=narrow(fields_[std::string("team.")+key]);
@@ -2099,9 +2007,7 @@ private:
                 return;
             }
             if (name=="read_row") {read_detail_result();return;}
-            if (name=="sync") {
-                refresh_sessions_automatically(true);
-            } else if (name=="detect_dsh") {
+            if (name=="detect_dsh") {
                 detect_dsh_profiles();
             } else if (name=="authorize_dsh_desktop") {
                 authorize_desktop();
