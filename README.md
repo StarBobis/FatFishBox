@@ -112,7 +112,7 @@ node tests/mcp-http-smoke.mjs "out/肥鱼重工/FatFishBox.exe"
 
 项目经理启动前通过DSH `/goal`创建目标，并读取`session/projections.values.goal`校验active及objective。goal运行期间的轮次间隙仍显示running；经理逐项验收后项目进入finishing，等goal结束及经理退出才completed。未完成而goal退出会报告真实异常，不自动重建经理。宿主自身的goal轮次上限仍然有效。
 
-`team_verify_candidate`由经理调用，在独立候选分支启动真实测试进程，记录退出码、日志、超时和源码变化，返回verificationId；accept必须引用同一SHA的通过验证。`team_record_merge`只在经理completed后供主代理登记实际main合并，核对候选祖先关系。新项目`domains`恰好一项；`tasks`提供name/steps/acceptance，数量不超过总并发减一个经理。
+`team_verify_candidate`由经理调用，在独立候选分支启动真实测试进程，记录退出码、日志、超时和源码变化，返回verificationId；accept必须引用同一SHA的通过验证。`team_record_merge`只在经理completed后供主代理登记实际main合并，核对候选祖先关系。新项目`domains`恰好一项；`tasks`提供name/steps/acceptance/files/dependsOn/startCondition/tests，数量不超过总并发减一个经理。
 
 长结果详情安全显示前段，保留原文供“复制结果/复制原因”完整复制；不会再触发多行文本框65536 UTF16单元上限。
 
@@ -125,3 +125,11 @@ node tests/mcp-http-smoke.mjs "out/肥鱼重工/FatFishBox.exe"
 ## 0.1.6：项目经理首次执行的职责与凭据
 
 激活goal前先生成完整manager-bootstrap.md（规程、授权、任务计划、工具凭据），并记录激活前的session cursor。goal首轮明确项目经理职责，第一步读取该文档并派发开发；不再随后排队发送启动prompt。凭据保留在本地启动文档，不放进goal目标或投影摘要。开发/审查/修复会话仍使用原来的单次prompt派发。历史失败经理不再阻断新一轮经理的正常完成。
+
+## 0.1.7：主代理任务契约与就绪批量派发
+
+主代理负责完整拆分，每项tasks含name、steps、acceptance、files、dependsOn、startCondition、tests。files使用仓库相对路径（目录用/**），dependsOn用精确任务名称，无依赖用[]。服务拒绝缺字段、越界边界、循环/未知依赖和未排序的共享写入。列表顺序不表示依赖。
+
+经理启动后调用team_dispatch_ready一次排队所有依赖已验收的任务，之后回到完成结果FIFO；每次处理结果尤其accept后再次派就绪项。容量不足由原调度器排队；不是把全部任务交给一个工作者，也不是强求占满并发。工作者自动收到完整契约和前置候选SHA。有就绪未派项时不能checkpoint waiting。team_delegate单项开发同样不能越过依赖门禁。
+
+旧项目可读且不被自动改写。dispatchPlan.planNeedsUpdate明确指出缺失契约，主代理用team_update_charter附完整tasks数组修订；经理不猜依赖。startCondition中的环境前提由主代理明确、执行者实际核对，程序自动强制的启动门禁是dependsOn对应工作项accepted/integrated。

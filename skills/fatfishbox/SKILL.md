@@ -18,3 +18,5 @@ description: 使用肥鱼重工 MCP 按两层循环管理 DSH 派发、审查与
 主代理每 60 秒读取经理状态直到完成，逐项验收合并并提供完整返工计划；断线按持久游标与 requestId 恢复，不以一次工具超时结束任务。详细规程见 prompts/principal.md、prompts/lead.md、prompts/worker.md。
 
 项目经理使用team_verify_candidate真实执行候选测试，accept引用通过的verificationId。全部通过后team_finish_domain，再完成DSH goal；主代理等status=completed后逐项实际合并main并team_record_merge，失败team_update_charter提交完整返工计划。准确参数见schema。
+
+任务契约v9：主代理必须提交name/steps/acceptance/files/dependsOn/startCondition/tests。新项目拒绝缺字段、循环依赖、未知依赖及并行写入重叠。项目经理第一步team_dispatch_ready派全就绪项，每处理结果后再调用；空闲等待前仍有就绪项会被门禁拒绝。依赖以真实工作项accepted/integrated解锁；经理不重新拆分计划、不凭任务排列串行等待。旧计划缺字段时由主代理team_update_charter提交完整tasks替换，不从自然语言猜依赖。

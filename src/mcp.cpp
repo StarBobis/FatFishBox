@@ -18,7 +18,7 @@ using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
 constexpr auto workflow=R"workflow(# 肥鱼重工两层循环
 主代理先读 fatfish://team/principal 或 team_get_prompt(principal)，理解需求，拆分任务并写完整步骤、审查标准、测试命令、验收证据和失败处置。team_start_project只启动一个设有真实goal的项目经理。
 主代理随后每次等待60秒，再读team_get_project。running继续等待，不消费开发交接或插手日常调度。
-项目经理先读team_domain_context，再循环team_next_action。开发/修复结果派独立reviewer；审查通过后调用team_verify_candidate在精确候选分支真实执行测试。只有passed=true才可用verificationId验收。失败派repair，新SHA重新审查测试。空列表仍有在途时留在同一goal session等待。
+主代理tasks须含name/steps/acceptance/files/dependsOn/startCondition/tests。项目经理先读team_domain_context，调用team_dispatch_ready派全就绪事项，再循环team_next_action；每处理结果后重新派就绪项。开发/修复结果派独立reviewer；审查通过后调用team_verify_candidate在精确候选分支真实执行测试。只有passed=true才可用verificationId验收。失败派repair，新SHA重新审查测试。空列表仍有在途时留在同一goal session等待。
 全部工作项accepted后team_finish_domain并完成DSH goal。无需integrator或预先合并。主代理逐项复核并实际合入main后team_record_merge；失败以team_update_charter提供新的完整返工计划，继续一分钟等待。
 兼容旧直接模式的cluster工具仍可用，详情以其schema为准。新团队路径由项目经理使用带凭据team工具；稳定requestId防重复，精确SHA和结果版本绑定审查及测试，旧记录不自动变成通过。
 )workflow";

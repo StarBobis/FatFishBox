@@ -61,8 +61,8 @@ const server=createServer(async(req,res)=>{
         case 'session/state':if(unavailableSessions.has(a.sessionId)){res.writeHead(503).end('fixture temporary failure');return;}value=states.get(a.sessionId);break;
         case 'session/prompt':assert.equal(goals.has(a.sessionId),false,'manager must never queue a second startup prompt');if(!prompts.has(a.sessionId)){prompts.set(a.sessionId,a.content[0].text);states.set(a.sessionId,{cursor:2,running:true,queue:[],pendingInput:[]});}value={accepted:true};break;
         case 'session/cancel':if(failedCancellations.has(a.sessionId)){res.writeHead(503).end('fixture cancellation failure');return;}states.set(a.sessionId,{cursor:7,running:false,queue:[],pendingInput:[]});value={};break;
-        case 'session/page':value={records:[{type:'event',event:{seq:6,type:'assistant/message',data:{message:{content:[{text:'Fixture complete\n```fatfish-delivery\n'+JSON.stringify(reports.get(a.sessionId)||{candidateSha:candidate,status:'passed',worktreeClean:true,tests:[],evidencePaths:[]})+'\n```'}]}}}},
-            {type:'event',event:{seq:7,type:'turn/end',time:Date.now(),data:{reason:{kind:'completed'}}}}]};break;
+        case 'session/page':{const sid=a.sessionId??a.address?.sessionId;value={records:[{type:'event',event:{seq:6,type:'assistant/message',data:{message:{content:[{text:'Fixture complete\n```fatfish-delivery\n'+JSON.stringify(reports.get(sid)||{candidateSha:candidate,status:'passed',worktreeClean:true,tests:[],evidencePaths:[]})+'\n```'}]}}}},
+            {type:'event',event:{seq:7,type:'turn/end',time:Date.now(),data:{reason:{kind:'completed'}}}}]};value.records=value.records.filter(r=>r.event.seq<=Math.min(states.get(sid)?.cursor??0,a.throughSeq??Number.MAX_SAFE_INTEGER));break;}
         default:res.writeHead(404).end();return;
         }
         res.setHeader('content-type','application/json');res.end(JSON.stringify({result:{ok:true,value}}));
@@ -106,9 +106,14 @@ try {
     await tool('team_update_settings',{...config,totalConcurrency:1},true);
     await tool('team_update_settings',config); // No integrator pool required.
     const charter={objective:'\u3000 Implement and independently verify the fixture \r\n',acceptance:'Review and actual branch tests',constraints:'Preserve data',architecture:'One manager',authority:'Local worktrees',escalation:'Real blocking failures'};
-    const input={requestId:'loop-project',title:'Two-loop fixture',workspace:repo,charter,tasks:[{name:'Feature',steps:'Change file, review, run branch tests',acceptance:'Tests pass'}],domains:[{name:'Manager',mission:'Run the plan',acceptance:'Every task accepted',dependencies:[]}]};
+    const contract=(name,files,dependsOn=[])=>({name,files,dependsOn,steps:'Implement only this task in its branch and return candidate',acceptance:'Independent review and actual branch tests pass',startCondition:'All declared dependencies accepted; baseline available',tests:'node -e "process.exit(0)"'});
+    const input={requestId:'loop-project',title:'Two-loop fixture',workspace:repo,charter,tasks:[contract('Feature',['feature.txt']),contract('Parallel',['parallel.txt']),contract('After',['after.txt'],['Feature'])],domains:[{name:'Manager',mission:'Run the plan',acceptance:'Every task accepted',dependencies:[]}]};
     await tool('team_start_project',{...input,requestId:'multi',domains:[...input.domains,{...input.domains[0],name:'Other'}]},true);
     await tool('team_start_project',{...input,requestId:'over-plan',tasks:Array.from({length:4},()=>input.tasks[0])},true);
+    await tool('team_start_project',{...input,requestId:'missing-contract',tasks:[{name:'Broken',steps:'Implement',acceptance:'Pass'}]},true);
+    await tool('team_start_project',{...input,requestId:'unknown-dependency',tasks:[contract('A',['a.txt'],['Missing'])]},true);
+    await tool('team_start_project',{...input,requestId:'cyclic',tasks:[contract('A',['a.txt'],['B']),contract('B',['b.txt'],['A'])]},true);
+    await tool('team_start_project',{...input,requestId:'overlapping-writers',tasks:[contract('A',['src/**']),contract('B',['src/file.cpp'])]},true);
     const defaultQueue=(await tool('cluster_create_queue',{name:'Default team queue',requestId:'default-team'})).queueId;
     assert.equal((await tool('team_get_queue',{queueId:defaultQueue})).mode,'team','unbound queues default to team collaboration');
     const started=await tool('team_start_project',input),pid=started.projectId;
@@ -132,11 +137,11 @@ try {
     const p=(await disk()).projects[pid],domain=Object.values(p.domains)[0];
     const authz={projectId:pid,domainId:domain.domainId,token:domain.token,charterVersion:1};
     const call=(name,args={},fail=false)=>tool(name,{...authz,...args},fail);
-    assert.equal((await call('team_get_contract')).version,8);
+    assert.equal((await call('team_get_contract')).version,9);
     const listed=(await rpc('tools/list')).tools;
     const taskSchema=listed.find(t=>t.name==='team_start_project').inputSchema.properties.tasks.items;
     assert.equal(taskSchema.properties.steps.type,'string');
-    assert.deepEqual(taskSchema.required,['name','steps','acceptance']);
+    assert.deepEqual(taskSchema.required,['name','steps','acceptance','files','dependsOn','startCondition','tests']);
     assert.equal(goalWrites.get(await remote(leader)),1,'projection retries never replay /goal creation');
     assert.ok(goalReads.get(await remote(leader))>=4,'delayed nested projection was polled');
     assert.ok(p.jobs[leader.jobId].goal.objective.endsWith(charter.objective.trim()),'user objective retained after bootstrap contract');
@@ -153,7 +158,17 @@ try {
     states.set(leaderRemote,{cursor:2,running:false,queue:[],pendingInput:[]});
     assert.equal((await call('team_domain_read',{operation:'cluster_get_session_status',arguments:{sessionId:leader.sessionId}})).status,'running','active goal idle gap stays running');
     states.set(leaderRemote,{cursor:2,running:true,queue:[],pendingInput:[]});
-    const first=await call('team_delegate',{requestId:'dev',taskName:'Feature',title:'Implement',role:'developer',task:'Return a candidate'});
+    assert.deepEqual((await call('team_domain_context')).dispatchPlan.readyTasks,['Feature','Parallel']);
+    await call('team_checkpoint',{requestId:'cannot-wait-before-dispatch',state:'waiting',checkpoint:{next:'Wait for only one task'}},true);
+    const batchInput={requestId:'initial-ready-batch'};
+    const batch=await call('team_dispatch_ready',batchInput);
+    assert.equal(batch.queuedCount,2,'queue every independent task without a batch barrier');
+    assert.deepEqual(batch.queued.map(j=>j.title).sort(),['Feature','Parallel']);
+    assert.deepEqual((await call('team_dispatch_ready',batchInput)).queued.map(j=>j.jobId),batch.queued.map(j=>j.jobId),'batch replay does not duplicate workers');
+    assert.equal((await call('team_dispatch_ready',{requestId:'nothing-new-yet'})).queuedCount,0);
+    const first=batch.queued.find(j=>j.title==='Feature'),parallelJob=batch.queued.find(j=>j.title==='Parallel');
+    const parallelLive=await until(async()=>{const j=(await disk()).projects[pid].jobs[parallelJob.jobId];return j.sessionId&&j.state==='running'&&j;},'second independent worker starts before first completes');
+
     const running=await until(async()=>{const j=(await disk()).projects[pid].jobs[first.jobId];return j.sessionId&&j;},'developer');
     assert.ok(running.workspace!==repo);
     assert.match((await run('git',['-C',running.workspace,'branch','--show-current'])).stdout,/codex\/task-/);
@@ -167,6 +182,8 @@ try {
     const completed=await end(running);
     assert.equal(Object.values((await disk()).projects[pid].jobs).filter(j=>j.role==='lead').length,2,'child completion must not rebuild manager; historical failed round retained');
     assert.equal((await call('team_next_action')).head.reason,'candidate_needs_review');
+    await call('team_delegate',{requestId:'cannot-start-after-development-only',taskName:'After',title:'After',role:'developer',task:'Wrong early start'},true);
+    assert.equal((await call('team_dispatch_ready',{requestId:'after-development-only'})).queuedCount,0,'development completion does not unlock dependencies');
     await call('team_delegate',{requestId:'integrator',role:'integrator',title:'Wrong',task:'Wrong'},true);
     const reviewArgs={title:'Adversarial review',role:'reviewer',sourceJobId:completed.jobId,baseSha:base,task:'Review exact candidate'};
     await call('team_delegate',{...reviewArgs,requestId:'wrong-sha',baseSha:'f'.repeat(40)},true);
@@ -199,6 +216,25 @@ try {
     assert.equal((await call('team_verify_candidate',goodInput)).verificationId,verified.verificationId,'verification replay');
     await action('accept',{candidateSha:candidate,verificationId:verified.verificationId,notes:'Manager actual branch test passed'},'accept');
     assert.equal((await item()).state,'accepted');
+    const unlocked=await call('team_dispatch_ready',{requestId:'after-feature-accepted'});
+    assert.equal(unlocked.queuedCount,1);assert.equal(unlocked.queued[0].title,'After');
+    const afterJob=await until(async()=>{const j=(await disk()).projects[pid].jobs[unlocked.queued[0].jobId];return j.sessionId&&j;},'dependent task starts after actual acceptance');
+    assert.equal(afterJob.baseSha,candidate,'dependent branch begins at verified input SHA');
+    await call('team_finish_domain',{...finish,requestId:'not-finished-with-independent-tasks'},true);
+    const acceptOther=async(job,label)=>{
+        const ownSha=(await run('git',['-C',job.workspace,'rev-parse','HEAD'])).stdout.trim();
+        const completed=await end(job,{candidateSha:ownSha});
+        const r=await call('team_delegate',{requestId:`review-${label}`,title:`Review ${label}`,role:'reviewer',sourceJobId:completed.jobId,baseSha:ownSha,task:'Independently review exact candidate'});
+        const live=await until(async()=>{const j=(await disk()).projects[pid].jobs[r.jobId];return j.sessionId&&j;},`review ${label}`);
+        const reviewed=await end(live,{candidateSha:ownSha});
+        const read=()=>call('team_domain_read',{operation:'cluster_get_work_item',arguments:{workItemId:job.workItemId}});
+        const record=async(action,details,id)=>call('team_domain_action',{operation:'cluster_update_work_item',arguments:{workItemId:job.workItemId,expectedRevision:(await read()).revision,requestId:id,action,details}});
+        await record('record_review',{sessionId:reviewed.sessionId,resultVersion:reviewed.resultVersion,candidateSha:ownSha,verdict:'passed',notes:'Independent fixture review'},`record-${label}`);
+        const v=await call('team_verify_candidate',{requestId:`verify-${label}`,workItemId:job.workItemId,candidateSha:ownSha,executable:process.execPath,arguments:['-e',"require('node:assert/strict').ok(require('node:fs').existsSync('feature.txt'))"]});
+        assert.equal(v.passed,true);await record('accept',{candidateSha:ownSha,verificationId:v.verificationId,notes:'Actual manager test passed'},`accept-${label}`);
+    };
+    await acceptOther(parallelLive,'parallel');await acceptOther(afterJob,'after');
+
     assert.equal((await call('team_priority_results')).count,0,'accepted requires no integration task');
     await call('team_checkpoint',{requestId:'checkpoint',state:'working',checkpoint:{verified:verified.verificationId}});
     assert.equal((await call('team_finish_domain',finish)).completed,true);
@@ -238,7 +274,7 @@ try {
         assert.ok(goalReads.get(failedNative.dshId)>=20 && goalReads.get(failedNative.dshId)<40,'verification stops after bounded reads including background observation');
         await tool('team_control_project',{projectId:failedProject.projectId,requestId:`cancel-${mode}`,action:'cancel'});
     }
-    console.log('Two-loop behavior passed: one real goal, isolated branches, failed review/repair/new review, actual failed/passed tests, acceptance without integrator, principal merge, durable rework and cancellation.');
+    console.log('Ready-plan batch dispatch and acceptance dependency gates passed. Two-loop behavior passed: one real goal, isolated branches, failed review/repair/new review, actual failed/passed tests, acceptance without integrator, principal merge, durable rework and cancellation.');
 } finally {
     await close();await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true});
 }

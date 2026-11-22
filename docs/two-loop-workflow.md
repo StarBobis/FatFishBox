@@ -10,7 +10,7 @@
 2. team_get_settings读取用户模型和并发。总并发包含一个经理，独立计划事项不能超过totalConcurrency-1。共享文件指派唯一写入者，有依赖步骤放在同一事项顺序执行。
 3. 为每个事项写明：名称、目标、触发输入、基线、允许文件、禁止文件、公共接口、逐步实现、正常路径、边界/异常路径、对抗审查攻击点、测试程序与参数、预期退出码、证据位置、验收条款、失败修复与复审入口。提交计划文档，让所有子分支可从同一基线读到它。
 4. 六部分charter必须完整：objective写结果；acceptance写可执行门禁；constraints写兼容与禁止项；architecture引用已提交计划路径及任务边界；authority写可自主操作范围及main/发布授权；escalation写真正不能自行解决的异常。
-5. team_start_project传稳定requestId、绝对workspace、charter、tasks（每项name/steps/acceptance）、domains恰好一个经理定义（name/mission/acceptance/dependencies=[]）。有queueId沿用原队列；响应不明原参数重试。
+5. team_start_project传稳定requestId、绝对workspace、charter、tasks（每项name/steps/acceptance/files/dependsOn/startCondition/tests）、domains恰好一个经理定义（name/mission/acceptance/dependencies=[]）。有queueId沿用原队列；响应不明原参数重试。
 6. team_get_project核对唯一经理的leadSessionId、leadState及goal.phase。程序通过DSH /goal创建目标并通过session/projections.values.goal校验active和objective；不是自报或本地伪造。
 
 ## 第二步：主代理一分钟循环
@@ -38,3 +38,11 @@
 
 ## 最终交付
 按AGENTS.md只增加一次补丁版本，Release编译成功后才安装发布；完整路径识别并强制结束原发布实例，安装后校验EXE哈希，原先运行则重启确认。package-release.ps1从全新安装暂存树创建桌面版本ZIP；验证可读、全包CRC及EXE哈希一致。日志、转储、运行状态与凭据不进入ZIP。最终报告版本、验证结果、桌面ZIP绝对路径及任何实际未完成项。
+
+## v9：直接可派发的任务表
+
+每项定义{name, steps, acceptance, files, dependsOn, startCondition, tests}。主代理确认环境前提与文件唯一写入者，按真实数据依赖连边，不按文字顺序连边。计划总量不超过totalConcurrency-1，必要时分阶段提交完整计划。不要把整个系统审计和所有修复打成一个巨型工作项。
+
+例如：A开发审计工具（tools/audit.py）、B修复已知页面1（gallery/page1.cpp）、C修复已知页面2（gallery/page2.cpp），三项无依赖；D使用工具审计页面1-64（evidence/part1/**）、E审计页面65-127（evidence/part2/**）仅依赖A；F汇总台账（docs/defects.md）依赖D/E。B/C不因等待全量审计而被推迟。未知缺陷按实际台账由主代理在下一轮提交新的完整任务表，不让经理临时规划全部开发。
+
+经理首次team_dispatch_ready就应排队A/B/C。A经历独立审查、经理真实测试并accept后，再次调用即可同时排队D/E；D/E都验收后F解锁。每个开发工作者收到自己的完整契约与前置候选SHA，必要时只在其分支合入依赖。重复requestId重放原结果，不重复建工人；每次新队列阶段用新稳定ID。旧项目缺字段须由主代理显式更新tasks，程序不推断业务依赖。

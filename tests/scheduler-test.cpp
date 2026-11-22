@@ -1,6 +1,7 @@
 #include "team_scheduler.h"
 #include "result_preview.h"
 #include "goal_projection.h"
+#include "task_plan.h"
 #include <iostream>
 #include <stdexcept>
 using fatfish::Json;
@@ -33,5 +34,18 @@ int main() {
     auto paused=goal;paused["phase"]="paused";
     require(!fatfish::goal_matches(paused,"任务"),"paused is not a running goal");
     require(fatfish::normalized_goal_objective("a  b")!="a b","internal whitespace remains significant");
+    const auto contract=[](std::string name,Json files,Json deps=Json::array()) {return Json{{"name",name},{"files",files},{"dependsOn",deps},{"steps","Implement"},{"acceptance","Pass"},{"startCondition","Dependencies accepted"},{"tests","Run real tests"}};};
+    Json tasks=Json::array({contract("A",{"a.cpp"}),contract("B",{"b.cpp"}),contract("C",{"c.cpp"},{"A"})});
+    require(fatfish::task_plan_error(tasks,3).empty(),"valid independent task graph");
+    auto readiness=fatfish::task_plan_readiness(tasks,Json::object());
+    require(readiness.at("readyTasks")==Json::array({"A","B"}),"all independent tasks ready at startup");
+    readiness=fatfish::task_plan_readiness(tasks,{{"A","candidate"},{"B","assigned"}});
+    require(readiness.at("readyTasks").empty(),"candidate alone does not unlock dependency");
+    readiness=fatfish::task_plan_readiness(tasks,{{"A","accepted"},{"B","assigned"}});
+    require(readiness.at("readyTasks")==Json::array({"C"}),"actual acceptance unlocks dependency");
+    auto invalid=tasks;invalid[0]["dependsOn"]={"C"};require(!fatfish::task_plan_error(invalid,3).empty(),"reject cycle");
+    invalid=tasks;invalid[1]["files"]={"a.cpp"};require(!fatfish::task_plan_error(invalid,3).empty(),"reject independent writers to same file");
+    invalid[1]["dependsOn"]={"A"};require(fatfish::task_plan_error(invalid,3).empty(),"sequential file handoff allowed");
+    require(fatfish::plan_scopes_overlap("SRC/**","src/deep/file.cpp"),"Windows scope prefix and case");
     std::cout<<"FIFO dispatch and long Unicode result preview passed.\n";
 }

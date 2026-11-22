@@ -1887,7 +1887,7 @@ Json Cluster::start_session(const Json& input,const std::string& key,const Json&
             require(bool(document),"无法保存完整项目经理启动文档，禁止激活goal");
             const auto objective=std::string("你是唯一项目经理，只负责派发开发、独立审查、亲自验收及修复调度，禁止自己修改产品代码或审计脚本。\n")+
                 "第一步必须读取以下启动文档，取得完整规程、当前授权、任务计划和派发凭据；读取前不要执行产品工作。\n启动文档："+
-                utf8(bootstrap)+"\n随后立即调用team_domain_context并按计划team_delegate派发开发，不要把准备工作变成自行开发。\n项目目标："+user_objective;
+                utf8(bootstrap)+"\n随后立即调用team_domain_context，再team_dispatch_ready一次排队主代理计划中全部已就绪任务；不要重新拆分、只派一个就等待或自行开发。\n项目目标："+user_objective;
             // The first goal round may start before commands/execute returns.
             // Persist everything it needs and capture the cursor BEFORE activation.
             const auto before=rpc_state(dsh,row);

@@ -1,5 +1,6 @@
 #include "team.h"
 #include "team_scheduler.h"
+#include "task_plan.h"
 #include "diagnostics.h"
 #include "dsh.h"
 #include "state_file.h"
@@ -371,7 +372,7 @@ Json lead_tool_contract() {
         const auto& fields=tool.at("inputSchema").at("properties");
         if (fields.contains("domainId") || tool.at("name")=="team_get_prompt") selected.push_back(tool);
     }
-    return {{"version",8},{"tools",selected},{"domainAction",domain_action_contract()}};
+    return {{"version",9},{"tools",selected},{"domainAction",domain_action_contract()}};
 }
 Json job_view(const Json& j) {
     Json out;for (const auto* k:{"jobId","domainId","title","role","state","sessionId","workItemId","baseSha","workspace","resultVersion","sourceJobId","error","accepted"})
@@ -390,6 +391,33 @@ Json new_job(const Json& p,const Json& d,const std::string& role,const std::stri
     return {{"jobId",key},{"domainId",d.at("domainId")},{"role",role},{"title",title},{"task",task},
         {"baseSha",base},{"state","queued"},{"created",now()},{"attempts",0},{"requestId","team-"+key},
         {"charterVersion",p.at("charterVersion")}};
+}
+Json dispatch_readiness(const Cluster& cluster,const Json& p) {
+    const auto tasks=p.value("tasks",Json::array());
+    const auto error=task_plan_error(tasks,64);
+    if (!error.empty()) return {{"readyTasks",Json::array()},{"blockedTasks",Json::array()},{"planNeedsUpdate",true},{"reason",error}};
+    const auto scoped=cluster.for_queue(p.at("queueId").get<std::string>());
+    Json states=Json::object(),inputs=Json::object();std::map<std::string,Json> ledger;
+    for (const auto& task:tasks) {
+        const auto name=task.at("name").get<std::string>();
+        for (const auto& job:p.at("jobs")) if (job.value("taskName","")==name && job.at("role")=="developer" && job.at("state")!="cancelled") {
+            states[name]="assigned";
+            if (job.contains("workItemId")) {
+                const auto key=job.at("workItemId").get<std::string>();
+                if (!ledger.contains(key)) ledger[key]=scoped.invoke("cluster_get_work_item",{{"workItemId",key}});
+                const auto& item=ledger.at(key);states[name]=item.at("state");
+                if (item.at("state")=="accepted" || item.at("state")=="integrated")
+                    inputs[name]={{"taskName",name},{"workItemId",key},{"candidateSha",item.at("acceptance").at("candidateSha")}};
+            }
+        }
+    }
+    auto result=task_plan_readiness(tasks,states);result["dependencyCandidates"]=inputs;return result;
+}
+std::string planned_task_text(const Json& task,const Json& inputs) {
+    Json dependencies=Json::array();for (const auto& name:task.at("dependsOn")) dependencies.push_back(inputs.at(name.get<std::string>()));
+    return "主代理已拆好的完整任务契约（不得扩大范围或重新拆分）：\n"+task.dump(2)+
+        "\n已由项目经理独立审查并测试验收的依赖："+dependencies.dump(2)+
+        "\n只在分配的隔离分支工作。需要依赖代码时在本分支合入上述候选（不操作main）；依赖冲突或环境启动条件不满足则报告具体blocked，不猜输入。严格遵守files边界，执行tests并交付精确SHA与证据。";
 }
 std::string cursor(const Json& p) {return p.at("projectId").get<std::string>()+":"+std::to_string(p.at("sequence").get<long long>());}
 long long parse_cursor(const Json& p,const std::string& value) {
@@ -434,7 +462,7 @@ void check_team_reservation(const fs::path& data,const Json& sessions,const Json
 
 Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view tool,const Json& in) {
     check(in.is_object(),"参数须为对象");
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",8},{"prompt",team_prompt(role)}};}
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",9},{"prompt",team_prompt(role)}};}
     if (tool=="team_get_settings") { Store s(data);return s.value.at("settings"); }
     if (tool=="team_update_settings") {
         const auto pools=cluster.invoke("cluster_get_settings").at("pools");
@@ -459,9 +487,9 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         for (const auto& p:s.value.at("projects")) if (p.value("queueId","")==queue) {bound=project_summary(p);break;}
         // The desktop has one execution path. Old saved direct preferences no longer select a mode.
         return {{"queueId",queue},{"mode","team"},{"project",bound},
-            {"principalPromptVersion",8},{"historyTakeoverSupported",true},
+            {"principalPromptVersion",9},{"historyTakeoverSupported",true},
             {"nextAction",bound.is_null()?"task_authorized_then_team_start_project_same_queue":"resume_bound_project"},
-            {"guidance","请使用 team_get_prompt({role:principal}) 的 v8 规程。负责人通过 team_next_action 机械循环处理统一FIFO；结果排队，不抢占，处理本条后继续下一条。项目经理在同一goal会话持续循环，主代理每60秒读取状态。"}};
+            {"guidance","请使用 team_get_prompt({role:principal}) 的 v9 规程。负责人通过 team_next_action 机械循环处理统一FIFO；结果排队，不抢占，处理本条后继续下一条。项目经理在同一goal会话持续循环，主代理每60秒读取状态。"}};
     }
     if (tool=="team_start_project") {
         const auto request=text(in,"requestId",100),title=text(in,"title",200);
@@ -518,9 +546,10 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             if (!queue.empty()) {p["queueId"]=queue;p["status"]="running";}
             check(s.value.at("settings").at("totalConcurrency").get<int>()>=2,"单goal经理需要至少2个总并发名额");
             const auto tasks=in.value("tasks",Json::array());
-            check(tasks.is_array() && tasks.size()<=static_cast<std::size_t>(std::max(0,s.value.at("settings").at("totalConcurrency").get<int>()-1)),"独立任务数不能超过扣除项目经理后的可用总并发");
+            const auto plan_error=task_plan_error(tasks,static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
+            if (!plan_error.empty()) throw std::runtime_error(plan_error);
             std::set<std::string> task_names;for (const auto& task:tasks) {check(task_names.insert(text(task,"name",200)).second,"计划任务名称须唯一");text(task,"steps",12000);text(task,"acceptance",6000);}
-            p["tasks"]=tasks;p["protocolVersion"]=8;p["pollIntervalMs"]=60000;
+            p["tasks"]=tasks;p["protocolVersion"]=9;p["pollIntervalMs"]=60000;
             p["history"]=history;
             p["backlogOwnerDomainId"]=first_domain;
             s.value["projects"][key]=p;s.value["requests"][request]={{"projectId",key},{"input",in}};s.save();
@@ -642,6 +671,11 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         } else if (tool=="team_update_charter") {
             check(p.at("status")!="cancelled","已取消项目不能更新授权");
             check(p.at("charterVersion")==in.at("expectedVersion"),"授权书版本已变化");valid_charter(in.at("charter"));text(in,"changeSummary",4000);
+            if (in.contains("tasks")) {
+                const auto error=task_plan_error(in.at("tasks"),static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
+                if (!error.empty()) throw std::runtime_error(error);
+                p["tasks"]=in.at("tasks");
+            }
             p["charter"]=in.at("charter");p["charterVersion"]=p.at("charterVersion").get<int>()+1;
             for (auto& job:p["jobs"]) if (job.at("state")=="queued" && !job.contains("launch") && !job.contains("sessionId")) {job["state"]="cancelled";job["error"]="授权已更新；负责人须按新版本重新评估任务";}
             for (auto& d:p["domains"]) {d["wake"]=d.at("wake").get<int>()+1;if (d.at("state")=="completed") d["state"]="working";}
@@ -657,6 +691,32 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             event(p,"project.status",{{"status",p.at("status")},{"note","暂停停止新派发；已运行任务由后台请求取消并核对"}});
         }
         auto result=project_summary(p);operations[request]={{"input",in},{"result",result}};s.save();return result;
+    }
+    if (tool=="team_dispatch_ready") {
+        Json copy;const auto request=text(in,"requestId",100);
+        {Store s(data);copy=project(s,in);domain(copy,in);running_project(copy);
+            const auto key=text(in,"domainId",100)+":dispatch-ready:"+request;
+            if (copy.at("operations").contains(key)) {const auto& old=copy.at("operations").at(key);check(old.at("input")==in,"requestId参数不一致");return old.at("result");}}
+        const auto readiness=dispatch_readiness(cluster,copy);
+        check(!readiness.at("planNeedsUpdate").get<bool>(),"主代理须先提交包含files/dependsOn/startCondition/tests的完整任务计划；项目经理不能自行猜拆分");
+        Store s(data);auto& p=project(s,in);auto& d=domain(p,in);running_project(p);
+        check(in.value("charterVersion",0)==p.at("charterVersion").get<int>() && copy.at("charterVersion")==p.at("charterVersion"),"授权已更新，请重读完整计划");
+        const auto key=d.at("domainId").get<std::string>()+":dispatch-ready:"+request;
+        if (p.at("operations").contains(key)) {const auto& old=p.at("operations").at(key);check(old.at("input")==in,"requestId参数不一致");return old.at("result");}
+        Json queued=Json::array();
+        for (const auto& name:readiness.at("readyTasks")) {
+            bool exists=false;for (const auto& j:p.at("jobs")) if (j.at("role")=="developer" && j.value("taskName","")==name.get<std::string>() && j.at("state")!="cancelled") exists=true;
+            if (exists) continue;
+            check(p.at("jobs").size()<512,"项目任务数达到上限");
+            for (const auto& task:p.at("tasks")) if (task.at("name")==name) {
+                auto base=p.at("baseSha").get<std::string>();
+                if (!task.at("dependsOn").empty()) base=readiness.at("dependencyCandidates").at(task.at("dependsOn").front().get<std::string>()).at("candidateSha").get<std::string>();
+                auto job=new_job(p,d,"developer",name.get<std::string>(),planned_task_text(task,readiness.at("dependencyCandidates")),base);
+                job["taskName"]=name;job["planContract"]=task;p["jobs"][job.at("jobId").get<std::string>()]=job;queued.push_back(job_view(job));
+            }
+        }
+        auto result=readiness;result["queued"]=queued;result["queuedCount"]=queued.size();
+        p["operations"][key]={{"input",in},{"result",result}};s.save();return result;
     }
     if (tool=="team_verify_candidate") {
         const auto key=text(in,"workItemId",100),candidate=text(in,"candidateSha",64),request=text(in,"requestId",100);
@@ -770,15 +830,15 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
     if (tool=="team_get_contract") {Store s(data);auto& p=project(s,in);domain(p,in);return lead_tool_contract();}
     if (tool=="team_next_action") {
         Json copy;{Store s(data);auto& p=project(s,in);domain(p,in);running_project(p);copy=p;}
-        return coordinator_queue(cluster,data,copy,text(in,"domainId",100));
+        auto result=coordinator_queue(cluster,data,copy,text(in,"domainId",100));result["dispatchPlan"]=dispatch_readiness(cluster,copy);return result;
     }
     if (tool=="team_domain_context" || tool=="team_domain_jobs") {
-        Json urgent=Json::array(),worklist=Json::array(),queue;
+        Json urgent=Json::array(),worklist=Json::array(),queue,dispatch_plan;
         if (tool=="team_domain_context") {
             Json copy;{Store s(data);auto& p=project(s,in);domain(p,in);copy=p;}
             urgent=priority_results(cluster,copy,text(in,"domainId",100));
             worklist=domain_worklist(cluster,copy,text(in,"domainId",100));
-            queue=coordinator_queue(cluster,data,copy,text(in,"domainId",100));
+            queue=coordinator_queue(cluster,data,copy,text(in,"domainId",100));dispatch_plan=dispatch_readiness(cluster,copy);
         }
         Store s(data);auto& p=project(s,in);auto& d=domain(p,in);
         Json jobs=Json::array();
@@ -790,7 +850,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json out={{"projectId",p.at("projectId")},{"queueId",p.value("queueId","")},{"status",p.at("status")},{"charter",p.at("charter")},
             {"charterVersion",p.at("charterVersion")},{"tasks",p.value("tasks",Json::array())},{"workspace",p.at("workspace")},{"baseSha",p.at("baseSha")},{"domain",d},{"jobs",Json::array()},{"decisions",Json::array()},{"dependencies",Json::array()}};
         out["domain"].erase("token");
-        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=8;
+        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=9;
         out["dispatchPolicy"]="统一FIFO：team_next_action取队首，处理/派后继后取下一项；子任务结果排队，不抢占当前项。priorityResults为兼容字段，不表示抢占优先级。";
         out["backlog"]={{"ownerDomainId",backlog_owner(p)},{"isOwner",d.at("domainId")==backlog_owner(p)},
             {"pending",p.value("backlog",Json::object()).value("pending",0)},{"actionable",p.value("backlog",Json::object()).value("actionable",0)},
@@ -821,7 +881,11 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 const auto& old=p.at("operations").at(key);check(old.at("input")==in,"requestId 参数不一致");return old.at("result");
             }
         }
-        Json reviewed;
+        Json reviewed,plan_guard;
+        if (tool=="team_delegate" && in.value("role","")=="developer") {
+            Json copy;{Store s(data);copy=project(s,in);domain(copy,in);}
+            plan_guard=dispatch_readiness(cluster,copy);
+        }
         if (tool=="team_delegate" && in.value("role","")=="reviewer") {
             Json source;std::string queue;
             {Store s(data);auto& p=project(s,in);auto& d=domain(p,in);source=authorize_job(p,d,text(in,"sourceJobId",100));queue=p.at("queueId").get<std::string>();}
@@ -834,13 +898,13 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json ledger;
         Json backlog_guard;
         Json priority_guard;
-        Json worklist_guard;
+        Json worklist_guard,dispatch_guard;
         if (tool=="team_checkpoint" || tool=="team_finish_domain") {
             Json pcopy;bool owner=false;
             {Store s(data);auto& p=project(s,in);auto& d=domain(p,in);owner=d.at("domainId")==backlog_owner(p);pcopy=p;}
             if (owner) backlog_guard=backlog_snapshot(cluster,pcopy);
             priority_guard=priority_results(cluster,pcopy,text(in,"domainId",100));
-            worklist_guard=domain_worklist(cluster,pcopy,text(in,"domainId",100));
+            worklist_guard=domain_worklist(cluster,pcopy,text(in,"domainId",100));dispatch_guard=dispatch_readiness(cluster,pcopy);
         }
         if (tool=="team_finish_domain") {
             std::string queue;
@@ -884,6 +948,9 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 const auto name=text(in,"taskName",200);bool planned=false;
                 for (const auto& task:p.at("tasks")) if (task.at("name")==name) planned=true;
                 check(planned,"开发任务须绑定计划中的taskName");
+                check(!plan_guard.value("planNeedsUpdate",true),"主代理须补齐结构化任务计划，经理不可自行拆分");
+                check(std::ranges::find(plan_guard.at("readyTasks"),Json(name))!=plan_guard.at("readyTasks").end(),"该任务已有派发或依赖尚未验收，不可提前启动");
+                for (const auto& task:p.at("tasks")) if (task.at("name")==name) {job["task"]=job.at("task").get<std::string>()+"\n"+planned_task_text(task,plan_guard.at("dependencyCandidates"));job["planContract"]=task;}
                 for (const auto& other:p.at("jobs")) if (other.value("taskName","")==name && other.at("role")=="developer" && other.at("state")!="cancelled")
                     check(false,"计划项已有开发任务；修复沿用sourceJobId或workItemId，不重复创建");
                 job["taskName"]=name;
@@ -897,6 +964,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         } else if (tool=="team_checkpoint") {
             const auto state=text(in,"state",32);check(state=="working" || state=="waiting" || state=="decision" || state=="continue","checkpoint state 无效");
             check(in.at("checkpoint").is_object() && in.at("checkpoint").dump().size()<=16000,"checkpoint 必须是小于 16000 字节的对象");
+            if (state=="waiting") check(!dispatch_guard.value("planNeedsUpdate",true) && dispatch_guard.at("readyTasks").empty(),"仍有可直接派发的独立计划项或计划字段缺失；先team_dispatch_ready或请求主代理补齐计划，不能只派一项就等待");
             if (state=="waiting" || state=="decision") check(worklist_guard.empty(),"仍有未接管或本领域无在途后继的工作项，不能等待整批结束；读取 team_domain_context.readyWorkItems，先派下一项或绑定具体阻塞");
             const bool retry_wait=!backlog_guard.is_null() && backlog_guard.at("pending").get<int>()>0 && p.value("backlog",Json::object()).value("retryAt",0LL)>now();
             if (state=="waiting" || state=="decision") check(priority_guard.is_null() || priority_guard.empty(),"还有结果/验收/集成阶段在队列中，不能全局等待；请继续 team_next_action 循环");
@@ -1053,15 +1121,15 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
         for (const auto& old:p.at("jobs")) {
             if (!old.contains("sessionId") || old.value("observedTerminal",false)) continue;
             if (old.at("role")=="lead" && !terminal(old.at("state").get<std::string>()) &&
-                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<8 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
+                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<9 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
                 health.run("notify_policy",old.at("jobId"),[&] {
                     const auto version=p.at("charterVersion").get<int>();
                     const auto notice=scoped.invoke("cluster_send_message",{{"sessionId",old.at("sessionId")},
-                        {"requestId","team-policy8-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
-                        {"message","规程v8：重新读取team_get_prompt(role=lead)与team_domain_context。一个项目经理在同一goal session循环消费待处理列表；开发后独立审查，通过后亲自调用team_verify_candidate测试，再accept；失败修复并重新审查测试。全部事项accepted即team_finish_domain，无integrator或预合并门禁。空列表有在途时等待，不结束goal。"}});
+                        {"requestId","team-policy9-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
+                        {"message","规程v9：重新读取team_get_prompt(role=lead)与team_domain_context。主代理负责完整任务拆分，经理先team_dispatch_ready派全就绪项，处理结果后再次派就绪项；不能只派一个独立任务就等待。一个项目经理在同一goal session循环消费待处理列表；开发后独立审查，通过后亲自调用team_verify_candidate测试，再accept；失败修复并重新审查测试。全部事项accepted即team_finish_domain，无integrator或预合并门禁。空列表有在途时等待，不结束goal。"}});
                     if (notice.value("accepted",false)) {
                         Store s(data);auto& saved=s.value["projects"][pid]["jobs"][old.at("jobId").get<std::string>()];
-                        saved["notifiedPolicyVersion"]=8;saved["notifiedCharterVersion"]=version;s.save();
+                        saved["notifiedPolicyVersion"]=9;saved["notifiedCharterVersion"]=version;s.save();
                     }
                 });
             }
@@ -1127,8 +1195,8 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
                 for (const auto& job:current.at("jobs")) if (job.at("domainId")==d.at("domainId") && job.at("role")=="lead" && (!terminal(job.at("state").get<std::string>()) || job.value("charterVersion",0)==current.at("charterVersion").get<int>())) exists=true;
                 if (exists) continue;
                 auto job=new_job(current,d,"lead","项目经理 · "+d.at("name").get<std::string>(),
-                    "读取team_domain_context和详细计划。在同一个goal session内派开发、循环消费team_next_action；开发结果派独立审查，审查通过亲自执行team_verify_candidate，失败派修复并重新审查测试。空列表有在途时等待，全部事项accepted后team_finish_domain，再完成goal。",current.at("baseSha").get<std::string>());
-                job["schedulerPolicyVersion"]=8;job["wake"]=d.at("wake");
+                    "读取team_domain_context和详细计划，先team_dispatch_ready一次排队全部就绪任务。每处理一条结果后再次team_dispatch_ready解锁依赖，再循环team_next_action；开发结果派独立审查，审查通过亲自执行team_verify_candidate，失败派修复并重新审查测试。空列表有在途时等待，全部事项accepted后team_finish_domain，再完成goal。",current.at("baseSha").get<std::string>());
+                job["schedulerPolicyVersion"]=9;job["wake"]=d.at("wake");
                 current["jobs"][job.at("jobId").get<std::string>()]=job;d["state"]="working";
             }
             s.save();p=current;
@@ -1233,18 +1301,17 @@ Json team_tools() {
         {"required",Json::array({"objective","acceptance","constraints","architecture","authority","escalation"})},{"additionalProperties",false}};
     const Json domain_spec{{"type","object"},{"properties",{{"name",text},{"mission",text},{"acceptance",text},{"dependencies",array}}},
         {"required",Json::array({"name","mission","acceptance","dependencies"})},{"additionalProperties",false}};
-    const Json task_spec{{"type","object"},{"properties",{{"name",{{"type","string"},{"minLength",1},{"maxLength",200}}},
-        {"steps",{{"type","string"},{"minLength",1},{"maxLength",12000},{"description","完整操作步骤，使用一个字符串；多步用换行分隔，不传数组。"}}},
-        {"acceptance",{{"type","string"},{"minLength",1},{"maxLength",6000}}}}},
-        {"required",Json::array({"name","steps","acceptance"})},{"additionalProperties",false}};
+    const Json task_spec{{"type","object"},{"properties",{{"name",text},{"steps",text},{"acceptance",text},{"files",array},{"dependsOn",array},
+        {"startCondition",{{"type","string"},{"description","可直接执行的启动条件；所有任务依赖必须另列dependsOn，无依赖任务不得人为串行等待。"}}},{"tests",text}}},
+        {"required",Json::array({"name","steps","acceptance","files","dependsOn","startCondition","tests"})},{"additionalProperties",false}};
     add("team_start_project","主代理提交详细计划、独立tasks和唯一项目经理定义；后台创建真实goal会话。重试复用原 requestId。",{{"requestId",text},{"queueId",text},{"title",text},{"workspace",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"domains",{{"type","array"},{"items",domain_spec},{"minItems",1},{"maxItems",1}}}},
-        {"requestId","title","workspace","charter","domains"});
+        {"requestId","title","workspace","charter","tasks","domains"});
     add("team_list_projects","桌面与续接用团队项目摘要；不要周期性读取全部历史。",Json::object(),Json::array());
     add("team_get_queue","按当前队列查执行方式与绑定的团队运行摘要；已有团队时续接，不再创建项目。",{{"queueId",text}},{"queueId"});
     add("team_get_project","读取单项目阶段成果与待决策；不返回执行日志。",{{"projectId",text},{"includeCharter",{{"type","boolean"}}}},{"projectId"});
     add("team_wait_decisions","等待关键决策、异常和里程碑；普通运行状态不唤醒主代理。宿主无主动唤醒时使用有界等待。",{{"projectId",text},{"afterCursor",text},{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",60000},{"default",60000}}}},{"projectId"});
     add("team_resolve_decision","主代理回复一张决策卡；自动保存并恢复领域负责人。",{{"projectId",text},{"decisionId",text},{"expectedRevision",integer},{"requestId",text},{"resolution",text}},{"projectId","decisionId","expectedRevision","requestId","resolution"});
-    add("team_update_charter","更新完整授权书；版本化保存，通知负责人重新核对受影响任务。",{{"projectId",text},{"expectedVersion",integer},{"requestId",text},{"charter",charter},{"changeSummary",text}},{"projectId","expectedVersion","requestId","charter","changeSummary"});
+    add("team_update_charter","更新完整授权书；版本化保存，通知负责人重新核对受影响任务。",{{"projectId",text},{"expectedVersion",integer},{"requestId",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"changeSummary",text}},{"projectId","expectedVersion","requestId","charter","changeSummary"});
     add("team_record_merge","项目经理完成后，主代理逐项验收并实际合入main，再核对登记集成提交。",{{"projectId",text},{"requestId",text},{"workItemId",text},{"integrationSha",text},{"targetBranch",text},{"notes",text}},{"projectId","requestId","workItemId","integrationSha","targetBranch","notes"});
     add("team_control_project","暂停/恢复/取消项目；暂停和取消停止新派发并请求取消活动任务，保留产物。",{{"projectId",text},{"requestId",text},{"action",{{"type","string"},{"enum",Json::array({"pause","resume","cancel"})}}}},{"projectId","requestId","action"});
     const Json auth{{"projectId",text},{"domainId",text},{"token",text},{"charterVersion",integer}};
@@ -1260,6 +1327,7 @@ Json team_tools() {
     scoped("team_next_handoff","值守负责人领取/恢复一条交接；处置须返回的 claimToken、稳定 requestId、notes 和 outcome=confirm/linked/blocked，自动取下一条。confirm 须证据和已验收总账；linked 须同工作项在途 jobId。",{{"requestId",text},{"claimToken",text},{"outcome",{{"type","string"},{"enum",Json::array({"confirm","linked","blocked"})}}},{"notes",text},{"evidence",array},{"jobId",text},{"decisionId",text}},Json::array());
     scoped("team_domain_history","负责人分页核对原队列总账；默认只看未完成项，includeClosed=true 才包含已集成和已取消历史。",{{"offset",integer},{"limit",integer},{"includeClosed",{{"type","boolean"}}}},Json::array());
     scoped("team_claim_work_item","负责人接管原队列未完成项及会话，保持原 ID/缺陷/审查/回执，防止重复接管。范围外项可 disposition=defer 并写 reason，保留原状态。",{{"workItemId",text},{"requestId",text},{"disposition",{{"type","string"},{"enum",Json::array({"adopt","defer"})}}},{"reason",text}},{"workItemId","requestId"});
+    scoped("team_dispatch_ready","按主代理完整计划一次排队所有依赖已验收的独立开发项；自动带上文件边界、启动条件、测试和依赖候选，不重复派发。",{{"requestId",text}},{"requestId","charterVersion"});
     scoped("team_delegate","项目经理派开发/审查/修复；审查绑定sourceJobId与精确候选；全部验收通过即可结束。",{{"requestId",text},{"title",text},{"role",{{"type","string"},{"enum",Json::array({"developer","reviewer","repair"})}}},{"task",text},{"baseSha",text},{"sourceJobId",text},{"workItemId",text},{"taskName",text}},
         {"requestId","title","role","task","charterVersion"});
     scoped("team_verify_candidate","项目经理亲自在候选分支运行测试；审查须已通过，服务记录实际退出码和日志。accept须带返回verificationId。",{{"requestId",text},{"workItemId",text},{"candidateSha",text},{"executable",text},{"arguments",array},{"timeoutMs",integer}},{"requestId","workItemId","candidateSha","executable","arguments"});
