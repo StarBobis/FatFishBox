@@ -35,9 +35,9 @@
 
 ### 主代理层：启动、MCP 等待、逐项验收
 
-- 主代理用 `team_get_queue` 查询队列执行方式与绑定记录。启动新团队时用 `team_start_project` 提交当前 queueId、六部分授权书（objective、acceptance、constraints、architecture、authority、escalation）和完整操作计划，charterVersion=1。只设一个项目经理、一个持久 goal，不创建多个负责人或多领域定义。
+- Codex 的 FatFishBox MCP 连接可在对应的 `[mcp_servers.<名称>]` 段设置 `tool_timeout_sec = 360`，为五分钟服务端等待留出返回时间。主代理调用 `team_wait_decisions`，传入 `timeoutMs: 300000`。工具在后台运行时继续等同一次调用。收到普通超时就带返回的游标安静续等。若客户端有不可调整的 60 秒上限，则每次传 45000 毫秒；调用中断时沿用最后收到的游标。经理执行期间只响应待决策、明确异常或用户指令，完成后再检查改动并合并。
 - 项目使用干净、已提交的 Git HEAD 作为基线；未提交修改不会被暗中忽略。工作树不干净时主代理须先在授权范围内整理基线，不能丢弃用户修改。每个执行任务由后台建立独立 worktree，项目经理使用独立元数据目录；工作树和提交保留在应用数据目录的 `team-workspaces` 中，结束项目不会自动删除成果。
-- 用户一次给出任务和授权后，主代理必须启动或续接团队，用 `team_get_project` 核对唯一项目经理会话的 leadSessionId/leadState 与 goal 已真实建立、running 正常，然后进入等待循环。仅在用户没有给任何任务或既有授权时才待命。
+- 用户给出任务和授权后，主代理先完成并保存计划草稿，再显式启动或按队列状态续接团队，用 `team_get_project` 核对唯一项目经理会话的 leadSessionId/leadState 与 goal 已真实建立、running 正常，然后进入等待循环。仅在用户没有给任何任务或既有授权时才待命。
 - 主代理用 `team_wait_decisions` 以最长 300000 毫秒（五分钟）有界等待并保存游标，下一次作为 afterCursor 续接，再用 `team_get_project` 读取项目经理状态：running 就继续等待，不消费开发队列、不代调度、不轮询子会话。等待超时只表示本轮到时，不是失败也不是完成；主代理不以一次工具超时结束任务，也不把“用户再发一条继续”当正常运行步骤。
 - 断线或宿主强制结束时，持久保存 projectId、游标与执行状态，在恢复处续接；不声称任意宿主都能主动唤醒。
 - 用户追加要求时，用 `team_update_charter` 提交完整新授权书与 changeSummary，绑定 charterVersion；扩大范围或越界时升级为具体事实与方案，不让工作悬停等待用户回答。
@@ -58,7 +58,7 @@
 
 项目经理“报告完成”不是最终证据。主代理逐项核对：每项验收条件 outcome 为 passed 且 evidence 指向对应提交/日志/清单；每个候选有独立审查结论且审查与测试证据绑定同一完整候选 SHA；失败项未被标完成；空队列有在途未被当完成；未把 integrator 门禁或预合并当完成前置；没有未解决阻塞；现有用户数据与未完历史项未被静默丢失或误标通过。
 
-任一条件不满足就不宣称完成，给出新的完整返工计划（目的、输入、边界、步骤、分支、候选完整 SHA、审查标准、可执行测试、证据、失败处置、具体缺口、返工范围与验收标准），必要时用 `team_control_project` pause/cancel 后启动下一轮；不替项目经理接管日常派发。全部通过才按授权逐项合入 main，随后完成构建、发布与打包（版本只增一次）。仅在项目经理就真实阻塞升级时，主代理用 `team_resolve_decision` 按决策版本回复具体决定（不作为日常干预），用 `team_update_charter` 更新完整授权书。
+任一条件不满足就不宣称完成，给出新的完整返工计划（目的、输入、边界、步骤、分支、候选完整 SHA、审查标准、可执行测试、证据、失败处置、具体缺口、返工范围与验收标准），同项目返工用 `team_update_charter` 更新计划。确需永久关闭时，用 `team_control_project` 预览并确认取消，待旧会话退出后在同一队列保存新草稿；不替项目经理接管日常派发。全部通过才按授权逐项合入 main，随后完成构建、发布与打包（版本只增一次）。仅在项目经理就真实阻塞升级时，主代理用 `team_resolve_decision` 按决策版本回复具体决定（不作为日常干预），用 `team_update_charter` 更新完整授权书。
 
 后台从全部已启用模型按账号负载选择，原子检查最大并发数量，再交给现有 DSH 派发器。并发检查包含正在运行的项目经理；容量不足保持排队，不改变已排好的处理顺序。开发、返修、审查按任务总账绑定同一工作项；reviewer 必须绑定原交付中的精确候选 SHA。
 
@@ -155,3 +155,12 @@ node tests/mcp-http-smoke.mjs "out/肥鱼重工/FatFishBox.exe"
 ## 0.1.11：移除质量门禁与取证
 
 默认流程仅为开发完成相关自测、独立审查、经理判断并确认。accept不再要求verificationId，完成项目不再要求证据数组/验收证明清单。读取结果不再自动采集文件、检查Git状态、计算文件哈希或建立证据归档。取证工具从默认目录移除，历史取证调用返回已停用，不继续扫描；旧归档保留。提示词禁止把局部修复扩展成全量页面/配置/截图取证；当前经理和执行者会收到停止额外取证的新规程。仅运行与实际改动相关的功能检查，不能虚报跳过的覆盖已完成。
+
+经理启动状态单独返回 `managerStartup`。草稿显式启动后先显示 starting，只有真实会话与 active goal 建立后才显示 running。显式启动计划时持久化唯一经理任务，后台先派发再复查历史会话；兼容恢复旧 pending 项目。超过 30 秒未建立 goal 或出现派发错误时，`team_wait_decisions` 提前返回 `needsAttention`、启动阶段、原因及重试时间；不会把空等当作正常执行。计划文件冲突会列明任务与路径。
+
+
+团队计划与队列恢复（主代理 v15）。`team_start_project` 保存草稿，`team_update_charter` 可修订草稿。规划完成后，用 `team_activate_project({projectId,requestId,expectedVersion})` 启动已核对的版本。运行中的项目可用 `team_update_charter` 一次提交完整修订。暂停项目需等旧会话退出再恢复，已完成项目可在队列可用时重新打开为草稿后启动。
+
+`team_control_project` 的 cancel 是终态。先用 `dryRun:true` 查看影响，再用 `confirm:true` 生效。旧会话确认退出后，`team_get_queue` 返回可接管的队列、上一项目以及 `allowedActions`。新草稿继续使用原 `queueId`，并可用 `replaceProjectId` 防止误接管已变化的历史。队列的工作项、会话和回执沿用原记录。取消或完成的项目带 `archived` 和 `closedAt`，可按 ID 查询，也可用 `team_list_projects({includeArchived:true})` 列出。
+
+MCP 工具目录公布输入与输出 schema，成功和团队操作错误均含 `structuredContent`，同时保留文本兼容。若宿主仅显示文本，`team_get_prompt({role:"principal"})` 也提供关键工具的输入 schema。

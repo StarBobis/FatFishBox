@@ -37,7 +37,18 @@ try {
     assert.equal((await fetch(url)).status,405);
     const teamUrl=`http://127.0.0.1:${port}/team`;
     const teamCall=(method,params={})=>fetch(teamUrl,{method:'POST',headers:base,body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})}).then(r=>r.json());
-    const principalTools=(await teamCall('tools/list')).result.tools.map(t=>t.name);
+    const principalCatalog=(await teamCall('tools/list')).result.tools;
+    const principalTools=principalCatalog.map(t=>t.name);
+    for (const name of ['team_start_project','team_activate_project','team_wait_decisions','team_control_project']) {
+        const schema=principalCatalog.find(t=>t.name===name);
+        assert.equal(schema.inputSchema.type,'object');
+        assert.ok(schema.inputSchema.properties.requestId || schema.inputSchema.properties.projectId);
+        assert.equal(schema.outputSchema.type,'object');
+    }
+    const promptResult=(await teamCall('tools/call',{name:'team_get_prompt',arguments:{role:'principal'}})).result;
+    assert.equal(promptResult.structuredContent.version,15);
+    assert.deepEqual(JSON.parse(promptResult.content[0].text),promptResult.structuredContent);
+    assert.deepEqual(promptResult.structuredContent.tools.team_start_project,principalCatalog.find(t=>t.name==='team_start_project').inputSchema);
     assert.ok(principalTools.includes('team_start_project'));
     assert.ok(!principalTools.some(n=>n.startsWith('cluster_')));
     assert.ok(!principalTools.includes('team_delegate'));

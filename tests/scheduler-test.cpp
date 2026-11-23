@@ -1,4 +1,5 @@
 #include "team_scheduler.h"
+#include "team_startup.h"
 #include "result_preview.h"
 #include "goal_projection.h"
 #include "task_plan.h"
@@ -18,6 +19,19 @@ int main() {
     require(fatfish::team_dispatch_plan(projects,Json::object(),100,0).empty(),"budget zero");
     projects["b"]["status"]="cancelled";
     require(fatfish::team_dispatch_plan(projects,Json::object(),100).empty(),"cancelled project must not dispatch");
+    Json startupProject={{"status","running"},{"updated",1000},{"jobs",Json::object()}};
+    auto startup=fatfish::team_manager_startup(startupProject,31000);
+    require(startup.at("pending")==true && startup.at("stalled")==true && startup.at("confirmed")==false,"saved project without manager must report startup stall");
+    auto manager=job("manager","lead",1000);startupProject["jobs"]["manager"]=manager;
+    require(fatfish::team_manager_startup(startupProject,1001).at("needsAttention")==false,"fresh queue is an ordinary startup");
+    startupProject["jobs"]["manager"].update({{"state","running"},{"sessionId","real-session"}});
+    require(fatfish::team_manager_startup(startupProject,31000).at("stalled")==true,"session without verified goal cannot confirm startup");
+    startupProject["jobs"]["manager"]["goal"]={{"phase","active"}};
+    require(fatfish::team_manager_startup(startupProject,31000).at("confirmed")==true,"active manager goal confirms startup");
+    startupProject["jobs"]["manager"]["state"]="succeeded";
+    require(fatfish::team_manager_startup(startupProject,31000).at("needsAttention")==true,"unexpected manager exit is actionable");
+    startupProject["status"]="completed";
+    require(fatfish::team_manager_startup(startupProject,31000).at("needsAttention")==false,"completed projects do not cause startup alarms");
     std::wstring text(200000,L'x');const auto original=text;
     require(fatfish::result_preview(text).size()<=65536 && text==original,"long result safe and full copy retained");
     require(fatfish::result_preview(std::wstring(65536,L'x')).size()==65536,"exact boundary retained");
@@ -45,6 +59,7 @@ int main() {
     require(readiness.at("readyTasks")==Json::array({"C"}),"actual acceptance unlocks dependency");
     auto invalid=tasks;invalid[0]["dependsOn"]={"C"};require(!fatfish::task_plan_error(invalid,3).empty(),"reject cycle");
     invalid=tasks;invalid[1]["files"]={"a.cpp"};require(!fatfish::task_plan_error(invalid,3).empty(),"reject independent writers to same file");
+    require(fatfish::task_plan_error(invalid,3).find("a.cpp")!=std::string::npos,"conflicts identify the actual file");
     invalid[1]["dependsOn"]={"A"};require(fatfish::task_plan_error(invalid,3).empty(),"sequential file handoff allowed");
     require(fatfish::plan_scopes_overlap("SRC/**","src/deep/file.cpp"),"Windows scope prefix and case");
     std::cout<<"FIFO dispatch and long Unicode result preview passed.\n";

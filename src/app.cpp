@@ -1033,7 +1033,7 @@ private:
     }
     bool copy_team_setup(bool bind_queue=false) {
         auto setup=fatfish::team_prompt("principal");
-        if (bind_queue) setup="Current work queueId="+current_queue_+"; first call team_get_queue. Resume an existing projectId, or include this queueId in team_start_project (historical queue takeover is supported). Do not create another queue. After the user supplies a task and authorization once, start the manager and continue through final acceptance without asking for another instruction.\n\n"+setup;
+        if (bind_queue) setup="Current work queueId="+current_queue_+". Call team_get_queue and follow nextAction and allowedActions. Save a new plan as a draft on this queue with team_start_project. Once planning is finished, activate its exact version with team_activate_project. After cancellation and session shutdown, reuse this queue and its history. Continue to final acceptance under the user's existing authorization.\n\n"+setup;
         if (http_) {
             const auto url=http_->url();const auto team_url=url.substr(0,url.size()-4)+"/team";
             setup="FatFishBox principal MCP: "+team_url+". Register this team endpoint for principal decision tools. An existing /mcp connection also supports team_* with a larger tool catalog.\n\n"+setup;
@@ -1454,7 +1454,7 @@ private:
         }
     }
     void queue_team_panel(const Json& p,float x,float top,float right,float bottom) {
-        const std::map<std::string,std::wstring> states{{"starting",L"启动中"},{"running",L"执行中"},{"finishing",L"等待经理结束"},
+        const std::map<std::string,std::wstring> states{{"draft",L"计划草稿"},{"starting",L"启动中"},{"running",L"执行中"},{"finishing",L"等待经理结束"},
             {"paused",L"已暂停"},{"cancelled",L"已取消"},{"completed",L"成果待主代理验收"}};
         const auto state=p.at("status").get<std::string>();
         const auto errors=p.value("runtimeErrors",Json::object());
@@ -1567,7 +1567,7 @@ private:
         button("create_queue",L"创建",edge-100,205,100,true,true,"queue.create");
         const bool legacy=std::ranges::any_of(queues_,[&](const Json& q){return q.at("queueId")==current_queue_ && q.value("legacy",false);});
         const auto project=queue_team_.value("project",Json());
-        const bool active_team=project.is_object() && (project.value("status","")=="running" || project.value("status","")=="starting" || project.value("status","")=="finishing");
+        const bool active_team=project.is_object() || queue_team_.value("drainingProject",Json()).is_object();
         panel("queue.edit",{x,274,right,397});
         field("queueName",L"修改当前队列名称",left,288,form-116,"queue.edit");
         button("rename_queue",L"保存名称",edge-100,312,100,false,!current_queue_.empty(),"queue.edit");
@@ -2222,9 +2222,9 @@ int WINAPI application_main(HINSTANCE instance, int show) {
                 const auto result=Cluster().invoke_mcp(name,input.value("arguments",Json::object()));
                 std::ofstream output(response,std::ios::binary);output<<Json{{"ok",true},{"result",result}}.dump();output.close();return output?0:1;
             } catch (const fatfish::DispatchError& e) {
-                std::ofstream output(response,std::ios::binary);output<<Json{{"ok",false},{"error",e.what()},{"details",e.details}}.dump();return 1;
+                std::ofstream output(response,std::ios::binary);output<<Json{{"ok",false},{"error",e.what()},{"code",e.details.value("code",e.details.value("reason","team_request_failed"))},{"details",e.details}}.dump();return 1;
             } catch (const std::exception& e) {
-                std::ofstream output(response,std::ios::binary);output<<Json{{"ok",false},{"error",e.what()}}.dump();return 1;
+                std::ofstream output(response,std::ios::binary);output<<Json{{"ok",false},{"error",e.what()},{"code","team_request_failed"}}.dump();return 1;
             }
         }
         LocalFree(argv);

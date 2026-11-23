@@ -34,6 +34,7 @@ public:
     Json invoke_mcp(std::string_view tool,const Json& input) const;
     Json update_model_field(const std::string& id,const std::string& field,
                             const Json& expected,const Json& value) const;
+    Json team_session_reservations(std::string_view project_id) const;
     Json desktop_snapshot(DesktopMonitor* monitor=nullptr,std::stop_token stop={}) const;
     Json mark_desktop_failed(const std::string& session_id) const;
     void delete_desktop_queue(std::string_view queue_id) const;

@@ -56,7 +56,7 @@ inline std::string task_plan_error(const Json& tasks,std::size_t maximum) {
     for (std::size_t k=0;k<tasks.size();++k) for (std::size_t i=0;i<tasks.size();++i) for (std::size_t j=0;j<tasks.size();++j) closure[i][j]=closure[i][j] || (closure[i][k] && closure[k][j]);
     for (std::size_t a=0;a<tasks.size();++a) for (std::size_t b=a+1;b<tasks.size();++b)
         if (!closure[a][b] && !closure[b][a]) for (const auto& x:tasks.at(a).at("files")) for (const auto& y:tasks.at(b).at("files"))
-            if (plan_scopes_overlap(x.get<std::string>(),y.get<std::string>())) return "并行任务写入边界重叠；主代理须拆分文件或声明真实依赖";
+            if (plan_scopes_overlap(x.get<std::string>(),y.get<std::string>())) return "并行任务写入边界重叠："+tasks.at(a).at("name").get<std::string>()+" ["+x.get<std::string>()+"] 与 "+tasks.at(b).at("name").get<std::string>()+" ["+y.get<std::string>()+"]；请分配文件所有权或声明真实依赖";
     return {};
 }
 // State is derived from the actual ledger. A developer finishing is not acceptance.

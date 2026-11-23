@@ -110,15 +110,35 @@ try {
     const charter={objective:'\u3000 Implement and independently verify the fixture \r\n',acceptance:'Review and actual branch tests',constraints:'Preserve data',architecture:'One manager',authority:'Local worktrees',escalation:'Real blocking failures'};
     const contract=(name,files,dependsOn=[])=>({name,files,dependsOn,steps:'Implement only this task in its branch and return candidate',acceptance:'Independent review and actual branch tests pass',startCondition:'All declared dependencies accepted; baseline available',tests:'node -e "process.exit(0)"'});
     const input={requestId:'loop-project',title:'Two-loop fixture',workspace:repo,charter,tasks:[contract('Feature',['feature.txt']),contract('Parallel',['parallel.txt']),contract('After',['after.txt'],['Feature'])],domains:[{name:'Manager',mission:'Run the plan',acceptance:'Every task accepted',dependencies:[]}]};
-    await tool('team_start_project',{...input,requestId:'multi',domains:[...input.domains,{...input.domains[0],name:'Other'}]},true);
-    await tool('team_start_project',{...input,requestId:'over-plan',tasks:Array.from({length:4},()=>input.tasks[0])},true);
-    await tool('team_start_project',{...input,requestId:'missing-contract',tasks:[{name:'Broken',steps:'Implement',acceptance:'Pass'}]},true);
-    await tool('team_start_project',{...input,requestId:'unknown-dependency',tasks:[contract('A',['a.txt'],['Missing'])]},true);
-    await tool('team_start_project',{...input,requestId:'cyclic',tasks:[contract('A',['a.txt'],['B']),contract('B',['b.txt'],['A'])]},true);
-    await tool('team_start_project',{...input,requestId:'overlapping-writers',tasks:[contract('A',['src/**']),contract('B',['src/file.cpp'])]},true);
+    await tool('team_start_project',{...input,queueId:undefined,requestId:'multi',domains:[...input.domains,{...input.domains[0],name:'Other'}]},true);
+    await tool('team_start_project',{...input,queueId:undefined,requestId:'over-plan',tasks:Array.from({length:4},()=>input.tasks[0])},true);
+    await tool('team_start_project',{...input,queueId:undefined,requestId:'missing-contract',tasks:[{name:'Broken',steps:'Implement',acceptance:'Pass'}]},true);
+    await tool('team_start_project',{...input,queueId:undefined,requestId:'unknown-dependency',tasks:[contract('A',['a.txt'],['Missing'])]},true);
+    await tool('team_start_project',{...input,queueId:undefined,requestId:'cyclic',tasks:[contract('A',['a.txt'],['B']),contract('B',['b.txt'],['A'])]},true);
+    await tool('team_start_project',{...input,queueId:undefined,requestId:'overlapping-writers',tasks:[contract('A',['src/**']),contract('B',['src/file.cpp'])]},true);
     const defaultQueue=(await tool('cluster_create_queue',{name:'Default team queue',requestId:'default-team'})).queueId;
     assert.equal((await tool('team_get_queue',{queueId:defaultQueue})).mode,'team','unbound queues default to team collaboration');
-    const started=await tool('team_start_project',input),pid=started.projectId;
+    const startupQueue=(await tool('cluster_create_queue',{name:'Existing startup queue',requestId:'existing-startup'})).queueId;
+    const started=await tool('team_start_project',{...input,queueId:startupQueue}),pid=started.projectId;
+    input.queueId=startupQueue;
+    assert.equal(started.status,'draft');
+    assert.equal((await tool('team_get_queue',{queueId:startupQueue})).nextAction,'review_and_activate_plan');
+    const boundError=await tool('team_start_project',{...input,queueId:startupQueue.toLowerCase(),requestId:'another-draft'},true);
+    assert.equal(boundError.code,'queue_bound');
+    assert.equal(boundError.details.boundProjectId,pid);
+    assert.ok(boundError.allowedActions.includes('team_activate_project'));
+    const guessedField=await tool('team_start_project',{...input,requestId:'unknown-field',projectId:pid},true);
+    assert.equal(guessedField.details.field,'projectId');
+    const activate={projectId:pid,requestId:'activate-fixture',expectedVersion:1};
+    assert.equal((await tool('team_activate_project',{...activate,expectedVersion:0},true)).code,'version_conflict');
+    await close();
+    ({tool,rpc}=await connect());
+    assert.deepEqual((await disk()).projects[pid].jobs,{});
+    assert.equal(number,0,'saved draft does not create a session even after restart');
+    const activated=await tool('team_activate_project',activate);
+    assert.equal(activated.status,'starting');
+    assert.ok(activated.managerStartup.jobId,'activation persists the manager job before replying');
+    assert.equal((await tool('team_activate_project',activate)).managerStartup.jobId,activated.managerStartup.jobId);
     assert.equal((await tool('team_start_project',input)).projectId,pid);
     const leader=await until(async()=>Object.values((await disk()).projects[pid].jobs).find(j=>j.role==='lead'&&j.sessionId&&j.state==='running'),'single manager');
     const native=async()=>JSON.parse(await readFile(join(data,'state.json'),'utf8'));
@@ -160,7 +180,11 @@ try {
     const waitSchema=listed.find(t=>t.name==='team_wait_decisions').inputSchema;
     assert.equal(waitSchema.properties.timeoutMs.maximum,300000);
     assert.equal(waitSchema.properties.timeoutMs.default,300000);
+    const emptyCursor=await tool('team_wait_decisions',{projectId:pid,afterCursor:'',timeoutMs:0});assert.equal(emptyCursor.managerStartup.confirmed,true,'wait confirms actual manager goal and accepts empty optional cursor');
     const before=Date.now();assert.equal((await tool('team_wait_decisions',{projectId:pid,timeoutMs:50})).timedOut,true);assert.ok(Date.now()-before>=50);
+    const quiet=await tool('team_wait_decisions',{projectId:pid,afterCursor:pid+':0',timeoutMs:50});
+    assert.equal(quiet.timedOut,true,'routine activation does not wake the principal');
+    assert.equal(quiet.cursor,emptyCursor.cursor,'quiet wait advances past routine events');
     const leaderRemote=await remote(leader);
     states.set(leaderRemote,{cursor:2,running:false,queue:[],pendingInput:[]});
     assert.equal((await call('team_domain_read',{operation:'cluster_get_session_status',arguments:{sessionId:leader.sessionId}})).status,'running','active goal idle gap stays running');
@@ -293,6 +317,8 @@ try {
 
     assert.equal((await call('team_priority_results')).count,0,'accepted requires no integration task');
     const pendingDecision=await call('team_escalate',{requestId:'wait-decision-fixture',jobId:completed.jobId,question:'Fixture pending decision after workers end',reason:'Verify MCP wait does not spin when only a decision remains',recommendation:'Resolve fixture decision',alternatives:'None',impact:'Fixture only',blockedScope:'Fixture completion'});
+    const decisionFeedback=await tool('team_wait_decisions',{projectId:pid,afterCursor:quiet.cursor,timeoutMs:5000});
+    assert.ok(decisionFeedback.events.some(e=>e.detail.decisionId===pendingDecision.decisionId),'open decision wakes the principal');
     assert.equal((await call('team_wait_actions',{timeoutMs:100})).timedOut,true,'no active workers plus pending decision must wait rather than return completion_check');
     await tool('team_resolve_decision',{projectId:pid,decisionId:pendingDecision.decisionId,expectedRevision:pendingDecision.revision,requestId:'resolve-wait-fixture',resolution:'Fixture decision resolved'});
 
@@ -318,14 +344,49 @@ try {
     goals.get(await remote(leader)).phase='complete';states.set(await remote(leader),{cursor:7,running:false,queue:[],pendingInput:[]});
     await until(async()=>(await disk()).projects[pid].jobs[leader.jobId].observedTerminal,'manager ends naturally');
     await tool('team_update_charter',{projectId:pid,requestId:'rework-plan',expectedVersion:1,charter:{...charter,objective:'Complete a new explicitly documented rework plan'},changeSummary:'Principal final acceptance requests rework'});
+    assert.equal((await tool('team_get_project',{projectId:pid})).status,'draft');
+    await tool('team_activate_project',{projectId:pid,expectedVersion:2,requestId:'activate-rework'});
     authz.charterVersion=2;
     const nextManager=await until(async()=>Object.values((await disk()).projects[pid].jobs).find(j=>j.role==='lead'&&j.jobId!==leader.jobId&&j.sessionId&&j.state==='running'),'next full-plan manager round');
     assert.ok(goals.get(await remote(nextManager)).objective.endsWith('Complete a new explicitly documented rework plan'));
     // Restart transport: state and accepted source remain durable.
     await close();({tool,rpc}=await connect());
     assert.equal((await tool('team_get_project',{projectId:pid})).charterVersion,2);
-    await tool('team_control_project',{projectId:pid,requestId:'cancel',action:'cancel'});
+    const cancel={projectId:pid,requestId:'cancel',action:'cancel'};
+    assert.equal((await tool('team_control_project',{...cancel,dryRun:true})).willDrain,true);
+    assert.equal((await tool('team_control_project',cancel,true)).code,'confirmation_required');
+    const stoppingManager=await remote(nextManager);
+    failedCancellations.add(stoppingManager);
+    const cancelled=await tool('team_control_project',{...cancel,confirm:true});
+    assert.equal(cancelled.archived,true);
+    assert.ok(cancelled.closedAt);
+    assert.ok(!cancelled.domains[0].goal);
+    assert.equal((await tool('team_control_project',{...cancel,requestId:'resume-closed',action:'resume'},true)).code,'project_terminal');
+    const drainingQueue=await tool('team_get_queue',{queueId:startupQueue});
+    assert.equal(drainingQueue.nextAction,'wait_for_project_shutdown');
+    assert.equal(drainingQueue.drainingProject.projectId,pid);
+    const drainingError=await tool('team_start_project',{...input,requestId:'early-takeover',replaceProjectId:pid},true);
+    assert.equal(drainingError.code,'queue_draining');
+    failedCancellations.delete(stoppingManager);
     await until(async()=>Object.values((await disk()).projects[pid].jobs).every(j=>['succeeded','failed','cancelled','interrupted'].includes(j.state)),'cancel all sessions');
+    const freeQueue=await until(async()=>{
+        const queue=await tool('team_get_queue',{queueId:startupQueue});
+        return queue.nextAction==='take_over_queue_history'&&queue;
+    },'cancelled project releases the original queue');
+    assert.equal(freeQueue.project,null);
+    assert.equal(freeQueue.previousProject.projectId,pid);
+    const archive=await tool('team_get_project',{projectId:pid});
+    assert.equal(archive.managerStartup.elapsedMs,cancelled.managerStartup.elapsedMs);
+    assert.ok(!(await tool('team_list_projects')).projects.some(p=>p.projectId===pid));
+    assert.ok((await tool('team_list_projects',{includeArchived:true})).projects.some(p=>p.projectId===pid));
+    assert.equal((await tool('team_start_project',{...input,requestId:'stale-takeover',replaceProjectId:'wrong'},true)).code,'version_conflict');
+    const replacement=await tool('team_start_project',{...input,requestId:'takeover',replaceProjectId:pid});
+    assert.equal(replacement.status,'draft');
+    assert.equal(replacement.queueId,startupQueue);
+    assert.equal(replacement.replacesProjectId,pid);
+    assert.ok(replacement.historyCounts.integrated>0,'takeover keeps the queue ledger');
+    assert.deepEqual((await disk()).projects[replacement.projectId].jobs,{});
+    await tool('team_control_project',{projectId:replacement.projectId,requestId:'close-replacement',action:'cancel',confirm:true});
     const pinnedWorker=await tool('cluster_start_session',{queueId:defaultQueue,requestId:'direct-fixed-account',title:'Explicit account remains fixed',batch:'direct-fixed-account',role:'developer',workspace:repo,task:'Fixture only',baseSha:candidate,poolId:pools.dev});
     assert.equal((await native()).sessions[pinnedWorker.id].poolId,pools.dev,'non-team explicit pool selection stays pinned');
     await tool('cluster_cancel_session',{queueId:defaultQueue,sessionId:pinnedWorker.id});
@@ -336,6 +397,7 @@ try {
     await tool('cluster_refresh_sessions',{queueId:historyQueue,limit:20});
     await tool('cluster_cancel_session',{queueId:historyQueue,sessionId:oldSession.id},true);
     const historyProject=await tool('team_start_project',{...input,requestId:'history-retirement',queueId:historyQueue,tasks:[contract('Current',['feature.txt'])]});
+    await tool('team_activate_project',{projectId:historyProject.projectId,requestId:'activate-history',expectedVersion:1});
     const historyLead=await until(async()=>Object.values((await disk()).projects[historyProject.projectId].jobs).find(j=>j.role==='lead'&&j.sessionId&&j.state==='running'),'history manager');
     const historyDomain=Object.values((await disk()).projects[historyProject.projectId].domains)[0];
     const historyAuth={projectId:historyProject.projectId,domainId:historyDomain.domainId,token:historyDomain.token,charterVersion:1};
@@ -348,11 +410,12 @@ try {
     assert.equal(historyLedger.state,'cancelled');assert.equal(Object.values((await disk()).projects[historyProject.projectId].jobs).filter(j=>j.role==='repair').length,0,'retirement never dispatches fake history-repair jobs');
     const afterRetirement=await tool('team_next_action',historyAuth);
     assert.ok(afterRetirement.items.every(j=>j.workItemId!==oldSession.workItemId),'obsolete handoff leaves the FIFO without a fake repair');
-    await tool('team_control_project',{projectId:historyProject.projectId,requestId:'close-history-fixture',action:'cancel'});
+    await tool('team_control_project',{projectId:historyProject.projectId,requestId:'close-history-fixture',action:'cancel',confirm:true});
     // A missing, wrong or paused goal cannot start a manager prompt.
     for(const mode of ['missing','mismatch','paused']) {
         nextGoalMode=mode;
-        const failedProject=await tool('team_start_project',{...input,requestId:`goal-${mode}`});
+        const failedProject=await tool('team_start_project',{...input,queueId:undefined,requestId:`goal-${mode}`});
+        await tool('team_activate_project',{projectId:failedProject.projectId,requestId:`activate-${mode}`,expectedVersion:1});
         const failedManager=await until(async()=>Object.values((await disk()).projects[failedProject.projectId].jobs).find(j=>j.role==='lead'&&j.state==='failed'&&j.sessionId),`goal ${mode} bounded failure`);
         const failedNative=(await native()).sessions[failedManager.sessionId];
         assert.equal(failedNative.failureStage,'set_goal');
@@ -362,8 +425,27 @@ try {
         assert.equal(prompts.has(failedNative.dshId),false,'unverified goal never receives task prompt');
         assert.equal(goalWrites.get(failedNative.dshId),1,'never duplicate goal command');
         assert.ok(goalReads.get(failedNative.dshId)>=20 && goalReads.get(failedNative.dshId)<40,'verification stops after bounded reads including background observation');
-        await tool('team_control_project',{projectId:failedProject.projectId,requestId:`cancel-${mode}`,action:'cancel'});
+        await tool('team_control_project',{projectId:failedProject.projectId,requestId:`cancel-${mode}`,action:'cancel',confirm:true});
     }
+    // A scheduler that never created a manager must wake the principal even
+    // with an up-to-date cursor. Use the non-scheduling CLI to isolate this race.
+    await close();
+    const stranded=await disk();
+    const strandedId='startup-stalled-fixture';
+    stranded.projects[strandedId]={...stranded.projects[pid],projectId:strandedId,status:'running',updated:Date.now()-31000,jobs:{},sequence:0,events:[],decisions:{}};
+    await writeFile(join(data,'teams.json'),JSON.stringify(stranded));
+    const stalledRequest=join(root,'startup-wait.request.json'),stalledResponse=join(root,'startup-wait.response.json');
+    await writeFile(stalledRequest,JSON.stringify({tool:'team_wait_decisions',arguments:{projectId:strandedId,afterCursor:strandedId+':0',timeoutMs:20000}}));
+    const stalledStart=Date.now();
+    await run(executable,['--team-call',stalledRequest,stalledResponse],{env,windowsHide:true});
+    const stalledResult=JSON.parse(await readFile(stalledResponse,'utf8'));
+    assert.equal(stalledResult.ok,true);
+    assert.equal(stalledResult.result.status,'starting');
+    assert.equal(stalledResult.result.needsAttention,true);
+    assert.equal(stalledResult.result.managerStartup.stage,'manager_not_queued');
+    assert.ok(stalledResult.result.managerStartup.reason);
+    assert.equal(stalledResult.result.timedOut,false);
+    assert.ok(Date.now()-stalledStart<5000,'stalled startup wakes wait immediately');
     console.log('Ready-plan batch dispatch and acceptance dependency gates passed. Two-loop behavior passed: one real goal, isolated branches, failed review/repair/new review, actual failed/passed tests, acceptance without integrator, principal merge, durable rework and cancellation.');
 } finally {
     await close();await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true});

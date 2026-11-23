@@ -1289,12 +1289,12 @@ void Cluster::require_open_queue() const {
 void Cluster::delete_desktop_queue(std::string_view queue_id) const {
     const auto deleting=for_queue(queue_id);
     const auto& key=deleting.queue_id_;
-    const auto team=invoke("team_get_queue",{{"queueId",key}}).value("project",Json());
-    require(!team.is_object() || (team.value("status","")!="running" && team.value("status","")!="starting" && team.value("status","")!="finishing"),"执行中的团队队列不能删除，请等待任务结束");
+
     require(key!=legacy_queue_id_,"原有队列保存历史任务，不能删除");
     const ExclusiveStateLock lock(deleting.handoff_file(true));
     Database db(data_,true);
     if (!open_queue(db.state,key)) return;
+    require(!team_managed_queue(data_,key),"队列有团队项目或正在结束会话，请先关闭项目并等待会话退出");
     db.state.at("queues").at(key)["deletedAt"]=now();
     if (db.state.value("desktopQueueId",legacy_queue_id_)==key) db.state["desktopQueueId"]=legacy_queue_id_;
     // Keep the sessions, receipts and dispatch request IDs with their original queue UUID.
@@ -1542,6 +1542,15 @@ Json Cluster::mark_desktop_failed(const std::string& key) const {
     fail_dispatch(row,"manual_failure",message);
     db.save();
     return public_row(row);
+}
+
+Json Cluster::team_session_reservations(std::string_view project_id) const {
+    Database db(data_,false);
+    Json reservations=Json::object();
+    for (const auto& row:db.state.at("sessions"))
+        if (row.value("queueId",legacy_queue_id_)==queue_id_ && row.value("teamProjectId","")==project_id && row.contains("teamJobId"))
+            reservations[row.at("teamJobId").get<std::string>()]=row.at("id");
+    return reservations;
 }
 
 Json Cluster::desktop_snapshot(DesktopMonitor* monitor,std::stop_token stop) const {

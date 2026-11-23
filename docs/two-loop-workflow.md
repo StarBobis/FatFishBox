@@ -1,9 +1,9 @@
-# Two-loop workflow (0.1.11 / policy v13)
+# Two-loop workflow
 
 ## Principal
-Read the request and repository instructions. Write a clear plan limited to the requested behavior, with independent task boundaries, dependencies and proportionate functional checks. Do not add proof obligations, screenshot matrices, manifests or full-product audits. Commit the plan and start one persistent-goal manager through team_start_project. Use team_get_queue to resume an existing project rather than duplicate it.
+Read the request and repository instructions. Write a clear plan limited to the requested behavior, with independent task boundaries, dependencies and proportionate functional checks. Do not add proof obligations, screenshot matrices, manifests or full-product audits. Save the plan as a draft with team_start_project. After planning is finished, call team_activate_project with the reviewed charterVersion as expectedVersion to start one persistent-goal manager. Use team_get_queue to read the available actions. Update an active plan with team_update_charter. For permanent cancellation, preview with dryRun and apply with confirm. After shutdown, use the same queueId and optionally replaceProjectId to save the replacement draft and keep the queue history.
 
-Wait through team_wait_decisions for up to 300000 ms. React to early completion or decisions immediately; never sleep or fill unused wait time. On manager completion, inspect the changes and merge accepted work into main, recording integration through team_record_merge. If functional work needs repair, provide a complete updated plan. Do not ask workers to collect proof of routine completion.
+Wait through team_wait_decisions for up to 300000 ms. Wait on the same pending call handle. Resume silently with the returned cursor on timeout. When a transport deadline interrupts delivery, keep the previous cursor and request a shorter wait. Inspect only a specific decision or reported error during execution. On manager completion, inspect the changes and merge accepted work into main, recording integration through team_record_merge. If functional work needs repair, provide a complete updated plan. Do not ask workers to collect proof of routine completion.
 
 ## Project manager
 Read the bootstrap plan, team_get_contract and team_domain_context. Preserve project/domain credentials, request IDs, work item identities and existing sessions across reconnects.

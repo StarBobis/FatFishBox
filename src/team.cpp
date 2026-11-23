@@ -1,5 +1,6 @@
 #include "team.h"
 #include "team_scheduler.h"
+#include "team_startup.h"
 #include "task_plan.h"
 #include "diagnostics.h"
 #include "dsh.h"
@@ -21,9 +22,9 @@ namespace fatfish {
 namespace {
 void check(bool yes,const char* message) { if (!yes) throw std::runtime_error(message); }
 std::string text(const Json& j,const char* key,std::size_t max=8000) {
-    check(j.contains(key) && j.at(key).is_string(),"缺少必需文本字段");
+    if (!j.contains(key) || !j.at(key).is_string()) throw std::runtime_error(std::string("缺少必需文本字段：")+key);
     const auto s=j.at(key).get<std::string>();
-    check(!s.empty() && s.size()<=max && s.find('\0')==s.npos && s.find_first_not_of(" \r\n\t")!=s.npos,"文本为空或超出长度限制");
+    check(!s.empty() && s.size()<=max && s.find('\0')==s.npos && s.find_first_not_of(" \r\n\t")!=s.npos,(std::string("文本为空或超出长度限制：")+key).c_str());
     return s;
 }
 bool terminal(const std::string& s) { return s=="succeeded" || s=="failed" || s=="cancelled" || s=="interrupted"; }
@@ -41,6 +42,11 @@ public:
         for(auto& p:value["projects"]) for(auto& d:p["decisions"]) if(d.value("state","")=="open" && (d.contains("evidenceSessionId") || d.contains("blockedSessionId"))) {
             d["state"]="resolved";d["revision"]=d.value("revision",0)+1;d["resolution"]="Formal evidence/review gates were removed under policy v13; resume normal work and manager judgement.";
             event(p,"evidence.policy_relaxed",{{"decisionId",d.at("decisionId")}});migrated=true;
+        }
+        for (auto& p:value["projects"]) if (!p.contains("closedAt") &&
+            (p.at("status")=="cancelled" || p.at("status")=="completed")) {
+            p["closedAt"]=p.value("updated",0LL);
+            migrated=true;
         }
         if(migrated) save();
     }
@@ -119,10 +125,64 @@ void event(Json& p,const std::string& kind,const Json& detail) {
     p["events"].push_back({{"sequence",sequence},{"kind",kind},{"detail",detail},{"time",now()}});
     if (p["events"].size()>256) p["events"].erase(p["events"].begin());
 }
+std::string canonical_queue(std::string queue) {
+    for (auto& ch:queue) if (ch>='a' && ch<='f') ch=char(ch-'a'+'A');
+    return queue;
+}
+bool archived_project(const Json& p) {
+    return p.at("status")=="cancelled" || p.at("status")=="completed";
+}
+bool has_unsettled_jobs(const Json& p) {
+    return std::ranges::any_of(p.at("jobs"),[](const Json& j) {
+        return !terminal(j.at("state").get<std::string>()) ||
+            (j.contains("sessionId") && !j.value("observedTerminal",false));
+    });
+}
+bool holds_queue(const Json& p) {
+    return !archived_project(p) || has_unsettled_jobs(p);
+}
+Json project_actions(const Json& p) {
+    const auto status=p.at("status").get<std::string>();
+    if (status=="cancelled") return Json::array({"team_get_queue"});
+    if (status=="completed") return Json::array({"team_record_merge","team_update_charter"});
+    if (status=="draft") return Json::array({"team_update_charter","team_activate_project","cancel"});
+    if (status=="paused") {
+        auto actions=Json::array({"team_update_charter","cancel"});
+        if (!has_unsettled_jobs(p)) actions.push_back("resume");
+        return actions;
+    }
+    if (status=="finishing") return Json::array({"team_wait_decisions","cancel"});
+    return Json::array({"team_update_charter","team_wait_decisions","pause","cancel"});
+}
+void team_error(const std::string& code,const std::string& message,Json details,Json actions) {
+    throw DispatchError(message,{{"code",code},{"reason",code},{"message",message},
+        {"details",std::move(details)},{"allowedActions",std::move(actions)}});
+}
+void queue_conflict(const Json& p) {
+    const bool draining=archived_project(p);
+    team_error(draining?"queue_draining":"queue_bound",
+        draining?"旧项目的会话正在停止，确认退出后可接管队列":"队列已有项目，请按当前状态继续或更新计划",
+        {{"queueId",p.at("queueId")},{"boundProjectId",p.at("projectId")},{"projectStatus",p.at("status")}},
+        draining?Json::array({"team_get_queue","team_wait_decisions"}):project_actions(p));
+}
+const Json* latest_archive(const Json& projects,const std::string& queue) {
+    const Json* latest=nullptr;
+    for (const auto& p:projects) if (canonical_queue(p.value("queueId",""))==queue && archived_project(p) &&
+        (!latest || p.value("closedAt",p.value("updated",0LL))>latest->value("closedAt",latest->value("updated",0LL)))) latest=&p;
+    return latest;
+}
 Json project_summary(const Json& p) {
     Json result;
     for (const auto* k:{"projectId","queueId","title","workspace","baseSha","status","charterVersion","updated","sequence"})
         if (p.contains(k)) result[k]=p.at(k);
+    const bool archived=archived_project(p);
+    result["archived"]=archived;
+    result["allowedActions"]=project_actions(p);
+    result["draining"]=archived && has_unsettled_jobs(p);
+    if (archived) result["closedAt"]=p.value("closedAt",p.value("updated",0LL));
+    if (p.contains("replacesProjectId")) result["replacesProjectId"]=p.at("replacesProjectId");
+    result["managerStartup"]=team_manager_startup(p,archived?result.at("closedAt").get<std::int64_t>():now());
+    if (p.at("status")=="running" && result["managerStartup"].at("pending")==true) result["status"]="starting";
     result["pollIntervalMs"]=300000;result["tasks"]=p.value("tasks",Json::array());
     result["domains"]=Json::array();
     int complete=0,pending=0,running=0;
@@ -131,7 +191,7 @@ Json project_summary(const Json& p) {
             if (d.contains(k)) row[k]=d.at(k);
         std::int64_t latest=-1;
         for (const auto& job:p.at("jobs")) if (job.at("role")=="lead" && job.at("domainId")==d.at("domainId") && job.value("created",0LL)>=latest) {
-            latest=job.value("created",0LL);row["leadState"]=job.at("state");row["leadSessionId"]=job.value("sessionId","");if (job.contains("goal")) row["goal"]=job.at("goal");
+            latest=job.value("created",0LL);row["leadState"]=job.at("state");row["leadSessionId"]=job.value("sessionId","");if (!archived && job.contains("goal")) row["goal"]=job.at("goal");
         }
         if (d.at("state")=="completed") ++complete;
         result["domains"].push_back(std::move(row));
@@ -418,6 +478,20 @@ Json new_job(const Json& p,const Json& d,const std::string& role,const std::stri
         {"baseSha",base},{"state","queued"},{"created",now()},{"attempts",0},{"requestId","team-"+key},
         {"charterVersion",p.at("charterVersion")}};
 }
+void prepare_manager(Json& current) {
+    if (current.at("status")!="running" || !current.contains("queueId")) return;
+    for (auto& d:current["domains"]) {
+        if (d.at("state")=="completed") continue;
+        bool exists=false;
+        for (const auto& job:current.at("jobs")) if (job.at("domainId")==d.at("domainId") && job.at("role")=="lead" && (!terminal(job.at("state").get<std::string>()) || (job.value("charterVersion",0)==current.at("charterVersion").get<int>() && !job.value("restartOnResume",false)))) exists=true;
+        if (exists) continue;
+        auto job=new_job(current,d,"lead","项目经理 · "+d.at("name").get<std::string>(),
+            "Read team_domain_context and the complete plan. Queue all ready tasks through team_dispatch_ready, then handle team_next_action FIFO. Developers perform relevant self-tests, then independent review. Confirm tasks using judgement; extra manager tests are optional. Do not collect proof or expand work into exhaustive audits. Repeat ready dispatch after each handled result. Wait only through team_wait_actions; never sleep. When all planned items are accepted, team_finish_domain, complete the goal and exit naturally.",current.at("baseSha").get<std::string>());
+        job["schedulerPolicyVersion"]=13;job["wake"]=d.at("wake");
+        current["jobs"][job.at("jobId").get<std::string>()]=job;d["state"]="working";
+    }
+}
+
 Json dispatch_readiness(const Cluster& cluster,const Json& p) {
     const auto tasks=p.value("tasks",Json::array());
     const auto error=task_plan_error(tasks,64);
@@ -462,7 +536,7 @@ std::string team_prompt(std::string_view role) {
     return worker_prompt;
 }
 bool team_managed_queue(const fs::path& data,std::string_view queue) {
-    Store store(data);for (const auto& p:store.value.at("projects")) if (p.value("queueId","")==queue) return true;
+    Store store(data);for (const auto& p:store.value.at("projects")) if (canonical_queue(p.value("queueId",""))==canonical_queue(std::string(queue)) && holds_queue(p)) return true;
     return false;
 }
 void check_team_reservation(const fs::path& data,const Json& sessions,const Json& input) {
@@ -480,7 +554,35 @@ void check_team_reservation(const fs::path& data,const Json& sessions,const Json
 
 Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view tool,const Json& in) {
     check(in.is_object(),"参数须为对象");
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");return {{"version",13},{"prompt",team_prompt(role)}};}
+    if (tool=="team_start_project" || tool=="team_activate_project" || tool=="team_wait_decisions" ||
+        tool=="team_control_project" || tool=="team_update_charter") {
+        static const auto catalog=team_tools();
+        const auto entry=std::ranges::find_if(catalog,[&](const Json& item) {return item.at("name").get<std::string>()==tool;});
+        const auto& schema=entry->at("inputSchema");
+        const auto& properties=schema.at("properties");
+        for (const auto& key:schema.at("required"))
+            if (!in.contains(key.get<std::string>()))
+                team_error("invalid_arguments","缺少必需字段",{{"field",key}},Json::array({"team_get_prompt"}));
+        for (const auto& [key,value]:in.items()) {
+            if (!properties.contains(key))
+                team_error("invalid_arguments","工具不接受该字段",{{"field",key}},Json::array({"team_get_prompt"}));
+            const auto type=properties.at(key).at("type");
+            const bool valid=(type=="string" && value.is_string()) || (type=="integer" && value.is_number_integer()) ||
+                (type=="boolean" && value.is_boolean()) || (type=="object" && value.is_object()) ||
+                (type=="array" && value.is_array());
+            if (!valid) team_error("invalid_arguments","字段类型不正确",{{"field",key},{"expectedType",type}},Json::array({"team_get_prompt"}));
+        }
+    }
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");auto out=Json{{"version",role=="principal"?15:13},{"prompt",team_prompt(role)}};
+        if (role=="principal") {
+            out["tools"]=Json::object();
+            for (const auto& entry:team_tools()) {
+                const auto name=entry.at("name").get<std::string>();
+                if (name=="team_start_project" || name=="team_activate_project" || name=="team_wait_decisions" || name=="team_control_project")
+                    out["tools"][name]=entry.at("inputSchema");
+            }
+        }
+        return out;}
     if (tool=="team_get_settings") { Store s(data);return s.value.at("settings"); }
     if (tool=="team_update_settings") {
         Store s(data);auto& settings=s.value["settings"];
@@ -491,17 +593,33 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         next["revision"]=settings.at("revision").get<int>()+1;settings=next;s.save();return next;
     }
     if (tool=="team_list_projects") {
-        Store s(data);Json rows=Json::array();for (const auto& p:s.value.at("projects")) rows.push_back(project_summary(p));return {{"projects",rows}};
+        Store s(data);Json rows=Json::array();
+        for (const auto& p:s.value.at("projects"))
+            if (!archived_project(p) || in.value("includeArchived",false)) rows.push_back(project_summary(p));
+        return {{"projects",rows}};
     }
     if (tool=="team_get_queue" || tool=="team_desktop_queue") {
-        const auto queue=text(in,"queueId",100);cluster.for_queue(queue);
-        Store s(data);Json bound=nullptr;
-        for (const auto& p:s.value.at("projects")) if (p.value("queueId","")==queue) {bound=project_summary(p);break;}
-        // The desktop has one execution path. Old saved direct preferences no longer select a mode.
-        return {{"queueId",queue},{"mode","team"},{"project",bound},
-            {"principalPromptVersion",13},{"historyTakeoverSupported",true},
-            {"nextAction",bound.is_null()?"task_authorized_then_team_start_project_same_queue":"resume_bound_project"},
-            {"guidance","Use team_get_prompt({role:principal}) v13. The manager handles team_next_action FIFO without preemption in one persistent goal. The principal waits through team_wait_decisions for up to 300000 ms and handles early feedback immediately."}};
+        const auto queue=canonical_queue(text(in,"queueId",100));cluster.for_queue(queue);
+        Store s(data);Json bound=nullptr,draining=nullptr,history=nullptr;
+        for (const auto& p:s.value.at("projects")) if (canonical_queue(p.value("queueId",""))==queue && holds_queue(p)) {
+            if (archived_project(p)) draining=project_summary(p);
+            else bound=project_summary(p);
+        }
+        if (const auto* p=latest_archive(s.value.at("projects"),queue))
+            history={{"projectId",p->at("projectId")},{"status",p->at("status")},{"closedAt",p->value("closedAt",p->value("updated",0LL))}};
+        std::string next="start_project_draft";
+        Json actions=Json::array({"team_start_project"});
+        if (!draining.is_null()) {next="wait_for_project_shutdown";actions=Json::array({"team_get_queue","team_wait_decisions"});}
+        else if (!bound.is_null()) {
+            const auto status=bound.at("status").get<std::string>();
+            if (status=="draft") next="review_and_activate_plan";
+            else if (status=="paused") next="review_paused_project";
+            else if (bound.at("managerStartup").value("needsAttention",false)) next="inspect_manager_status";
+            else next="monitor_project";
+            actions=bound.at("allowedActions");
+        } else if (!history.is_null()) next="take_over_queue_history";
+        return {{"queueId",queue},{"mode","team"},{"project",bound},{"drainingProject",draining},{"previousProject",history},
+            {"principalPromptVersion",15},{"historyTakeoverSupported",true},{"nextAction",next},{"allowedActions",actions}};
     }
     if (tool=="team_start_project") {
         const auto request=text(in,"requestId",100),title=text(in,"title",200);
@@ -515,7 +633,19 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
                 const auto& old=s.value.at("requests").at(request);check(old.at("input")==in,"requestId 已用于其他项目参数");return project_summary(s.value.at("projects").at(old.at("projectId").get<std::string>()));
             }
         }
-        const auto queue=in.value("queueId",std::string());
+        const auto queue=canonical_queue(in.value("queueId",std::string()));
+        const auto replace=in.value("replaceProjectId",std::string());
+        if (!replace.empty() && queue.empty())
+            team_error("invalid_arguments","replaceProjectId requires queueId",{{"field","queueId"}},Json::array({"team_get_queue"}));
+        if (!queue.empty()) {
+            Store s(data);
+            for (const auto& existing:s.value.at("projects"))
+                if (canonical_queue(existing.value("queueId",""))==queue && holds_queue(existing)) {
+                    if (const auto& requests=s.value.at("requests");requests.contains(request) && requests.at(request).at("input")==in)
+                        return project_summary(s.value.at("projects").at(requests.at(request).at("projectId").get<std::string>()));
+                    queue_conflict(existing);
+                }
+        }
         Json history={{"counts",Json::object()},{"items",Json::object()}};
         if (!queue.empty()) {
             const auto scoped=cluster.for_queue(queue);int offset=0;
@@ -540,30 +670,79 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             domains[key]={{"domainId",key},{"name",name},{"mission",text(entry,"mission",6000)},{"acceptance",text(entry,"acceptance",6000)},
                 {"dependencies",deps},{"token",id()},{"state","pending"},{"wake",1},{"checkpoint",Json::object()}};seen.insert(name);
         }
-        const auto settings=cluster.invoke("cluster_get_settings");
         {
             Store s(data);
             // Serialize creation against retries after the Git checks.
             if (s.value.at("requests").contains(request)) {
                 const auto& old=s.value.at("requests").at(request);check(old.at("input")==in,"requestId 参数不一致");return project_summary(s.value.at("projects").at(old.at("projectId").get<std::string>()));
             }
-            check(std::ranges::any_of(settings.at("pools"),[](const Json& pool){return pool.value("enabled",false);}),"请在账号与模型池启用至少一个模型");
-            if (!queue.empty()) for (const auto& existing:s.value.at("projects")) check(existing.value("queueId","")!=queue,"此队列已经绑定团队，请续接原项目");
-            const auto key=id();p={{"projectId",key},{"title",title},{"workspace",utf8(workspace)},{"baseSha",base},{"status","starting"},
+            const auto& projects=s.value.at("projects");
+            if (!queue.empty()) for (const auto& existing:projects)
+                if (canonical_queue(existing.value("queueId",""))==queue && holds_queue(existing)) queue_conflict(existing);
+            const auto* previous=queue.empty()?nullptr:latest_archive(projects,queue);
+            if (!replace.empty() && (!previous || previous->at("projectId")!=replace))
+                team_error("version_conflict","队列上的上一项目已变化，请重新读取队列",
+                    {{"queueId",queue},{"expectedProjectId",replace},{"actualProjectId",previous?previous->at("projectId"):Json()}},
+                    Json::array({"team_get_queue"}));
+            const auto key=id();p={{"projectId",key},{"title",title},{"workspace",utf8(workspace)},{"baseSha",base},{"status","draft"},
                 {"charter",in.at("charter")},{"charterVersion",1},{"config",s.value.at("settings")},{"domains",domains},
                 {"jobs",Json::object()},{"decisions",Json::object()},{"events",Json::array()},{"operations",Json::object()},{"sequence",0},{"updated",now()}};
-            if (!queue.empty()) {p["queueId"]=queue;p["status"]="running";}
+            if (!queue.empty()) p["queueId"]=queue;
+            if (previous) p["replacesProjectId"]=previous->at("projectId");
             check(s.value.at("settings").at("totalConcurrency").get<int>()>=2,"单goal经理需要至少2个总并发名额");
             const auto tasks=in.value("tasks",Json::array());
             const auto plan_error=task_plan_error(tasks,static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
-            if (!plan_error.empty()) throw std::runtime_error(plan_error);
+            if (!plan_error.empty()) team_error("invalid_plan",plan_error,Json::object(),Json::array({"team_start_project"}));
             std::set<std::string> task_names;for (const auto& task:tasks) {check(task_names.insert(text(task,"name",200)).second,"计划任务名称须唯一");text(task,"steps",12000);text(task,"acceptance",6000);}
-            p["tasks"]=tasks;p["protocolVersion"]=13;p["pollIntervalMs"]=300000;
+            p["tasks"]=tasks;p["protocolVersion"]=14;p["pollIntervalMs"]=300000;
             p["history"]=history;
             p["backlogOwnerDomainId"]=first_domain;
             s.value["projects"][key]=p;s.value["requests"][request]={{"projectId",key},{"input",in}};s.save();
         }
-        // Queue creation is recovered by advance_teams after interruption.
+        return project_summary(p);
+    }
+    if (tool=="team_activate_project") {
+        const auto request=text(in,"requestId",100);
+        const auto replay=[&](const Json& p)->Json {
+            const auto& ops=p.at("operations");
+            if (!ops.contains(request)) return nullptr;
+            const auto& saved=ops.at(request);
+            if (saved.value("tool","")!="team_activate_project" || saved.at("input")!=in)
+                team_error("request_conflict","requestId 已用于其他操作",{{"requestId",request}},Json::array());
+            return project_summary(p);
+        };
+        const auto validate=[&](const Json& p) {
+            if (p.at("status")!="draft")
+                team_error(archived_project(p)?"project_terminal":"invalid_project_state","只能启动已完成规划的草稿",
+                    {{"projectId",p.at("projectId")},{"projectStatus",p.at("status")}},project_actions(p));
+            if (p.at("charterVersion")!=in.at("expectedVersion"))
+                team_error("version_conflict","确认的计划版本已变化",{{"expectedVersion",in.at("expectedVersion")},{"actualVersion",p.at("charterVersion")}},
+                    Json::array({"team_get_project"}));
+        };
+        Json draft;
+        {
+            Store s(data);draft=project(s,in);
+            if (auto prior=replay(draft);!prior.is_null()) return prior;
+            validate(draft);
+        }
+        const auto workspace=path_from_utf8(draft.at("workspace").get<std::string>());
+        if (!git(workspace,{L"status",L"--porcelain"}).empty() ||
+            git(workspace,{L"rev-parse",L"--verify",L"HEAD"})!=draft.at("baseSha").get<std::string>())
+            team_error("baseline_changed","工作区已改变，请刷新草稿基线并核对完整计划",
+                {{"projectId",draft.at("projectId")},{"baseSha",draft.at("baseSha")}},Json::array({"team_update_charter"}));
+        const auto settings=cluster.invoke("cluster_get_settings");
+        if (std::ranges::none_of(settings.at("pools"),[](const Json& pool){return pool.value("enabled",false);}))
+            team_error("no_enabled_models","请在账号与模型池启用至少一个模型",Json::object(),Json::array({"team_activate_project"}));
+        Store s(data);auto& p=project(s,in);
+        if (auto prior=replay(p);!prior.is_null()) return prior;
+        validate(p);
+        const auto error=task_plan_error(p.at("tasks"),static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
+        if (!error.empty()) team_error("invalid_plan",error,Json::object(),Json::array({"team_update_charter"}));
+        p["status"]=p.contains("queueId")?"running":"starting";
+        prepare_manager(p);
+        event(p,"project.activated",{{"charterVersion",p.at("charterVersion")}});
+        p["operations"][request]={{"tool","team_activate_project"},{"input",in}};
+        s.save();
         return project_summary(p);
     }
     if (tool=="team_get_project") {
@@ -647,57 +826,137 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             Json out;bool ready=false;
             {
                 Store s(data);const auto& p=project(s,in);out={{"projectId",p.at("projectId")},{"status",p.at("status")},{"cursor",cursor(p)},{"events",Json::array()}};
-                const auto after=in.contains("afterCursor")?parse_cursor(p,text(in,"afterCursor",140)):-1LL;
+                const auto after=in.contains("afterCursor") && in.at("afterCursor")!=""?parse_cursor(p,text(in,"afterCursor",140)):-1LL;
                 const auto oldest=p.at("events").empty()?p.at("sequence").get<long long>():p.at("events").front().at("sequence").get<long long>();
                 out["resetRequired"]=after>=0 && after<oldest-1;
                 if (after<0 || out.at("resetRequired")==true) {
                     for (const auto& d:p.at("decisions")) if (d.at("state")=="open") out["events"].push_back({{"kind","decision"},{"detail",d}});
-                    if (p.at("status")!="running" && p.at("status")!="starting") out["events"].push_back({{"kind","project.status"},{"detail",{{"status",p.at("status")}}}});
                 } else {
                     auto last=after;
-                    for (const auto& e:p.at("events")) if (e.at("sequence").get<long long>()>after && out["events"].size()<8) {out["events"].push_back(e);last=e.at("sequence").get<long long>();}
+                    for (const auto& e:p.at("events")) {
+                        const auto seq=e.at("sequence").get<long long>();
+                        if (seq<=after) continue;
+                        const auto& kind=e.at("kind");
+                        if (kind=="decision" || kind=="incident") {
+                            const auto& decisions=p.at("decisions");
+                            const auto decision=decisions.find(e.at("detail").at("decisionId").get<std::string>());
+                            if (decision!=decisions.end() && decision->at("state")=="open") {
+                                out["events"].push_back(e);
+                                if (out["events"].size()==8) {last=seq;break;}
+                            }
+                        }
+                        last=seq;
+                    }
                     out["hasMore"]=last<p.at("sequence").get<long long>();
                     if (!out.at("events").empty()) out["cursor"]=p.at("projectId").get<std::string>()+":"+std::to_string(last);
                 }
-                ready=!out.at("events").empty();out["ready"]=ready;
+                const bool archived=archived_project(p);
+                const auto closedAt=p.value("closedAt",p.value("updated",0LL));
+                const bool draining=archived && has_unsettled_jobs(p);
+                out["archived"]=archived;
+                out["draining"]=draining;
+                if (archived) out["closedAt"]=closedAt;
+                out["allowedActions"]=project_actions(p);
+                out["managerStartup"]=team_manager_startup(p,archived?closedAt:now());
+                out["runtimeErrors"]=p.value("runtimeErrors",Json::object());
+                if (p.at("status")=="running" && out["managerStartup"].at("pending")==true) out["status"]="starting";
+                const bool attention=out["managerStartup"].value("needsAttention",false) || !out["runtimeErrors"].empty();
+                out["needsAttention"]=attention;
+                ready=!out.at("events").empty() || attention || (archived && !draining) || p.at("status")=="draft" || p.at("status")=="paused";out["ready"]=ready;
             }
             if (ready || std::chrono::steady_clock::now()>=deadline) {out["timedOut"]=!ready;return out;}
             Sleep(100);
         }
     }
     if (tool=="team_resolve_decision" || tool=="team_update_charter" || tool=="team_control_project") {
-        Store s(data);auto& p=project(s,in);const auto request=text(in,"requestId",100);
+        const auto request=text(in,"requestId",100);
+        std::string refreshed_base;
+        if (tool=="team_update_charter") {
+            Json copy;
+            {Store s(data);copy=project(s,in);}
+            if (!copy.at("operations").contains(request) && (copy.at("status")=="draft" || copy.at("status")=="completed")) {
+                const auto workspace=path_from_utf8(copy.at("workspace").get<std::string>());
+                check(git(workspace,{L"status",L"--porcelain"}).empty(),"规划基线必须是干净工作树");
+                refreshed_base=git(workspace,{L"rev-parse",L"--verify",L"HEAD"});
+                check(sha(refreshed_base),"项目必须有有效 Git HEAD");
+            }
+        }
+        Store s(data);auto& p=project(s,in);
         auto& operations=p["operations"];
-        if (operations.contains(request)) {check(operations.at(request).at("input")==in,"requestId 已用于其他操作参数");return operations.at(request).at("result");}
+        if (operations.contains(request)) {
+            const auto& saved=operations.at(request);
+            if (saved.at("input")!=in || !saved.contains("result") || saved.value("tool",std::string(tool))!=tool)
+                team_error("request_conflict","requestId 已用于其他操作",{{"requestId",request}},Json::array());
+            return saved.at("result");
+        }
+        const auto reject_terminal=[&] {
+            team_error("project_terminal","项目已归档，请根据队列状态创建新计划或完成合并",
+                {{"projectId",p.at("projectId")},{"projectStatus",p.at("status")},{"queueId",p.value("queueId","")}},project_actions(p));
+        };
         if (tool=="team_resolve_decision") {
+            if (archived_project(p)) reject_terminal();
             const auto key=text(in,"decisionId",100);check(p.at("decisions").contains(key),"决策不存在");auto& d=p["decisions"][key];
-            check(d.at("state")=="open" && d.at("revision")==in.at("expectedRevision"),"决策已处理或版本已变化");
+            if (d.at("state")!="open" || d.at("revision")!=in.at("expectedRevision"))
+                team_error("version_conflict","决策已处理或版本已变化",{{"decisionId",key},{"actualRevision",d.at("revision")},{"state",d.at("state")}},Json::array({"team_get_project"}));
             d["resolution"]=text(in,"resolution",8000);d["state"]="resolved";d["revision"]=d.at("revision").get<int>()+1;
             auto& owner=p["domains"][d.at("domainId").get<std::string>()];owner["wake"]=owner.at("wake").get<int>()+1;owner["state"]="working";
             if (d.at("domainId")==backlog_owner(p) && p.contains("backlog")) p["backlog"]["suspendedOnStall"]=false;
         } else if (tool=="team_update_charter") {
-            check(p.at("status")!="cancelled","已取消项目不能更新授权");
-            check(p.at("charterVersion")==in.at("expectedVersion"),"授权书版本已变化");valid_charter(in.at("charter"));text(in,"changeSummary",4000);
+            if (p.at("status")=="cancelled") reject_terminal();
+            if (p.at("status")=="finishing")
+                team_error("invalid_project_state","等经理退出后再更新计划",{{"projectStatus",p.at("status")}},project_actions(p));
+            if (p.at("charterVersion")!=in.at("expectedVersion"))
+                team_error("version_conflict","授权书版本已变化",{{"expectedVersion",in.at("expectedVersion")},{"actualVersion",p.at("charterVersion")}},Json::array({"team_get_project"}));
+            if (p.at("status")=="completed") for (const auto& other:s.value.at("projects"))
+                if (other.at("projectId")!=p.at("projectId") && canonical_queue(other.value("queueId",""))==canonical_queue(p.value("queueId","")) && holds_queue(other)) queue_conflict(other);
+            if ((p.at("status")=="draft" || p.at("status")=="completed") && refreshed_base.empty())
+                team_error("version_conflict","项目状态变化，请重新读取",{{"projectStatus",p.at("status")}},Json::array({"team_get_project"}));
+            valid_charter(in.at("charter"));text(in,"changeSummary",4000);
             if (in.contains("tasks")) {
                 const auto error=task_plan_error(in.at("tasks"),static_cast<std::size_t>(s.value.at("settings").at("totalConcurrency").get<int>()-1));
-                if (!error.empty()) throw std::runtime_error(error);
+                if (!error.empty()) team_error("invalid_plan",error,Json::object(),Json::array({"team_update_charter"}));
                 p["tasks"]=in.at("tasks");
             }
             p["charter"]=in.at("charter");p["charterVersion"]=p.at("charterVersion").get<int>()+1;
             for (auto& job:p["jobs"]) if (job.at("state")=="queued" && !job.contains("launch") && !job.contains("sessionId")) {job["state"]="cancelled";job["error"]="授权已更新；负责人须按新版本重新评估任务";}
             for (auto& d:p["domains"]) {d["wake"]=d.at("wake").get<int>()+1;if (d.at("state")=="completed") d["state"]="working";}
-            if (p.at("status")=="completed") {p["status"]="running";p["baseSha"]=git(path_from_utf8(p.at("workspace").get<std::string>()),{L"rev-parse",L"HEAD"});}
+            if (!refreshed_base.empty() && (p.at("status")=="draft" || p.at("status")=="completed")) {
+                p["status"]="draft";
+                p.erase("closedAt");
+                p["baseSha"]=refreshed_base;
+            }
             event(p,"charter.changed",{{"version",p.at("charterVersion")},{"summary",in.at("changeSummary")}});
         } else {
             const auto action=text(in,"action",32);check(action=="pause" || action=="resume" || action=="cancel","action 须为 pause/resume/cancel");
-            check(p.at("status")!="cancelled","已取消项目不可恢复");
-            if (action=="resume") check(p.at("status")=="paused","只能恢复已暂停项目");
-            p["status"]=action=="pause"?"paused":action=="cancel"?"cancelled":"running";
-            if (action=="cancel") for (auto& j:p["jobs"]) if (j.at("state")=="queued") j["state"]="cancelled";
-            if (action=="resume") for (auto& d:p["domains"]) if (d.at("state")!="completed") d["wake"]=d.at("wake").get<int>()+1;
-            event(p,"project.status",{{"status",p.at("status")},{"note","暂停停止新派发；已运行任务由后台请求取消并核对"}});
+            if (archived_project(p)) reject_terminal();
+            if (action=="cancel") {
+                const auto impact=Json{{"projectId",p.at("projectId")},{"projectStatus",p.at("status")},
+                    {"queueId",p.value("queueId","")},{"terminal",true},{"willDrain",has_unsettled_jobs(p)},
+                    {"impact","Cancel archives the project permanently and releases the queue after active jobs stop. Work and history are retained."}};
+                if (in.value("dryRun",false)) return impact;
+                if (!in.value("confirm",false))
+                    team_error("confirmation_required","取消是终态操作，请先核对影响，然后传 confirm:true",impact,Json::array({"cancel","pause"}));
+            } else if ((action=="pause" && p.at("status")!="running" && p.at("status")!="starting") ||
+                       (action=="resume" && p.at("status")!="paused")) {
+                team_error("invalid_project_state","项目当前状态不允许该操作",{{"projectStatus",p.at("status")}},project_actions(p));
+            }
+            if (action=="resume" && has_unsettled_jobs(p))
+                team_error("project_draining","请等待已请求停止的会话确认退出",{{"projectId",p.at("projectId")}},project_actions(p));
+            if (action=="pause" || action=="cancel") {
+                for (auto& j:p["jobs"]) {
+                    if (!j.contains("launch") && !j.contains("sessionId") && !terminal(j.at("state").get<std::string>())) j["state"]="cancelled";
+                    if (action=="pause" && j.at("role")=="lead") j["restartOnResume"]=true;
+                }
+            }
+            p["status"]=action=="pause"?"paused":action=="cancel"?"cancelled":p.contains("queueId")?"running":"starting";
+            if (action=="cancel") p["closedAt"]=now();
+            if (action=="resume") {
+                for (auto& d:p["domains"]) if (d.at("state")!="completed") d["wake"]=d.at("wake").get<int>()+1;
+                prepare_manager(p);
+            }
+            event(p,"project.status",{{"status",p.at("status")}});
         }
-        auto result=project_summary(p);operations[request]={{"input",in},{"result",result}};s.save();return result;
+        auto result=project_summary(p);operations[request]={{"tool",tool},{"input",in},{"result",result}};s.save();return result;
     }
     if (tool=="team_dispatch_ready") {
         Json copy;const auto request=text(in,"requestId",100);
@@ -1159,113 +1418,22 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
     if (runtime==INVALID_HANDLE_VALUE) return;
     struct Close {HANDLE h;~Close(){CloseHandle(h);}} close{runtime};
     Json projects;
-    {Store s(data);projects=s.value.at("projects");}
-    for (const auto& original:projects) {
-        if (stop.stop_requested()) return;
-        const auto pid=original.at("projectId").get<std::string>();
-        RuntimeHealth health(data,pid,original.value("runtimeErrors",Json::object()));
-        if (original.at("status")=="starting") {
-            const bool recovered=health.run("create_queue","",[&] {
-                const auto q=cluster.invoke("cluster_create_queue",{{"name",original.at("title")},{"requestId","team-queue-"+pid},{"workspace",original.at("workspace")},{"workKey","team:"+pid}});
-                Store s(data);auto& p=s.value["projects"][pid];p["queueId"]=q.at("queueId");if (p.at("status")=="starting") p["status"]="running";s.save();
-            });
-            if (!recovered) continue;
+    {
+        Store s(data);
+        bool changed=false;
+        for (auto& p:s.value["projects"]) {
+            const auto count=p.at("jobs").size();
+            prepare_manager(p);
+            changed=changed || p.at("jobs").size()!=count;
         }
-        Json p;
-        {Store s(data);p=s.value.at("projects").at(pid);}
-        if (!p.contains("queueId")) continue;
-        const auto scoped=cluster.for_queue(p.at("queueId").get<std::string>());
-        // Synchronize only this queue, using native code rather than model polling.
-        health.run("refresh_sessions","",[&] {scoped.invoke("cluster_refresh_sessions",{{"limit",20}});});
-        for (const auto& old:p.at("jobs")) {
-            if (!old.contains("sessionId") || old.value("observedTerminal",false)) continue;
-            if (!terminal(old.at("state").get<std::string>()) &&
-                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<13 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
-                health.run("notify_policy",old.at("jobId"),[&] {
-                    const auto version=p.at("charterVersion").get<int>();
-                    const auto notice=scoped.invoke("cluster_send_message",{{"sessionId",old.at("sessionId")},
-                        {"requestId","team-policy13-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
-                        {"message","Policy v13 - user removed formal gates and evidence collection. Stop additional proof-only exhaustive Gallery/page/config/frame capture and screenshot matrices, including proof-only steps in older plans. Do not restart or cancel development sessions. If a proof-only subprocess is still running, stop only that subprocess when safe; preserve actual development/self-tests. Continue the assigned functional work and relevant checks, then return a concise honest summary. No evidence manifests, hashes, attachment collection, verificationId, acceptance proof lists or full audit are required. Managers use ordinary developer self-tests and independent review to decide acceptance; extra manager tests are optional and targeted. Refresh team_get_prompt(role=lead for the manager, role=worker for developers/reviewers/repair workers) and team_get_contract if you are the manager. Stay in the same goal and use MCP waits. Keep user-requested functional checks, but never claim skipped bulk coverage was completed."}});
-                    if (notice.value("accepted",false)) {
-                        Store s(data);auto& saved=s.value["projects"][pid]["jobs"][old.at("jobId").get<std::string>()];
-                        saved["notifiedPolicyVersion"]=13;saved["notifiedCharterVersion"]=version;s.save();
-                    }
-                });
-            }
-            health.run("observe_session",old.at("sessionId"),[&] {
-                auto row=scoped.invoke("cluster_get_session_status",{{"sessionId",old.at("sessionId")}});
-                // Pause and cancel request cancellation, but never infer it succeeded.
-                if ((p.at("status")=="paused" || p.at("status")=="cancelled" || old.value("cancelRequested",false)) && !terminal(row.value("status",""))) {
-                    health.run("cancel_session",old.at("sessionId"),[&] {scoped.invoke("cluster_cancel_session",{{"sessionId",old.at("sessionId")}});});
-                    row=scoped.invoke("cluster_get_session_status",{{"sessionId",old.at("sessionId")}});
-                }
-                if (row.value("stale",false)) throw std::runtime_error("会话实时状态尚未确认，将继续重试");
-                if (old.at("role")=="lead" && terminal(row.value("status","")) && row.contains("resultVersion"))
-                    if (!health.run("mark_receipt",old.at("sessionId"),[&] {scoped.invoke("cluster_mark_receipt",{{"sessionId",old.at("sessionId")},{"resultVersion",row.at("resultVersion")},{"processed",true}});})) return;
-                if (terminal(row.value("status",""))) {
-                    health.resolve("cancel_session",old.at("sessionId"));
-                    health.resolve("notify_policy",old.at("jobId"));
-                }
-                Store s(data);auto& current=s.value["projects"][pid];auto& job=current["jobs"][old.at("jobId").get<std::string>()];
-                job["state"]=row.at("status");if (row.contains("goal")) job["goal"]=row.at("goal");if (row.contains("resultVersion")) job["resultVersion"]=row.at("resultVersion");
-                auto& d=current["domains"][job.at("domainId").get<std::string>()];
-                if (terminal(job.at("state").get<std::string>())) {
-                    job["observedTerminal"]=true;
-                    if (job.at("role")!="lead") d["wake"]=d.at("wake").get<int>()+1;
-                    else if (current.at("status")=="running" && d.at("state")!="completed") {
-                        incident(current,d,"manager-ended-"+job.at("jobId").get<std::string>(),"项目经理goal结束但计划未验收完成。保留结果，需恢复或更新完整计划；不得自动重建另一项目经理。");
-                    }
-                }
-                if (current.at("status")=="finishing" && std::ranges::all_of(current.at("jobs"),[](const Json& j){return terminal(j.at("state").get<std::string>());})) {
-                    const bool natural=std::ranges::all_of(current.at("jobs"),[&](const Json& j){
-                        if (j.at("role")!="lead") return true;
-                        for (const auto& later:current.at("jobs")) if (later.at("role")=="lead" && later.at("domainId")==j.at("domainId") && later.value("created",0LL)>j.value("created",0LL)) return true;
-                        return j.at("state")=="succeeded" && (!j.contains("goal") || j.at("goal").value("phase","")=="complete");
-                    });
-                    if (natural) {current["status"]="completed";event(current,"project.completed",{{"status","completed"},{"note","项目经理已退出，等待主代理逐项验收合并"}});}
-                    else incident(current,d,"manager-goal-incomplete-"+job.at("jobId").get<std::string>(),"候选已验收，但项目经理goal未自然完成；不能交给主代理作为成功结果。");
-                }
-                s.save();
-            });
-        }
-        Json fresh_backlog;
-        Json fresh_priority=Json::array();
-        bool priority_refreshed=false;
-        {Store s(data);p=s.value.at("projects").at(pid);}
-        if (p.at("status")=="running") {
-            health.run("backlog_snapshot","",[&] {fresh_backlog=backlog_snapshot(cluster,p);});
-            priority_refreshed=health.run("priority_results","",[&] {fresh_priority=priority_results(cluster,p);});
-        }
-        std::map<std::string,Json> fresh_worklists;
-        if (p.at("status")=="running") for (const auto& d:p.at("domains")) if (d.at("state")!="completed") {
-            health.run("domain_worklist",d.at("domainId"),[&] {fresh_worklists[d.at("domainId").get<std::string>()]=domain_worklist(cluster,p,d.at("domainId").get<std::string>());coordinator_queue(cluster,data,p,d.at("domainId").get<std::string>());});
-        }
-        {
-            Store s(data);auto& current=s.value["projects"][pid];
-            if (current.at("status")!="running") continue;
-            if (priority_refreshed) current["priorityResults"]=fresh_priority;
-            if (!fresh_backlog.is_null()) {
-                auto& backlog=current["backlog"];if (backlog.is_null()) backlog=Json::object();
-                for (const auto& [key,value]:fresh_backlog.items()) backlog[key]=value;
-            }
-            for (auto& d:current["domains"]) {
-                if (d.at("state")=="completed") continue;
-                bool exists=false;
-                for (const auto& job:current.at("jobs")) if (job.at("domainId")==d.at("domainId") && job.at("role")=="lead" && (!terminal(job.at("state").get<std::string>()) || job.value("charterVersion",0)==current.at("charterVersion").get<int>())) exists=true;
-                if (exists) continue;
-                auto job=new_job(current,d,"lead","项目经理 · "+d.at("name").get<std::string>(),
-                    "Read team_domain_context and the complete plan. Queue all ready tasks through team_dispatch_ready, then handle team_next_action FIFO. Developers perform relevant self-tests, then independent review. Confirm tasks using judgement; extra manager tests are optional. Do not collect proof or expand work into exhaustive audits. Repeat ready dispatch after each handled result. Wait only through team_wait_actions; never sleep. When all planned items are accepted, team_finish_domain, complete the goal and exit naturally.",current.at("baseSha").get<std::string>());
-                job["schedulerPolicyVersion"]=13;job["wake"]=d.at("wake");
-                current["jobs"][job.at("jobId").get<std::string>()]=job;d["state"]="working";
-            }
-            s.save();p=current;
-        }
+        if (changed) s.save();
+        projects=std::move(s.value["projects"]);
     }
-    {Store s(data);projects=s.value.at("projects");}
     const auto plan=team_dispatch_plan(projects,Json::object(),now());
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(20);
     for (const auto& ticket:plan) {
-        if (stop.stop_requested() || std::chrono::steady_clock::now()>=deadline) return;
+        if (stop.stop_requested()) return;
+        if (std::chrono::steady_clock::now()>=deadline) break;
         const auto pid=ticket.at("projectId").get<std::string>(),jid=ticket.at("jobId").get<std::string>();
         Json current,d,job;
         {Store s(data);current=s.value.at("projects").at(pid);if (current.at("status")!="running") continue;
@@ -1344,13 +1512,123 @@ void advance_teams(const Cluster& cluster,const fs::path& data,std::stop_token s
             if (attempts>=3) incident(live,live["domains"][saved.at("domainId").get<std::string>()],"dispatch-"+jid,std::string(e.what()));s.save();
         }
     }
+    {Store s(data);projects=s.value.at("projects");}
+    for (const auto& original:projects) {
+        if (stop.stop_requested()) return;
+        if ((original.at("status")=="completed" || original.at("status")=="cancelled") &&
+            std::ranges::all_of(original.at("jobs"),[](const Json& j) {return terminal(j.at("state").get<std::string>()) && (!j.contains("sessionId") || j.value("observedTerminal",false));})) continue;
+        const auto pid=original.at("projectId").get<std::string>();
+        RuntimeHealth health(data,pid,original.value("runtimeErrors",Json::object()));
+        if (original.at("status")=="starting" && !original.contains("queueId")) {
+            const bool recovered=health.run("create_queue","",[&] {
+                const auto q=cluster.invoke("cluster_create_queue",{{"name",original.at("title")},{"requestId","team-queue-"+pid},{"workspace",original.at("workspace")},{"workKey","team:"+pid}});
+                Store s(data);auto& p=s.value["projects"][pid];p["queueId"]=q.at("queueId");if (p.at("status")=="starting") p["status"]="running";s.save();
+            });
+            if (!recovered) continue;
+        }
+        Json p;
+        {Store s(data);p=s.value.at("projects").at(pid);}
+        if (!p.contains("queueId") || p.at("status")=="draft") continue;
+        const auto scoped=cluster.for_queue(p.at("queueId").get<std::string>());
+        if (p.at("status")=="paused" || p.at("status")=="cancelled") {
+            const auto reservations=scoped.team_session_reservations(pid);
+            Store s(data);auto& current=s.value["projects"][pid];
+            bool changed=false;
+            if (current.at("status")==p.at("status")) for (auto& job:current["jobs"]) {
+                if (job.contains("sessionId") || terminal(job.at("state").get<std::string>())) continue;
+                const auto key=job.at("jobId").get<std::string>();
+                if (reservations.contains(key)) job["sessionId"]=reservations.at(key);
+                else job["state"]="cancelled";
+                changed=true;
+            }
+            if (changed) s.save();
+            p=current;
+        }
+        // Synchronize only this queue, using native code rather than model polling.
+        health.run("refresh_sessions","",[&] {scoped.invoke("cluster_refresh_sessions",{{"limit",20}});});
+        for (const auto& old:p.at("jobs")) {
+            if (!old.contains("sessionId") || old.value("observedTerminal",false)) continue;
+            if (!terminal(old.at("state").get<std::string>()) &&
+                (old.value("notifiedPolicyVersion",old.value("schedulerPolicyVersion",0))<13 || old.value("notifiedCharterVersion",old.value("charterVersion",0))<p.at("charterVersion").get<int>())) {
+                health.run("notify_policy",old.at("jobId"),[&] {
+                    const auto version=p.at("charterVersion").get<int>();
+                    const auto notice=scoped.invoke("cluster_send_message",{{"sessionId",old.at("sessionId")},
+                        {"requestId","team-policy13-c"+std::to_string(version)+"-"+old.at("jobId").get<std::string>()},{"mode","steer"},
+                        {"message","Policy v13 - user removed formal gates and evidence collection. Stop additional proof-only exhaustive Gallery/page/config/frame capture and screenshot matrices, including proof-only steps in older plans. Do not restart or cancel development sessions. If a proof-only subprocess is still running, stop only that subprocess when safe; preserve actual development/self-tests. Continue the assigned functional work and relevant checks, then return a concise honest summary. No evidence manifests, hashes, attachment collection, verificationId, acceptance proof lists or full audit are required. Managers use ordinary developer self-tests and independent review to decide acceptance; extra manager tests are optional and targeted. Refresh team_get_prompt(role=lead for the manager, role=worker for developers/reviewers/repair workers) and team_get_contract if you are the manager. Stay in the same goal and use MCP waits. Keep user-requested functional checks, but never claim skipped bulk coverage was completed."}});
+                    if (notice.value("accepted",false)) {
+                        Store s(data);auto& saved=s.value["projects"][pid]["jobs"][old.at("jobId").get<std::string>()];
+                        saved["notifiedPolicyVersion"]=13;saved["notifiedCharterVersion"]=version;s.save();
+                    }
+                });
+            }
+            health.run("observe_session",old.at("sessionId"),[&] {
+                auto row=scoped.invoke("cluster_get_session_status",{{"sessionId",old.at("sessionId")}});
+                // Pause and cancel request cancellation, but never infer it succeeded.
+                if ((p.at("status")=="paused" || p.at("status")=="cancelled" || old.value("cancelRequested",false)) && !terminal(row.value("status",""))) {
+                    health.run("cancel_session",old.at("sessionId"),[&] {scoped.invoke("cluster_cancel_session",{{"sessionId",old.at("sessionId")}});});
+                    row=scoped.invoke("cluster_get_session_status",{{"sessionId",old.at("sessionId")}});
+                }
+                if (row.value("stale",false)) throw std::runtime_error("会话实时状态尚未确认，将继续重试");
+                if (old.at("role")=="lead" && terminal(row.value("status","")) && row.contains("resultVersion"))
+                    if (!health.run("mark_receipt",old.at("sessionId"),[&] {scoped.invoke("cluster_mark_receipt",{{"sessionId",old.at("sessionId")},{"resultVersion",row.at("resultVersion")},{"processed",true}});})) return;
+                if (terminal(row.value("status",""))) {
+                    health.resolve("cancel_session",old.at("sessionId"));
+                    health.resolve("notify_policy",old.at("jobId"));
+                }
+                Store s(data);auto& current=s.value["projects"][pid];auto& job=current["jobs"][old.at("jobId").get<std::string>()];
+                job["state"]=row.at("status");if (row.contains("goal")) job["goal"]=row.at("goal");if (row.contains("resultVersion")) job["resultVersion"]=row.at("resultVersion");
+                auto& d=current["domains"][job.at("domainId").get<std::string>()];
+                if (terminal(job.at("state").get<std::string>())) {
+                    job["observedTerminal"]=true;
+                    if (job.at("role")!="lead") d["wake"]=d.at("wake").get<int>()+1;
+                    else if (current.at("status")=="running" && d.at("state")!="completed") {
+                        incident(current,d,"manager-ended-"+job.at("jobId").get<std::string>(),"项目经理goal结束但计划未验收完成。保留结果，需恢复或更新完整计划；不得自动重建另一项目经理。");
+                    }
+                }
+                if (current.at("status")=="finishing" && std::ranges::all_of(current.at("jobs"),[](const Json& j){return terminal(j.at("state").get<std::string>());})) {
+                    const bool natural=std::ranges::all_of(current.at("jobs"),[&](const Json& j){
+                        if (j.at("role")!="lead") return true;
+                        for (const auto& later:current.at("jobs")) if (later.at("role")=="lead" && later.at("domainId")==j.at("domainId") && later.value("created",0LL)>j.value("created",0LL)) return true;
+                        return j.at("state")=="succeeded" && (!j.contains("goal") || j.at("goal").value("phase","")=="complete");
+                    });
+                    if (natural) {current["status"]="completed";current["closedAt"]=now();event(current,"project.completed",{{"status","completed"},{"note","项目经理已退出，等待主代理逐项验收合并"}});}
+                    else incident(current,d,"manager-goal-incomplete-"+job.at("jobId").get<std::string>(),"候选已验收，但项目经理goal未自然完成；不能交给主代理作为成功结果。");
+                }
+                s.save();
+            });
+        }
+        Json fresh_backlog;
+        Json fresh_priority=Json::array();
+        bool priority_refreshed=false;
+        {Store s(data);p=s.value.at("projects").at(pid);}
+        if (p.at("status")=="running") {
+            health.run("backlog_snapshot","",[&] {fresh_backlog=backlog_snapshot(cluster,p);});
+            priority_refreshed=health.run("priority_results","",[&] {fresh_priority=priority_results(cluster,p);});
+        }
+        std::map<std::string,Json> fresh_worklists;
+        if (p.at("status")=="running") for (const auto& d:p.at("domains")) if (d.at("state")!="completed") {
+            health.run("domain_worklist",d.at("domainId"),[&] {fresh_worklists[d.at("domainId").get<std::string>()]=domain_worklist(cluster,p,d.at("domainId").get<std::string>());coordinator_queue(cluster,data,p,d.at("domainId").get<std::string>());});
+        }
+        {
+            Store s(data);auto& current=s.value["projects"][pid];
+            if (current.at("status")!="running") continue;
+            if (priority_refreshed) current["priorityResults"]=fresh_priority;
+            if (!fresh_backlog.is_null()) {
+                auto& backlog=current["backlog"];if (backlog.is_null()) backlog=Json::object();
+                for (const auto& [key,value]:fresh_backlog.items()) backlog[key]=value;
+            }
+            prepare_manager(current);
+            s.save();p=current;
+        }
+    }
+
 }
 
 Json team_tools() {
     const Json text{{"type","string"}},integer{{"type","integer"}},object{{"type","object"}},array{{"type","array"},{"items",text}};
     Json tools=Json::array();
     const auto add=[&](const char* name,const char* description,Json fields,Json required) {
-        tools.push_back({{"name",name},{"description",description},{"inputSchema",{{"type","object"},{"properties",fields},{"required",required},{"additionalProperties",false}}}});
+        tools.push_back({{"name",name},{"description",description},{"inputSchema",{{"type","object"},{"properties",fields},{"required",required},{"additionalProperties",false}}},{"outputSchema",{{"type","object"}}}});
     };
     add("team_get_settings","Read the saved maximum concurrency (default 20); all roles automatically share enabled account/model pools using global load balancing.",Json::object(),Json::array());
     add("team_update_settings","Save maximum concurrency including the manager, with revision protection. Existing sessions continue unchanged; all roles share enabled models automatically.",{{"revision",integer},{"totalConcurrency",integer}},{"revision","totalConcurrency"});
@@ -1362,19 +1640,22 @@ Json team_tools() {
     const Json task_spec{{"type","object"},{"properties",{{"name",text},{"steps",text},{"acceptance",text},{"files",array},{"dependsOn",array},
         {"startCondition",{{"type","string"},{"description","Executable start condition. Declare all task dependencies separately in dependsOn; independent tasks must not be serialized."}}},{"tests",text}}},
         {"required",Json::array({"name","steps","acceptance","files","dependsOn","startCondition","tests"})},{"additionalProperties",false}};
-    add("team_start_project","Submit the complete charter, independent task contracts and exactly one manager definition. The service starts a real persistent-goal session. Retry uncertain responses with the original requestId and arguments.",{{"requestId",text},{"queueId",text},{"title",text},{"workspace",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"domains",{{"type","array"},{"items",domain_spec},{"minItems",1},{"maxItems",1}}}},
+    add("team_start_project","Save a draft on a new or existing queue. No manager starts until team_activate_project confirms the finished version. After a project closes and its sessions stop, reuse the same queue. Optionally pin the previous archived project with replaceProjectId. Retry with identical arguments and requestId.",{{"requestId",text},{"queueId",text},{"replaceProjectId",text},{"title",text},{"workspace",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"domains",{{"type","array"},{"items",domain_spec},{"minItems",1},{"maxItems",1}}}},
         {"requestId","title","workspace","charter","tasks","domains"});
-    add("team_list_projects","Read compact project summaries for desktop display or recovery; do not repeatedly load all historical projects.",Json::object(),Json::array());
-    add("team_get_queue","Find the team bound to a queue. Resume its existing project instead of creating another one.",{{"queueId",text}},{"queueId"});
+    add("team_activate_project","Start exactly one persistent-goal manager for a saved draft after planning is finished. Pass the reviewed charterVersion as expectedVersion. Retries with the same requestId are safe.",
+        {{"projectId",text},{"requestId",text},{"expectedVersion",integer}},{"projectId","requestId","expectedVersion"});
+    add("team_list_projects","List active projects and drafts. Set includeArchived=true to include cancelled and completed projects.",
+        {{"includeArchived",{{"type","boolean"}}}},Json::array());
+    add("team_get_queue","Read the current queue owner, the previous archived project, shutdown progress, and available actions. Reuse the queue after its previous project has stopped.",{{"queueId",text}},{"queueId"});
     add("team_retire_work_item","Formally cancel obsolete work only after every session is terminal; retain audit records and dispose of old handoffs. Managers may retire adopted historical/old-round items. Current-round developer work requires explicit principal authorization.",{{"projectId",text},{"charterVersion",integer},{"workItemId",text},{"requestId",text},{"reason",text},{"domainId",text},{"token",text}},{"projectId","charterVersion","workItemId","requestId","reason"});
     const Json correction{{"type","object"},{"properties",{{"reportedPath",text},{"replacementPath",text},{"reason",text}}},{"required",Json::array({"reportedPath","replacementPath","reason"})},{"additionalProperties",false}};
     add("team_capture_evidence","Optional collection/correction, available to managers with credentials. Select declared evidence or in-worktree files; fix mistaken references with corrections:[{reportedPath,replacementPath,reason}]. Keep original references and real replacement hashes. Attachment problems are warnings. Unrelated external files need principal authorization.",{{"projectId",text},{"domainId",text},{"token",text},{"sessionId",text},{"resultVersion",text},{"candidateSha",text},{"files",array},{"corrections",{{"type","array"},{"items",correction},{"maxItems",128}}},{"reason",text}},{"projectId","sessionId","resultVersion","candidateSha","files","reason"});
     add("team_get_project","Read one project status, deliverables and pending decisions without full execution logs.",{{"projectId",text},{"includeCharter",{{"type","boolean"}}}},{"projectId"});
-    add("team_wait_decisions","The principal must wait through this MCP tool for up to 300000 ms. Manager completion, important decisions and failures return early. Never sleep or fill the remaining wait time.",{{"projectId",text},{"afterCursor",text},{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",300000},{"default",300000}}}},{"projectId"});
+    add("team_wait_decisions","Wait up to 300000 ms after activation. Omit afterCursor on the first call, then reuse the returned cursor. Open decisions, errors, paused/draft state, completion and finished shutdown return early. On timedOut, silently wait again with the returned cursor.",{{"projectId",text},{"afterCursor",text},{"timeoutMs",{{"type","integer"},{"minimum",0},{"maximum",300000},{"default",300000}}}},{"projectId"});
     add("team_resolve_decision","The principal resolves one decision using its current expectedRevision; the manager is notified to resume affected work.",{{"projectId",text},{"decisionId",text},{"expectedRevision",integer},{"requestId",text},{"resolution",text}},{"projectId","decisionId","expectedRevision","requestId","resolution"});
-    add("team_update_charter","Replace the full charter with version protection and notify the manager. Provide a complete tasks replacement when the plan changes.",{{"projectId",text},{"expectedVersion",integer},{"requestId",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"changeSummary",text}},{"projectId","expectedVersion","requestId","charter","changeSummary"});
+    add("team_update_charter","Update a draft or atomically apply a complete plan revision to an active project. Provide the entire tasks array when it changes. Updating a completed project reopens a draft if the queue is available. A cancelled project can only be replaced on its queue.",{{"projectId",text},{"expectedVersion",integer},{"requestId",text},{"charter",charter},{"tasks",{{"type","array"},{"items",task_spec}}},{"changeSummary",text}},{"projectId","expectedVersion","requestId","charter","changeSummary"});
     add("team_record_merge","After manager completion, independently accept and actually merge the candidate into main before recording the verified integration commit.",{{"projectId",text},{"requestId",text},{"workItemId",text},{"integrationSha",text},{"targetBranch",text},{"notes",text}},{"projectId","requestId","workItemId","integrationSha","targetBranch","notes"});
-    add("team_control_project","Pause, resume or cancel a project. Pause/cancel stop new dispatch and request cancellation of active jobs while retaining artifacts.",{{"projectId",text},{"requestId",text},{"action",{{"type","string"},{"enum",Json::array({"pause","resume","cancel"})}}}},{"projectId","requestId","action"});
+    add("team_control_project","Pause stops dispatch and cancels active sessions before resume. Cancel permanently archives the project and releases the queue after sessions stop. Use dryRun=true to preview cancel, then confirm=true to apply it. History and artifacts remain.",{{"projectId",text},{"requestId",text},{"action",{{"type","string"},{"enum",Json::array({"pause","resume","cancel"})}}},{"dryRun",{{"type","boolean"}}},{"confirm",{{"type","boolean"}}}},{"projectId","requestId","action"});
     const Json auth{{"projectId",text},{"domainId",text},{"token",text},{"charterVersion",integer}};
     const auto scoped=[&](const char* name,const char* desc,Json fields,Json required) {
         fields.update(auth);for (const auto* k:{"projectId","domainId","token"}) required.push_back(k);add(name,desc,fields,required);
