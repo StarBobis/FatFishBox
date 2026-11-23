@@ -6,4 +6,5 @@
 - 发布更新时，无论窗口可见、最小化或进入托盘，都直接按上述完整路径强制结束进程，无需再次请示，也无需使用 computer-use 或操作托盘菜单；保留用户的关闭行为偏好。
 - 使用 `cmake --install build --config Release --prefix "out/肥鱼重工"` 将本次编译的产物复制到发布目录。如果用户使用其他发布目录，将 `--prefix` 改为该目录。确认发布目录中的 `FatFishBox.exe` 与本次构建产物一致。
 - 如果更新前发布版正在运行，安装成功后从原发布路径重新打开 `FatFishBox.exe`，确认新进程已启动，让用户可以立即看到修改效果。完成这些步骤后再交付。
-- 每轮修改交付前，还必须运行 `./scripts/package-release.ps1`，在当前用户的实际桌面目录生成 `肥鱼重工V<完整版本号>.zip`，例如 `肥鱼重工V0.1.155.zip`。桌面路径使用系统已知目录解析，不能硬编码，须兼容桌面重定向。压缩包从全新的暂存目录执行 `cmake --install` 获取本轮 Release 产物，包含可分享的程序、README、skills 和 prompts；不得直接压缩正在使用的发布目录，避免夹带日志、转储、用户状态、凭据或旧产物。核对 ZIP 内 EXE 与本轮构建/发布 EXE 一致，确认 ZIP 可读取后再交付，并向用户报告版本号及桌面 ZIP 路径。保留其他版本的 ZIP；同版本重复打包仅替换同名 ZIP。
+- 每轮修改交付前，运行 `./scripts/package-release.ps1`，在 `build/releases/` 暂存 `FatFishBox-v<完整版本号>-win-x64.zip`。脚本从全新的安装目录获取本轮 Release 产物，包含程序、README、许可证、skills 和 prompts。核对 ZIP 可读取且包内 EXE 与本轮构建及本地发布目录的 EXE 一致。
+- 推送本轮源码到 `StarBobis/FatFishBox` 的 `main`，为本轮提交创建并推送 `v<完整版本号>` 标签，然后将已校验的 ZIP 上传到该标签对应的 GitHub Release。确认附件可以下载且 SHA-256 与本地 ZIP 一致后，向用户报告版本号及 GitHub Release 链接。保留历史版本附件，桌面无需生成新 ZIP。
