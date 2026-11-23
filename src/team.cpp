@@ -573,7 +573,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             if (!valid) team_error("invalid_arguments","字段类型不正确",{{"field",key},{"expectedType",type}},Json::array({"team_get_prompt"}));
         }
     }
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");auto out=Json{{"version",role=="principal"?15:13},{"prompt",team_prompt(role)}};
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");auto out=Json{{"version",role=="principal"?16:13},{"prompt",team_prompt(role)}};
         if (role=="principal") {
             out["tools"]=Json::object();
             for (const auto& entry:team_tools()) {

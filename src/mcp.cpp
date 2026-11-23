@@ -15,8 +15,10 @@
 namespace {
 using fatfish::Json;
 using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
-constexpr auto workflow=R"workflow(# FatFishBox simple team workflow
-Read team_get_prompt(principal). The principal plans only the requested changes and starts one persistent-goal manager. Use team_wait_decisions for up to 300000 ms; keep a pending call alive and renew quiet timeouts silently. Act on decisions and explicit errors.
+constexpr char principal_routing_instructions[]=
+    "For new work, decide before calling any FatFishBox tool whether substantial independent tasks can run in parallel with enough benefit to justify coordination and integration. If the benefit is unclear, implement and verify the work yourself without FatFishBox tools, even if a queue is supplied. Continue existing delegated work through its current project. For team work, read team_get_prompt(principal).";
+constexpr auto workflow=R"workflow(
+For team work, the principal plans only the requested changes and starts one persistent-goal manager. Use team_wait_decisions for up to 300000 ms; keep a pending call alive and renew quiet timeouts silently. Act on decisions and explicit errors.
 The manager calls team_dispatch_ready and handles team_next_action FIFO. Developers implement and perform relevant self-tests. Arrange independent review and repair real defects. The manager confirms completion using judgement; team_verify_candidate is optional, never a mandatory acceptance gate.
 Do not collect proof, hashes, manifests, screenshot archives or exhaustive page/configuration/frame matrices. Do not expand a local fix into a full-product audit. Stop extra proof-only work from older checklists while preserving development/testing and existing sessions. Report actual results and skipped coverage honestly. No verificationId, evidence array or acceptanceResults proof list is required.
 Use MCP team_wait_actions while workers/decisions remain. After all current tasks are confirmed, team_finish_domain with requestId/summary, then complete the goal. The principal reviews actual changes and integrates main through team_record_merge or gives a clear repair plan. Retire obsolete terminal work through team_retire_work_item, never fake repairs. Keep ordinary ownership, valid Git references and stable IDs for correct bookkeeping.
@@ -104,7 +106,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"protocolVersion",mcp_protocol_supported(version)?version:"2025-11-25"},
                 {"capabilities",{{"tools",Json::object()},{"resources",Json::object()}}},
                 {"serverInfo",{{"name","fatfishbox"},{"title","肥鱼重工"},{"version",FATFISHBOX_VERSION}}},
-                {"instructions",principal_only?"Read team_get_prompt(principal), save a draft with team_start_project, then call team_activate_project once the full plan is ready. Wait only through team_wait_decisions for up to 300000 ms; continue pending calls and renew quiet timeouts silently using the cursor. Act on decisions and explicit errors. After manager completion, review the actual changes and merge each item, or provide a complete repair plan.":mcp_handoff_instructions}};
+                {"instructions",std::string(principal_routing_instructions)+" "+(principal_only?"For team work, save a draft with team_start_project, then call team_activate_project once the full plan is ready. Wait only through team_wait_decisions for up to 300000 ms; continue pending calls and renew quiet timeouts silently using the cursor. Act on decisions and explicit errors. After manager completion, review the actual changes and merge each item, or provide a complete repair plan.":mcp_handoff_instructions)}};
             if (initialized) *initialized=true;
         } else if (method=="ping") {
             value=Json::object();
@@ -120,7 +122,7 @@ fatfish::Json fatfish::dispatch_mcp(const Cluster& cluster,std::string_view line
             value={{"contents",Json::array({{{"uri","fatfish://team/principal"},{"mimeType","text/markdown"},{"text",team_prompt("principal")}}})}};
         } else if (method=="resources/read" && !principal_only && params.value("uri","")=="fatfish://workflow") {
             value={{"contents",Json::array({{{"uri","fatfish://workflow"},{"mimeType","text/markdown"},
-                {"text",workflow}}})}};
+                {"text",std::string("# FatFishBox simple team workflow\n\n")+principal_routing_instructions+"\n"+workflow}}})}};
         } else if (method=="tools/call") {
             std::string tool;
             try {

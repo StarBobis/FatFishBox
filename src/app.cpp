@@ -1033,7 +1033,7 @@ private:
     }
     bool copy_team_setup(bool bind_queue=false) {
         auto setup=fatfish::team_prompt("principal");
-        if (bind_queue) setup="Current work queueId="+current_queue_+". Call team_get_queue and follow nextAction and allowedActions. Save a new plan as a draft on this queue with team_start_project. Once planning is finished, activate its exact version with team_activate_project. After cancellation and session shutdown, reuse this queue and its history. Continue to final acceptance under the user's existing authorization.\n\n"+setup;
+        if (bind_queue) setup="Available work queueId="+current_queue_+". Use this queue only if you decide to delegate or are continuing work already delegated on it.\n\n"+setup;
         if (http_) {
             const auto url=http_->url();const auto team_url=url.substr(0,url.size()-4)+"/team";
             setup="FatFishBox principal MCP: "+team_url+". Register this team endpoint for principal decision tools. An existing /mcp connection also supports team_* with a larger tool catalog.\n\n"+setup;
@@ -1424,7 +1424,7 @@ private:
             start+=panel_height+gap;
         } else {
             panel("queue_team_hint",{x,start,right,start+54});
-            label(L"已选择团队协作。复制主代理提示词并描述任务，团队将在此队列中启动。",x+16,start+15,right-x-32,13,"queue_team_hint",ColorToken::text_secondary);
+            label(L"主代理先判断并行收益，决定使用团队协作时才会在此队列启动。",x+16,start+15,right-x-32,13,"queue_team_hint",ColorToken::text_secondary);
             start+=66;
         }
         const auto visible=[&](const Json& rows) {Json out=Json::array();for (const auto& row:rows) if (row.value("role","")!="lead") out.push_back(row);return out;};
@@ -1672,7 +1672,7 @@ private:
             panel("wizard.start",{x,112,right,std::min(bottom,365.f)});
             label(L"准备就绪",x+24,134,width-48,23,"wizard.start",ColorToken::text_primary,true);
             label(L"1. 复制主代理提示词，粘贴到主代理会话。",x+24,185,width-48,14,"wizard.start");
-            label(L"2. 描述需求，项目经理会自动派发与验收。",x+24,221,width-48,14,"wizard.start");
+            label(L"2. 描述需求，主代理先判断是否值得并行。",x+24,221,width-48,14,"wizard.start");
             button("wizard.copy",wizard_copied_?L"已复制 · 再次复制":L"复制主代理提示词",x+24,278,174,true,!current_queue_.empty(),"wizard.start");
         }
         button("wizard.dismiss",L"稍后设置",x,h-58,100);

@@ -1,9 +1,11 @@
 ---
 name: fatfishbox
-description: Coordinate authorized work using one principal, one persistent-goal manager, ordinary developer self-tests and independent review, without proof collection or formal artifact gates.
+description: Coordinate authorized work that benefits from parallel execution using one principal, one persistent-goal manager, ordinary developer self-tests and independent review.
 ---
 
-Read team_get_prompt for the appropriate role. The principal saves a draft with team_start_project, explicitly activates the reviewed version with team_activate_project, waits through team_wait_decisions and finally integrates main. The manager dispatches all ready planned tasks, handles FIFO results, arranges independent review/repairs and confirms completion. All roles share one maximum concurrency and load-balanced enabled models; preserve existing sessions and assignments.
+Before any FatFishBox tool call for new work, the principal decides whether meaningful independent tasks can run in parallel with enough benefit to justify coordination. If not, the principal implements and verifies the work directly, without FatFishBox tools. An available queue does not change this decision.
+
+For delegated work, read team_get_prompt for the appropriate role. The principal saves a draft with team_start_project, explicitly activates the reviewed version with team_activate_project, waits through team_wait_decisions and finally integrates main. The manager dispatches all ready planned tasks, handles FIFO results, arranges independent review/repairs and confirms completion. All roles share one maximum concurrency and load-balanced enabled models; preserve existing sessions and assignments.
 
 There is no formal evidence workflow. Do not collect screenshots, manifests, hashes, proof packages or exhaustive page/configuration/frame matrices merely to satisfy acceptance. Do not expand a local change into a full-product audit. Broad functional checks are work only if the user explicitly requests them. The user's removal of proof-only work overrides old checklists. Stop extra proof-only subprocesses when safe without cancelling development/test sessions. Report actual checks and skipped coverage honestly.
 

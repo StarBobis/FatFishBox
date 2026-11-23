@@ -5,7 +5,7 @@
 namespace fatfish {
 inline constexpr std::size_t mcp_max_request_size=1024*1024;
 inline constexpr char mcp_handoff_instructions[]=
-    "Read team_get_prompt(principal). Plan only the requested work, start one persistent-goal manager, and wait through team_wait_decisions (up to 300000 ms). Continue pending calls and renew quiet timeouts silently with the last received cursor. "
+    "For team work, plan only the requested work, start one persistent-goal manager, and wait through team_wait_decisions (up to 300000 ms). Continue pending calls and renew quiet timeouts silently with the last received cursor. "
     "The manager queues all ready tasks with team_dispatch_ready and handles team_next_action FIFO. Developers perform relevant self-tests; independent review follows; the manager decides acceptance. team_verify_candidate is optional, never a prerequisite. "
     "No proof collection, manifests, hashes, screenshot archives, exhaustive page/configuration/frame audits, verificationId or acceptance-proof checklist is required. Never enlarge a local fix into full-product auditing. Stop extra proof-only capture requested by older checklists, preserving actual development and sessions. Report what actually ran. "
     "Wait only through team_wait_actions/ team_wait_decisions, never sleep. After all work is confirmed, team_finish_domain with summary, then complete the goal. The principal integrates main through team_record_merge or gives a clear repair plan. When the user only pastes connection instructions, wait for a task.";

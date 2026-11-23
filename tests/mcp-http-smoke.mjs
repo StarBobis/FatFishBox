@@ -37,6 +37,9 @@ try {
     assert.equal((await fetch(url)).status,405);
     const teamUrl=`http://127.0.0.1:${port}/team`;
     const teamCall=(method,params={})=>fetch(teamUrl,{method:'POST',headers:base,body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})}).then(r=>r.json());
+    const initParams={protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'test',version:'1'}};
+    const teamInitialization=(await teamCall('initialize',initParams)).result;
+    assert.match(teamInitialization.instructions,/before calling any FatFishBox tool/);
     const principalCatalog=(await teamCall('tools/list')).result.tools;
     const principalTools=principalCatalog.map(t=>t.name);
     for (const name of ['team_start_project','team_activate_project','team_wait_decisions','team_control_project']) {
@@ -46,7 +49,8 @@ try {
         assert.equal(schema.outputSchema.type,'object');
     }
     const promptResult=(await teamCall('tools/call',{name:'team_get_prompt',arguments:{role:'principal'}})).result;
-    assert.equal(promptResult.structuredContent.version,15);
+    assert.equal(promptResult.structuredContent.version,16);
+    assert.match(promptResult.structuredContent.prompt,/verify it yourself without calling any FatFishBox tools/);
     assert.deepEqual(JSON.parse(promptResult.content[0].text),promptResult.structuredContent);
     assert.deepEqual(promptResult.structuredContent.tools.team_start_project,principalCatalog.find(t=>t.name==='team_start_project').inputSchema);
     assert.ok(principalTools.includes('team_start_project'));
@@ -55,9 +59,10 @@ try {
     assert.equal((await teamCall('tools/call',{name:'cluster_find_queues',arguments:{}})).result.isError,true);
     assert.equal((await fetch(teamUrl,{method:'POST',headers:{...base,Origin:'https://example.test'},body:'{}'})).status,403);
     assert.equal((await fetch(teamUrl)).status,405);
-    const initialized=await call('initialize',{protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'test',version:'1'}});
+    const initialized=await call('initialize',initParams);
     const initialization=(await initialized.json()).result;
     assert.equal(initialization.protocolVersion,'2025-11-25');
+    assert.match(initialization.instructions,/before calling any FatFishBox tool/);
     assert.match(initialization.instructions,/only pastes connection instructions, wait for a task/);
     assert.equal((await call('notifications/initialized',{},null)).status,202);
     const missingQueue=await call('tools/call',{name:'cluster_overview'},7).then(response=>response.json());

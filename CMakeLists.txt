@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(FatFishBox VERSION 0.1.17 LANGUAGES CXX RC)
+project(FatFishBox VERSION 0.1.18 LANGUAGES CXX RC)
 
 include(CTest)
 include(FetchContent)
