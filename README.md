@@ -63,3 +63,7 @@ cmake --install build --config Release --prefix "out/肥鱼重工"
 HTTP MCP 只监听本机，当前无需访问令牌。新建 DSH 会话使用 `danger-full-access` 和 `ptc` Agent，模型可访问运行账户有权访问的文件。请在可信的本机环境和工作区使用。
 
 应用状态默认保存在 `%LOCALAPPDATA%\FatFishBox`，可用 `FATFISHBOX_DATA_DIR` 指定隔离目录。程序旁的 `logs` 保存诊断日志和崩溃转储。分享程序时使用打包脚本生成的 ZIP，避免把日志、转储、DSH 授权文件或团队运行数据一起上传。
+
+## 📄 许可证
+
+FatFishBox 使用 MIT 许可证，发布包附带原文。[LICENSE](LICENSE)
