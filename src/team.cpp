@@ -13,6 +13,7 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
+#include <iterator>
 #include <ranges>
 #include <set>
 #include <thread>
@@ -531,6 +532,21 @@ long long parse_cursor(const Json& p,const std::string& value) {
 }
 
 std::string team_prompt(std::string_view role) {
+    if (role!="principal" && role!="lead" && role!="worker") role="worker";
+    // 优先读安装目录旁的 prompts/<role>.md，便于不重新编译就改提示词；
+    // 文件缺失或为空时退回编译内置的副本。
+    std::wstring executable(32768,L'\0');
+    const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
+    if (length>0 && length<executable.size()) {
+        executable.resize(length);
+        const std::wstring name(role.begin(),role.end());
+        const auto file=fs::path(executable).parent_path()/L"prompts"/(name+L".md");
+        std::ifstream external(file,std::ios::binary);
+        if (external) {
+            std::string text((std::istreambuf_iterator<char>(external)),std::istreambuf_iterator<char>());
+            if (!text.empty()) return text;
+        }
+    }
     if (role=="principal") return principal_prompt;
     if (role=="lead") return lead_prompt;
     return worker_prompt;
