@@ -13,7 +13,7 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
-#include <iterator>
+#include <limits>
 #include <ranges>
 #include <set>
 #include <thread>
@@ -533,18 +533,23 @@ long long parse_cursor(const Json& p,const std::string& value) {
 
 std::string team_prompt(std::string_view role) {
     if (role!="principal" && role!="lead" && role!="worker") role="worker";
-    // 优先读安装目录旁的 prompts/<role>.md，便于不重新编译就改提示词；
-    // 文件缺失或为空时退回编译内置的副本。
+    // Read the prompt beside the executable on each call so edits can take effect immediately.
     std::wstring executable(32768,L'\0');
     const auto length=GetModuleFileNameW(nullptr,executable.data(),static_cast<DWORD>(executable.size()));
     if (length>0 && length<executable.size()) {
         executable.resize(length);
         const std::wstring name(role.begin(),role.end());
         const auto file=fs::path(executable).parent_path()/L"prompts"/(name+L".md");
-        std::ifstream external(file,std::ios::binary);
-        if (external) {
-            std::string text((std::istreambuf_iterator<char>(external)),std::istreambuf_iterator<char>());
-            if (!text.empty()) return text;
+        std::ifstream external(file,std::ios::binary|std::ios::ate);
+        const auto size=external.tellg();
+        if (size>0 && size<=std::numeric_limits<int>::max()) {
+            std::string prompt(static_cast<std::size_t>(size),'\0');
+            if (external.seekg(0) && external.read(prompt.data(),static_cast<std::streamsize>(size))) {
+                if (prompt.starts_with("\xEF\xBB\xBF")) prompt.erase(0,3);
+                if (prompt.find_first_not_of(" \t\r\n")!=std::string::npos && prompt.find('\0')==std::string::npos &&
+                    MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,prompt.data(),static_cast<int>(prompt.size()),nullptr,0)>0)
+                    return prompt;
+            }
         }
     }
     if (role=="principal") return principal_prompt;
@@ -589,7 +594,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
             if (!valid) team_error("invalid_arguments","字段类型不正确",{{"field",key},{"expectedType",type}},Json::array({"team_get_prompt"}));
         }
     }
-    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");auto out=Json{{"version",role=="principal"?16:13},{"prompt",team_prompt(role)}};
+    if (tool=="team_get_prompt") {const auto role=in.value("role","principal");auto out=Json{{"version",role=="principal"?17:role=="lead"?14:13},{"prompt",team_prompt(role)}};
         if (role=="principal") {
             out["tools"]=Json::object();
             for (const auto& entry:team_tools()) {
@@ -1193,7 +1198,7 @@ Json team_invoke(const Cluster& cluster,const fs::path& data,std::string_view to
         Json out={{"projectId",p.at("projectId")},{"queueId",p.value("queueId","")},{"status",p.at("status")},{"charter",p.at("charter")},
             {"charterVersion",p.at("charterVersion")},{"tasks",p.value("tasks",Json::array())},{"workspace",p.at("workspace")},{"baseSha",p.at("baseSha")},{"domain",d},{"jobs",Json::array()},{"decisions",Json::array()},{"dependencies",Json::array()}};
         out["domain"].erase("token");
-        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=13;
+        out["domainActionContract"]=domain_action_contract();out["toolContractTool"]="team_get_contract";out["workQueue"]=queue;out["dispatchPlan"]=dispatch_plan;out["readyWorkItems"]=worklist;out["priorityResults"]=urgent;out["rolePromptVersion"]=14;
         out["dispatchPolicy"]="FIFO: take the team_next_action head, handle it or dispatch its successor, then take the next. Child results join the tail without preemption. priorityResults is a compatibility field, not a priority policy.";
         out["backlog"]={{"ownerDomainId",backlog_owner(p)},{"isOwner",d.at("domainId")==backlog_owner(p)},
             {"pending",p.value("backlog",Json::object()).value("pending",0)},{"actionable",p.value("backlog",Json::object()).value("actionable",0)},

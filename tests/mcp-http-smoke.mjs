@@ -49,7 +49,7 @@ try {
         assert.equal(schema.outputSchema.type,'object');
     }
     const promptResult=(await teamCall('tools/call',{name:'team_get_prompt',arguments:{role:'principal'}})).result;
-    assert.equal(promptResult.structuredContent.version,16);
+    assert.equal(promptResult.structuredContent.version,17);
     assert.match(promptResult.structuredContent.prompt,/verify it yourself without calling any FatFishBox tools/);
     assert.deepEqual(JSON.parse(promptResult.content[0].text),promptResult.structuredContent);
     assert.deepEqual(promptResult.structuredContent.tools.team_start_project,principalCatalog.find(t=>t.name==='team_start_project').inputSchema);
